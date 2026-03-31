@@ -1,6 +1,8 @@
-# Virtual Context Plugin for OpenClaw
+# [Virtual Context](https://virtual-context.com) Plugin for OpenClaw
 
-Persistent AI memory across conversations. Virtual Context sits between your agent and the LLM provider, enriching every request with relevant context from past conversations.
+> **[virtual-context.com](https://virtual-context.com)** — OS-style memory for LLMs. Less context. Better answers.
+
+Persistent AI memory across conversations. [Virtual Context](https://virtual-context.com) sits between your agent and the LLM provider, enriching every request with relevant context from past conversations. No code changes needed for proxy mode; this plugin provides deep integration via the REST API.
 
 ## What It Does
 
@@ -58,10 +60,11 @@ By default, the plugin activates for all providers. Use the `providers` config t
 
 ## Getting a vcKey
 
-Sign up at [virtual-context.com](https://virtual-context.com) to get your API key. Free tier available.
+Sign up at [virtual-context.com](https://virtual-context.com) to get your API key. Free tier available with 1 conversation and 50 requests/day. Pro ($29/mo) for unlimited.
 
-## Links
+## Learn More
 
-- [Virtual Context](https://virtual-context.com)
-- [Documentation](https://virtual-context.com/docs/)
-- [GitHub](https://github.com/virtual-context/openclaw-plugin)
+- [virtual-context.com](https://virtual-context.com) — product overview, pricing, and signup
+- [Documentation](https://virtual-context.com/docs/) — integration guides for Anthropic, OpenAI, and more
+- [Research Paper](https://virtual-context.com/paper/) — the technical paper behind Virtual Context
+- [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
