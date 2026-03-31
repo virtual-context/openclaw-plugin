@@ -91,7 +91,7 @@ This plugin is transparent about what it accesses. Here is the full list:
 
 ## Getting a vcKey
 
-Sign up at [virtual-context.com](https://virtual-context.com) to get your API key. Free tier available with 1 conversation and 50 requests/day. Pro ($29/mo) for unlimited.
+Sign up at [virtual-context.com](https://virtual-context.com) to get your API key. Free tier available. Pro ($19/mo) for unlimited.
 
 ## Learn More
 
