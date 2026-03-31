@@ -60,6 +60,35 @@ In `openclaw.json`:
 
 By default, the plugin activates for all providers. Use the `providers` config to restrict it to specific provider/model combinations. The plugin reads the current model from the session store at runtime, so it correctly handles `/model` switches.
 
+## Security and Access
+
+This plugin is transparent about what it accesses. Here is the full list:
+
+**Network calls (to your configured `baseUrl`):**
+- Sends conversation messages to `/api/v1/context/prepare` before each LLM call
+- Sends assistant reply text to `/api/v1/context/ingest` after each LLM response
+- Fetches tool definitions from `/api/v1/tools/definitions` at startup
+- Calls `/api/v1/tools/{name}` when the LLM requests a retrieval tool
+
+**Local filesystem reads:**
+- Reads `~/.openclaw/agents/<agentId>/sessions/sessions.json` to determine the current model for provider filtering. This is a read-only access to OpenClaw's session store, used because the `before_prompt_build` hook does not expose the active model in its context. No writes.
+
+**Payload modification:**
+- Replaces the message array in-place with the compressed payload returned by the cloud
+- Can override the system prompt if the cloud returns one (VC manages the full payload to compress it)
+
+**Tool registration:**
+- Registers tools dynamically from definitions fetched from the cloud at startup
+
+**Debug logging (opt-in, off by default):**
+- When `debug: true`, logs message previews, API responses, and payload sizes to the gateway log. Disable in production.
+
+**What it does NOT do:**
+- Does not write to any local files (except gateway logs via the logger)
+- Does not access files outside the session store
+- Does not send data to any endpoint other than your configured `baseUrl`
+- Does not store credentials or API keys beyond what is in your `openclaw.json` config
+
 ## Getting a vcKey
 
 Sign up at [virtual-context.com](https://virtual-context.com) to get your API key. Free tier available with 1 conversation and 50 requests/day. Pro ($29/mo) for unlimited.

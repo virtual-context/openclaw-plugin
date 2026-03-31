@@ -137,6 +137,8 @@ export default {
     }
 
     // ── Bootstrap: fetch tool definitions and register each one ──
+    // NETWORK: GET /api/v1/tools/definitions — fetches tool schemas from the cloud.
+    // TOOLS: Registers each returned tool so the LLM can call them during its run.
     vcGet(baseUrl, "/api/v1/tools/definitions", vcKey)
       .then((data) => {
         const tools = data?.tools ?? [];
@@ -182,6 +184,9 @@ export default {
       });
 
     // ── before_prompt_build: prepare context ──
+    // FILESYSTEM: Reads sessions.json to resolve the current model (read-only).
+    // NETWORK: POST /api/v1/context/prepare — sends full message history to cloud.
+    // PAYLOAD: Replaces messages in-place with the compressed payload from the cloud.
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
@@ -290,6 +295,7 @@ export default {
     });
 
     // ── agent_end: ingest the completed turn ──
+    // NETWORK: POST /api/v1/context/ingest — sends assistant reply text to cloud for tagging.
     api.on("agent_end", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
