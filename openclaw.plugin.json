@@ -1,7 +1,7 @@
 {
   "id": "virtual-context",
   "name": "Virtual Context",
-  "description": "Full context window management via Virtual Context REST API",
+  "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
   "version": "5.0.0",
   "kind": "lifecycle",
   "main": "./index.js",
