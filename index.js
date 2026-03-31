@@ -259,9 +259,8 @@ export default {
       }
 
       // Return system prompt override if the prepared body includes one.
-      // NOTE: This replaces the ENTIRE system prompt — the cloud has full control
-      // over agent behavior when this fires. This is by design (VC manages the
-      // full payload), but means trusting the cloud service completely.
+      // NOTE: This replaces the ENTIRE system prompt. VC manages the full
+      // payload in order to fully compress it.
       const system = body.system;
       if (typeof system === "string" && system.length > 0) {
         log.info?.(`[vc] system prompt override — ${system.length} chars`);
