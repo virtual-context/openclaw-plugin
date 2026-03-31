@@ -112,6 +112,25 @@ export default {
 
     log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
+    // ── Config compatibility checks ──
+    const ocConfig = api.config ?? {};
+    const defaults = ocConfig.agents?.defaults ?? {};
+
+    const pruningMode = defaults.contextPruning?.mode;
+    if (pruningMode && pruningMode !== "off") {
+      log.warn?.(`[vc] WARNING: agents.defaults.contextPruning.mode is "${pruningMode}" — should be "off". OpenClaw may prune messages before VC sees them. Set contextPruning.mode to "off" and let VC manage the context window.`);
+    }
+
+    const contextTokens = defaults.contextTokens;
+    if (typeof contextTokens === "number" && contextTokens < 1000000) {
+      log.warn?.(`[vc] WARNING: agents.defaults.contextTokens is ${contextTokens} — recommend 2000000+. Low values cause early compaction before VC can manage the context.`);
+    }
+
+    const groupIdleMinutes = ocConfig.session?.resetByType?.group?.idleMinutes;
+    if (typeof groupIdleMinutes === "number" && groupIdleMinutes < 2880) {
+      log.warn?.(`[vc] WARNING: session.resetByType.group.idleMinutes is ${groupIdleMinutes} — recommend 2880+ (48h). Low values reset sessions and wipe client-side history before VC can manage it.`);
+    }
+
     // ── Bootstrap: fetch tool definitions and register each one ──
     vcGet(baseUrl, "/api/v1/tools/definitions", vcKey)
       .then((data) => {
