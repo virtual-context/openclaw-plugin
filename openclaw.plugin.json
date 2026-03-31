@@ -1,0 +1,31 @@
+{
+  "id": "virtual-context",
+  "name": "Virtual Context",
+  "description": "Full context window management via Virtual Context REST API",
+  "version": "5.0.0",
+  "kind": "lifecycle",
+  "main": "./index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "vcKey": {
+        "type": "string",
+        "description": "Virtual Context API key (sent as X-VC-Key header)"
+      },
+      "baseUrl": {
+        "type": "string",
+        "description": "VC REST API base URL (default: https://api.virtual-context.com)"
+      },
+      "providers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of provider/model strings to activate for (e.g. [\"openai-direct/gpt-5.4\"]). Empty or omitted = all providers."
+      },
+      "debug": {
+        "type": "boolean",
+        "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."
+      }
+    },
+    "additionalProperties": false
+  }
+}

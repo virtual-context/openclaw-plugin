@@ -1,0 +1,40 @@
+{
+  "name": "openclaw-plugin-virtual-context",
+  "version": "5.0.0",
+  "description": "Full context window management via Virtual Context REST API. Provides persistent AI memory across conversations through automatic context enrichment, semantic retrieval tools, and turn ingestion.",
+  "main": "./index.js",
+  "type": "module",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "virtual-context",
+    "context-management",
+    "ai-memory",
+    "llm-context",
+    "semantic-retrieval"
+  ],
+  "author": "Virtual Context <support@virtual-context.com>",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.24",
+      "minGatewayVersion": "2026.3.24"
+    },
+    "build": {
+      "openclawVersion": "2026.3.24",
+      "pluginSdkVersion": "2026.3.24"
+    }
+  },
+  "homepage": "https://virtual-context.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/virtual-context/openclaw-plugin"
+  },
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "package.json",
+    "README.md"
+  ]
+}
