@@ -36,6 +36,11 @@ const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 /**
  * Resolve the current provider/model for a session by reading sessions.json.
  * Returns "provider/model" lowercase, or null if unknown.
+ *
+ * NOTE: This reads OpenClaw's internal session store directly from disk because
+ * the before_prompt_build hook context does not expose the current model.
+ * This is fragile — the file format could change between OpenClaw versions.
+ * The proper fix is OpenClaw exposing provider/model in the hook context.
  */
 function resolveSessionModel(sessionKey) {
   try {
@@ -253,7 +258,10 @@ export default {
         log.info?.(`[vc] replaced messages — ${body.messages.length} from prepared body`);
       }
 
-      // Return system prompt override if the prepared body includes one
+      // Return system prompt override if the prepared body includes one.
+      // NOTE: This replaces the ENTIRE system prompt — the cloud has full control
+      // over agent behavior when this fires. This is by design (VC manages the
+      // full payload), but means trusting the cloud service completely.
       const system = body.system;
       if (typeof system === "string" && system.length > 0) {
         log.info?.(`[vc] system prompt override — ${system.length} chars`);

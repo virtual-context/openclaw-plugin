@@ -10,7 +10,7 @@
     "properties": {
       "vcKey": {
         "type": "string",
-        "description": "Virtual Context API key (sent as X-VC-Key header)"
+        "description": "Virtual Context API key (sent as vckey query parameter)"
       },
       "baseUrl": {
         "type": "string",
