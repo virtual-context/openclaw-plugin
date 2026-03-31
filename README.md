@@ -2,7 +2,9 @@
 
 > **[virtual-context.com](https://virtual-context.com)** — OS-style memory for LLMs. Less context. Better answers.
 
-Persistent AI memory across conversations. [Virtual Context](https://virtual-context.com) sits between your agent and the LLM provider, enriching every request with relevant context from past conversations. No code changes needed for proxy mode; this plugin provides deep integration via the REST API.
+[Virtual Context](https://virtual-context.com) lets your agents run with unlimited context windows while sending only what matters to the LLM. Conversations are compressed, organized, and indexed automatically. When context is needed, it's retrieved semantically and injected into the payload. The result: unlimited memory, lower token costs, and better reasoning from models that see clean, relevant context instead of raw history.
+
+This plugin provides deep OpenClaw integration via the Virtual Context REST API. For other frameworks, the [transparent proxy](https://virtual-context.com/docs/) requires zero code changes.
 
 ## What It Does
 
