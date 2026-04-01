@@ -33,6 +33,9 @@ import { join } from "node:path";
 
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
+// Tracks sessions where last prepare was a VC command (skip ingest)
+const vcCommandSessions = new Set();
+
 /**
  * Resolve the current provider/model for a session by reading sessions.json.
  * Returns "provider/model" lowercase, or null if unknown.
@@ -226,6 +229,29 @@ export default {
         return;
       }
 
+      // ── VC command handling ──
+      // If the prepare response contains a vc_command, the cloud handled it server-side.
+      // Inject the command response as messages and send a minimal prompt so the LLM
+      // returns quickly. Skip ingest for this turn.
+      if (prepareResult.vc_command) {
+        const cmdMessage = prepareResult.message ?? `[VC ${prepareResult.vc_command}]`;
+        log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting response, skipping LLM`);
+        vcCommandSessions.add(sessionId);
+
+        // Replace messages with the command response
+        if (Array.isArray(event.messages)) {
+          event.messages.length = 0;
+          event.messages.push(
+            { role: "user", content: [{ type: "text", text: cmdMessage }] },
+          );
+        }
+
+        return { prependContext: "A VC command has been executed. The command output is in the last user message. Repeat it back verbatim to the user. Do not add commentary. Respond with only the command output." };
+      }
+
+      // Clear command flag for normal turns
+      vcCommandSessions.delete(sessionId);
+
       const body = prepareResult.body;
       const passthrough = prepareResult.is_passthrough ?? false;
       const meta = prepareResult.metadata ?? {};
@@ -299,6 +325,13 @@ export default {
     api.on("agent_end", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
+
+      // Skip ingest for VC command turns — command was fully handled by prepare
+      if (vcCommandSessions.has(sessionId)) {
+        log.info?.(`[vc] skipping ingest — VC command turn`);
+        vcCommandSessions.delete(sessionId);
+        return;
+      }
 
       // Same provider filter as prepare
       if (providerFilter) {
