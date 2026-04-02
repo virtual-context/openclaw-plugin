@@ -219,22 +219,15 @@ export default {
 
       // ── VC command handling ──
       // If the prepare response contains a vc_command, the cloud handled it server-side.
-      // Inject the command response as messages and send a minimal prompt so the LLM
-      // returns quickly. Skip ingest for this turn.
+      // Do NOT modify event.messages — that persists to the session and pollutes history.
+      // Instead, use prependContext to inject the command output as the prompt.
+      // The LLM gets a small instruction + command output, responds quickly, ingest is skipped.
       if (prepareResult.vc_command) {
         const cmdMessage = prepareResult.message ?? `[VC ${prepareResult.vc_command}]`;
-        log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting response, skipping LLM`);
+        log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting via prependContext, skipping LLM`);
         vcCommandSessions.add(sessionId);
 
-        // Replace messages with the command response
-        if (Array.isArray(event.messages)) {
-          event.messages.length = 0;
-          event.messages.push(
-            { role: "user", content: [{ type: "text", text: cmdMessage }] },
-          );
-        }
-
-        return { prependContext: "A VC command has been executed. The command output is in the last user message. Repeat it back verbatim to the user. Do not add commentary. Respond with only the command output." };
+        return { prependContext: `Respond with ONLY the following text, exactly as shown. No commentary, no additions:\n\n${cmdMessage}` };
       }
 
       // Clear command flag for normal turns
