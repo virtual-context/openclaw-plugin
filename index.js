@@ -198,8 +198,20 @@ export default {
 
       log.info?.(`[vc] prepare — session=${sessionId} messages=${event?.messages?.length ?? 0}`);
 
+      // event.messages is the history (does NOT include the current user message).
+      // event.prompt is the current user message. Append it so the cloud sees the
+      // full conversation including the current turn — needed for VC command detection
+      // and accurate context preparation.
+      const messagesWithCurrentTurn = [...event.messages];
+      if (event.prompt) {
+        messagesWithCurrentTurn.push({
+          role: "user",
+          content: [{ type: "text", text: event.prompt }],
+        });
+      }
+
       const prepareBody = {
-        messages: event.messages,
+        messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
       };
       if (debug) {
