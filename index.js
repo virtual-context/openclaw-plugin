@@ -83,18 +83,7 @@ async function vcPost(baseUrl, path, vcKey, sessionId, body) {
   return res.json();
 }
 
-async function vcGet(baseUrl, path, vcKey) {
-  const url = buildUrl(baseUrl, path, vcKey, null);
-  const res = await fetch(url, {
-    method: "GET",
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`VC API ${res.status}: ${text.slice(0, 200)}`);
-  }
-  return res.json();
-}
+// vcGet removed — tool definitions are now hardcoded, no bootstrap network call needed.
 
 export default {
   id: "virtual-context",
@@ -139,52 +128,51 @@ export default {
       log.warn?.(`[vc] WARNING: session.resetByType.group.idleMinutes is ${groupIdleMinutes} — recommend 2880+ (48h). Low values reset sessions and wipe client-side history before VC can manage it.`);
     }
 
-    // ── Bootstrap: fetch tool definitions and register each one ──
-    // NETWORK: GET /api/v1/tools/definitions — fetches tool schemas from the cloud.
-    // TOOLS: Registers each returned tool so the LLM can call them during its run.
-    vcGet(baseUrl, "/api/v1/tools/definitions", vcKey)
-      .then((data) => {
-        const tools = data?.tools ?? [];
-        log.info?.(`[vc] bootstrap — ${tools.length} tool(s)`);
-        if (debug) log.info?.(`[vc:debug] bootstrap response: ${JSON.stringify(data).slice(0, 500)}`);
+    // ── Register VC retrieval tools (hardcoded definitions) ──
+    // TOOLS: Registered statically — no bootstrap network call needed.
+    // Update these when the VC tool catalogue changes and release a new plugin version.
+    const vcTools = [
+      { name: "vc_expand_topic", description: "Load the full original conversation text for a topic. Use when a topic summary covers the area you need \u2014 expanding reveals the complete conversation including details the summary may have compressed. Also use after vc_find_quote returns snippets \u2014 expand the matching tag to read surrounding context before answering. For specific facts when you don't know which topic holds them, use vc_find_quote first to locate them.", input_schema: { type: "object", properties: { tag: { type: "string", description: "Topic tag from the context-topics list to expand." }, depth: { type: "string", enum: ["segments", "full"], description: "Target depth: 'segments' for individual summaries, 'full' for original conversation text." }, collapse_tags: { type: "array", items: { type: "string" }, description: "Optional list of topic tags to collapse back to summary depth before expanding. Frees context budget in the same round-trip instead of requiring a separate tool call." } }, required: ["tag"] } },
+      { name: "vc_find_quote", description: "Search the full original conversation text and truncated tool outputs for a specific word, phrase, or detail. Use this when you see '... N bytes truncated \u2014 call vc_find_quote(query) ...' in a tool result, or when the user asks about a specific fact \u2014 a name, number, dosage, recommendation, date, or decision \u2014 especially when no topic summary mentions it or you don't know which topic it falls under. This bypasses tags entirely and searches raw text, so it finds content even when it's filed under an unexpected topic. Returns short excerpts \u2014 use vc_expand_topic on a matching tag if you need more context.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for. Use the most specific and distinctive terms." } }, required: ["query"] } },
+      { name: "vc_recall_all", description: "Load summaries of ALL stored conversation topics at once. Use when the user asks for a broad overview, wants to know everything discussed, needs a full summary, or asks a vague question that spans multiple topics. Returns all tag summaries within the token budget. After reviewing, use vc_expand_topic on specific tags if you need more detail.", input_schema: { type: "object", properties: {} } },
+      { name: "vc_query_facts", description: "Query extracted facts with structured filters. Essential for questions about events, experiences, trips, activities, or anything the user has done \u2014 each fact has a date, location, and status. Also use for counting, listing, or filtering questions like 'how many X have I done', 'what projects am I leading'. Returns matching facts with count.", input_schema: { type: "object", properties: { subject: { type: "string", description: "Who the fact is about. Usually 'user'." }, verb: { type: "string", description: "Action verb to search for (e.g. 'led', 'built', 'prefers'). Automatically expanded to include similar verbs." }, object_contains: { type: "string", description: "Keyword to match in the object field." }, status: { type: "string", enum: ["active", "completed", "planned", "abandoned", "recurring"], description: "Temporal status filter. Omit for counting queries to get all statuses at once." }, fact_type: { type: "string", enum: ["personal", "experience", "world"], description: "Filter by fact type. Omit to get all types." } } } },
+      { name: "vc_remember_when", description: "Best tool for time-based questions. Retrieves conversations and facts from a specific date range. Use FIRST when the question mentions a time period ('past three months', 'last week', 'in March', 'between June and July'). Returns both conversation excerpts and structured facts within the window.", input_schema: { type: "object", properties: { query: { type: "string", description: "Topic/fact query to search for within a time window." }, time_range: { type: "object", properties: { kind: { type: "string", enum: ["relative", "between_dates"] }, preset: { type: "string", enum: ["last_7_days", "last_30_days", "last_90_days", "last_week", "last_month", "this_week", "this_month"] }, start: { type: "string", description: "YYYY-MM-DD" }, end: { type: "string", description: "YYYY-MM-DD" } }, required: ["kind"] }, max_results: { type: "integer", description: "Maximum results to return (default 5)." } }, required: ["query", "time_range"] } },
+      { name: "vc_restore_tool", description: "Restore compacted conversation history in place. Compacted turns marked with [Compacted turn N | ... | vc_restore_tool(ref=...)] contain the FULL original conversation including thinking blocks, tool calls, tool outputs, and all details that the summary omits. Call this when you need the exact original content.", input_schema: { type: "object", properties: { ref: { type: "string", description: "The ref from the compacted stub (e.g. chain_5_abc123 or tool_abc123def)" } }, required: ["ref"] } },
+      { name: "vc_find_session", description: "Retrieve full conversation excerpts from a specific older session that was marked as superseded in a previous vc_find_quote result. Use this ONLY when you see '[Older session \u2014 superseded]' and need the original text to answer the question.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for within the session." }, session: { type: "string", description: "The session date to search (e.g. '2023/05/25'). Copy the date shown in the '[Older session (...)]' marker." } }, required: ["query", "session"] } },
+    ];
 
-        for (const def of tools) {
-          api.registerTool((ctx) => ({
-            name: def.name,
-            description: def.description,
-            parameters: def.input_schema,
-            async execute(toolCallId, params) {
-              const sessionId = ctx?.sessionId ?? "unknown";
-              log.info?.(`[vc] tool call — ${def.name} session=${sessionId}`);
-              if (debug) log.info?.(`[vc:debug] tool ${def.name} request: ${JSON.stringify(params).slice(0, 500)}`);
+    for (const def of vcTools) {
+      api.registerTool((ctx) => ({
+        name: def.name,
+        description: def.description,
+        parameters: def.input_schema,
+        async execute(toolCallId, params) {
+          const sessionId = ctx?.sessionId ?? "unknown";
+          log.info?.(`[vc] tool call — ${def.name} session=${sessionId}`);
+          if (debug) log.info?.(`[vc:debug] tool ${def.name} request: ${JSON.stringify(params).slice(0, 500)}`);
 
-              try {
-                const response = await vcPost(
-                  baseUrl,
-                  `/api/v1/tools/${def.name}`,
-                  vcKey,
-                  sessionId,
-                  { arguments: params }
-                );
-                if (debug) log.info?.(`[vc:debug] tool ${def.name} response: ${(response.result ?? "").slice(0, 500)}`);
-                return {
-                  content: [{ type: "text", text: response.result ?? "" }],
-                };
-              } catch (err) {
-                log.error?.(`[vc] tool ${def.name} failed: ${err}`);
-                return {
-                  content: [{ type: "text", text: `Error: ${err.message}` }],
-                };
-              }
-            },
-          }));
-
-          log.info?.(`[vc] registered tool: ${def.name}`);
-        }
-      })
-      .catch((err) => {
-        log.error?.(`[vc] bootstrap failed — no tools registered: ${err}`);
-      });
+          try {
+            const response = await vcPost(
+              baseUrl,
+              `/api/v1/tools/${def.name}`,
+              vcKey,
+              sessionId,
+              { arguments: params }
+            );
+            if (debug) log.info?.(`[vc:debug] tool ${def.name} response: ${(response.result ?? "").slice(0, 500)}`);
+            return {
+              content: [{ type: "text", text: response.result ?? "" }],
+            };
+          } catch (err) {
+            log.error?.(`[vc] tool ${def.name} failed: ${err}`);
+            return {
+              content: [{ type: "text", text: `Error: ${err.message}` }],
+            };
+          }
+        },
+      }));
+    }
+    log.info?.(`[vc] registered ${vcTools.length} tools (hardcoded)`);
 
     // ── before_prompt_build: prepare context ──
     // FILESYSTEM: Reads sessions.json to resolve the current model (read-only).
