@@ -5,6 +5,9 @@
   "version": "5.0.0",
   "kind": "lifecycle",
   "main": "./index.js",
+  "activation": {
+    "onCapabilities": ["hook", "tool"]
+  },
   "configSchema": {
     "type": "object",
     "properties": {
