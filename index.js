@@ -182,8 +182,14 @@ export default {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
 
+      // VC commands (VCSTATUS, VCLABEL, etc.) must always reach prepare regardless
+      // of provider filter. The provider filter uses the *configured* model from
+      // sessions.json, but model fallback happens later — so the filter may see
+      // "anthropic/claude-opus-4-6" even when the actual runtime model is GPT-5.4.
+      const isVcCommand = /^VC[A-Z]/i.test((event.prompt ?? "").trim());
+
       // Check provider filter against the session's current model
-      if (providerFilter) {
+      if (providerFilter && !isVcCommand) {
         const currentModel = resolveSessionModel(sessionKey);
         if (currentModel && !providerFilter.has(currentModel)) {
           log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
@@ -194,6 +200,9 @@ export default {
         if (!currentModel && debug) {
           log.info?.(`[vc:debug] model not yet in session store, proceeding optimistically`);
         }
+      }
+      if (isVcCommand) {
+        log.info?.(`[vc] VC command detected in prompt — bypassing provider filter`);
       }
 
       log.info?.(`[vc] prepare — session=${sessionId} messages=${event?.messages?.length ?? 0}`);
