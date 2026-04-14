@@ -27,7 +27,7 @@
  *              If empty or omitted, activates for all providers.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +35,82 @@ const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Tracks sessions where last prepare was a VC command (skip ingest)
 const vcCommandSessions = new Set();
+
+// ── JSONL ingest tracking ──
+// Tracks which sessions have had their full JSONL history sent to the VC cloud.
+// On first prepare for a new session, reads the entire JSONL and sends all messages.
+// Subsequent calls use normal windowed messages. Reset via VCREINGEST command.
+const INGEST_TRACKER_PATH = join(homedir(), ".openclaw", "extensions", "virtual-context", "initialized-sessions.json");
+
+function readIngestTracker() {
+  try { return JSON.parse(readFileSync(INGEST_TRACKER_PATH, "utf-8")); }
+  catch { return {}; }
+}
+
+function writeIngestTracker(tracker) {
+  writeFileSync(INGEST_TRACKER_PATH, JSON.stringify(tracker, null, 2));
+}
+
+function isSessionIngested(sessionId) {
+  return sessionId in readIngestTracker();
+}
+
+function markSessionIngested(sessionId, messageCount) {
+  const tracker = readIngestTracker();
+  tracker[sessionId] = { ingestedAt: new Date().toISOString(), messages: messageCount };
+  writeIngestTracker(tracker);
+}
+
+function resetSessionIngest(sessionId) {
+  const tracker = readIngestTracker();
+  delete tracker[sessionId];
+  writeIngestTracker(tracker);
+}
+
+/**
+ * Read the full session JSONL and extract messages in API format.
+ * Returns an array of {role, content} messages, or null on failure.
+ */
+function readFullSessionJSONL(sessionKey, sessionId, log) {
+  try {
+    const parts = sessionKey?.split(":");
+    if (!parts || parts.length < 2) return null;
+    const agentId = parts[1];
+
+    const jsonlPath = join(homedir(), ".openclaw", "agents", agentId, "sessions", `${sessionId}.jsonl`);
+    if (!existsSync(jsonlPath)) {
+      log?.info?.(`[vc] JSONL not found: ${jsonlPath}`);
+      return null;
+    }
+
+    const content = readFileSync(jsonlPath, "utf-8");
+    const lines = content.split("\n").filter(Boolean);
+    log?.info?.(`[vc] JSONL: ${lines.length} lines (${(content.length / 1024 / 1024).toFixed(1)}MB)`);
+
+    const messages = [];
+    let skipped = 0;
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.message?.role) {
+          messages.push(entry.message);
+        } else if (entry.role && (entry.role === "user" || entry.role === "assistant" || entry.role === "tool")) {
+          messages.push(entry);
+        } else {
+          skipped++;
+        }
+      } catch {
+        skipped++;
+      }
+    }
+
+    log?.info?.(`[vc] JSONL parsed — ${messages.length} messages, ${skipped} non-message entries skipped`);
+    return messages.length > 0 ? messages : null;
+  } catch (err) {
+    log?.error?.(`[vc] JSONL read failed: ${err}`);
+    return null;
+  }
+}
 
 /**
  * Resolve the current provider/model for a session by reading sessions.json.
@@ -68,13 +144,13 @@ function buildUrl(baseUrl, path, vcKey, sessionId) {
   return `${base}?${params.join("&")}`;
 }
 
-async function vcPost(baseUrl, path, vcKey, sessionId, body) {
+async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000) {
   const url = buildUrl(baseUrl, path, vcKey, sessionId);
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -181,12 +257,22 @@ export default {
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
+      const promptText = (event.prompt ?? "").trim();
+
+      // Handle VCREINGEST locally — resets the ingest tracker for this session.
+      // Next prepare call will re-read the full JSONL and send all messages to the cloud.
+      if (/^VCREINGEST$/i.test(promptText)) {
+        resetSessionIngest(sessionId);
+        log.info?.(`[vc] VCREINGEST — reset ingest tracker for session=${sessionId}`);
+        vcCommandSessions.add(sessionId);
+        return { prependContext: `Respond with ONLY the following text, exactly as shown. No commentary, no additions:\n\nSession ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
+      }
 
       // VC commands (VCSTATUS, VCLABEL, etc.) must always reach prepare regardless
       // of provider filter. The provider filter uses the *configured* model from
       // sessions.json, but model fallback happens later — so the filter may see
       // "anthropic/claude-opus-4-6" even when the actual runtime model is GPT-5.4.
-      const isVcCommand = /^VC[A-Z]/i.test((event.prompt ?? "").trim());
+      const isVcCommand = /^VC[A-Z]/i.test(promptText);
 
       // Check provider filter against the session's current model
       if (providerFilter && !isVcCommand) {
@@ -211,12 +297,37 @@ export default {
       // event.prompt is the current user message. Append it so the cloud sees the
       // full conversation including the current turn — needed for VC command detection
       // and accurate context preparation.
-      const messagesWithCurrentTurn = [...event.messages];
+      let messagesWithCurrentTurn = [...event.messages];
       if (event.prompt) {
         messagesWithCurrentTurn.push({
           role: "user",
           content: [{ type: "text", text: event.prompt }],
         });
+      }
+
+      // ── Initial JSONL ingest ──
+      // On the first prepare call for a session not yet in the tracker,
+      // read the full JSONL from disk and send ALL messages instead of
+      // the windowed subset from OpenClaw. This gives the cloud the
+      // complete conversation history for initial context building.
+      let isInitialIngest = false;
+      if (!isSessionIngested(sessionId)) {
+        const fullMessages = readFullSessionJSONL(sessionKey, sessionId, log);
+        if (fullMessages && fullMessages.length > messagesWithCurrentTurn.length) {
+          log.info?.(`[vc] initial ingest — sending ${fullMessages.length} JSONL messages (was ${messagesWithCurrentTurn.length} windowed)`);
+          messagesWithCurrentTurn = [...fullMessages];
+          if (event.prompt) {
+            messagesWithCurrentTurn.push({
+              role: "user",
+              content: [{ type: "text", text: event.prompt }],
+            });
+          }
+          isInitialIngest = true;
+        } else {
+          // JSONL not available or smaller than windowed — mark as ingested anyway
+          markSessionIngested(sessionId, messagesWithCurrentTurn.length);
+          log.info?.(`[vc] no JSONL advantage — marked session=${sessionId} as ingested (${messagesWithCurrentTurn.length} messages)`);
+        }
       }
 
       const prepareBody = {
@@ -231,11 +342,17 @@ export default {
 
       let prepareResult;
       try {
-        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, sessionId, prepareBody);
+        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, sessionId, prepareBody, isInitialIngest ? 120000 : 15000);
       } catch (err) {
         log.error?.(`[vc] prepare failed: ${err} — passing through unmodified`);
         if (debug) log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
         return;
+      }
+
+      // Mark session as ingested after successful initial ingest
+      if (isInitialIngest) {
+        markSessionIngested(sessionId, messagesWithCurrentTurn.length);
+        log.info?.(`[vc] marked session=${sessionId} as ingested (${messagesWithCurrentTurn.length} messages sent)`);
       }
 
       // ── VC command handling ──
