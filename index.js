@@ -144,14 +144,19 @@ function buildUrl(baseUrl, path, vcKey, sessionId) {
   return `${base}?${params.join("&")}`;
 }
 
-async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000) {
+async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000, log = null) {
   const url = buildUrl(baseUrl, path, vcKey, sessionId);
+  const serialized = JSON.stringify(body);
+  const byteLen = Buffer.byteLength(serialized, "utf-8");
+  const msgCount = body?.messages?.length ?? 0;
+  if (log) log.info?.(`[vc:wire] POST ${path} — ${msgCount} messages, ${byteLen} bytes serialized`);
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: serialized,
     signal: AbortSignal.timeout(timeoutMs),
   });
+  if (log) log.info?.(`[vc:wire] POST ${path} — HTTP ${res.status} ${res.statusText}`);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`VC API ${res.status}: ${text.slice(0, 200)}`);
@@ -233,7 +238,9 @@ export default {
               `/api/v1/tools/${def.name}`,
               vcKey,
               sessionId,
-              { arguments: params }
+              { arguments: params },
+              15000,
+              debug ? log : null
             );
             if (debug) log.info?.(`[vc:debug] tool ${def.name} response: ${(response.result ?? "").slice(0, 500)}`);
             return {
@@ -335,14 +342,14 @@ export default {
         model: ctx?.model ?? undefined,
       };
       if (debug) {
-        log.info?.(`[vc:debug] prepare request — url=${baseUrl}/api/v1/context/prepare vcconv=${sessionId} messages=${event.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
-        log.info?.(`[vc:debug] prepare first message: ${JSON.stringify(event.messages?.[0])?.slice(0, 300)}`);
-        log.info?.(`[vc:debug] prepare last message: ${JSON.stringify(event.messages?.[event.messages.length - 1])?.slice(0, 300)}`);
+        log.info?.(`[vc:debug] prepare request — url=${baseUrl}/api/v1/context/prepare vcconv=${sessionId} messages=${prepareBody.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
+        log.info?.(`[vc:debug] prepare first message: ${JSON.stringify(prepareBody.messages?.[0])?.slice(0, 300)}`);
+        log.info?.(`[vc:debug] prepare last message: ${JSON.stringify(prepareBody.messages?.[prepareBody.messages.length - 1])?.slice(0, 300)}`);
       }
 
       let prepareResult;
       try {
-        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, sessionId, prepareBody, isInitialIngest ? 120000 : 15000);
+        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, sessionId, prepareBody, isInitialIngest ? 120000 : 15000, log);
       } catch (err) {
         log.error?.(`[vc] prepare failed: ${err} — passing through unmodified`);
         if (debug) log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
@@ -486,7 +493,7 @@ export default {
       try {
         const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, sessionId, {
           assistant_message: assistantMessage,
-        });
+        }, 15000, log);
         log.info?.(
           `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
           `status=${ingestResult.status ?? "?"} ` +
