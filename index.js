@@ -368,7 +368,11 @@ export default {
       // Instead, use prependContext to inject the command output as the prompt.
       // The LLM gets a small instruction + command output, responds quickly, ingest is skipped.
       if (prepareResult.vc_command) {
-        const cmdMessage = prepareResult.message ?? `[VC ${prepareResult.vc_command}]`;
+        // Defensive: fall back to `error` field if cloud forgets to populate `message`.
+        // Cloud's existing convention (e.g. VCATTACH error path) populates `error` but
+        // historically not `message`; without this fallback, error responses render as
+        // the meaningless string "[VC <cmd>]" and the user sees no error context.
+        const cmdMessage = prepareResult.message ?? prepareResult.error ?? `[VC ${prepareResult.vc_command}]`;
         log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting via prependContext, skipping LLM`);
         vcCommandSessions.add(sessionId);
 

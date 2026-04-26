@@ -99,3 +99,16 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 - [Documentation](https://virtual-context.com/docs/) — integration guides for Anthropic, OpenAI, and more
 - [Research Paper](https://virtual-context.com/paper/) — the technical paper behind Virtual Context
 - [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
+
+## Changelog
+
+### 5.0.1
+
+- Defensive fix: VC command error responses now render correctly when the cloud populates the `error` field without a `message` field. Previously, error responses (such as `VCATTACH` against a missing target) rendered the placeholder string `[VC <command>]` and the user saw no error context. The plugin now falls back to `prepareResult.error` before the placeholder.
+
+### 5.0.0
+
+- Hardcoded retrieval tool definitions (no bootstrap network call).
+- VC command handling via `prependContext` (keeps history clean).
+- JSONL ingest tracking with `VCREINGEST` reset command.
+- Wire-level request logging in debug mode.
