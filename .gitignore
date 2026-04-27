@@ -1,0 +1,7 @@
+node_modules/
+.vitest-cache/
+coverage/
+*.log
+.DS_Store
+initialized-sessions.json
+initialized-sessions.json.bak-*

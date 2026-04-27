@@ -1,9 +1,13 @@
 {
   "name": "openclaw-plugin-virtual-context",
-  "version": "5.0.1",
+  "version": "5.1.0",
   "description": "Plugin integrates OpenClaw to virtual-context.com and provides a virtual context window of 50M+ tokens for unlimited memory, reduces upstream costs by compressing the LLM payload, and increases LLM reasoning by providing only relevant context with memory retrieval tools.",
   "main": "./index.js",
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "keywords": [
     "openclaw",
     "openclaw-plugin",
@@ -16,7 +20,9 @@
   "author": "Virtual Context <support@virtual-context.com>",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./index.js"],
+    "extensions": [
+      "./index.js"
+    ],
     "compat": {
       "pluginApi": ">=2026.3.24",
       "minGatewayVersion": "2026.3.24"
@@ -36,5 +42,9 @@
     "openclaw.plugin.json",
     "package.json",
     "README.md"
-  ]
+  ],
+  "devDependencies": {
+    "fetch-mock": "^12.6.0",
+    "vitest": "^4.1.5"
+  }
 }

@@ -102,6 +102,13 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 
 ## Changelog
 
+### 5.1.0
+
+- **VCMERGE support**: the plugin's existing `^VC[A-Z]/i + vc_command + prependContext` rail handles `VCMERGE INTO <target>`, `VCMERGE PREVIEW <target>`, and the reserved-for-v2 `VCMERGESTATUS <merge_id>` natively. No new dispatch code; cloud's REST endpoint resolves these alongside VCATTACH/VCSTATUS/VCLABEL/etc.
+- **Timeout sizing for VC commands**: prepare-call timeout is now `60s` for any VC command (matches against `^VC[A-Z]/i`). Previous behavior was `15s` everywhere except `120s` on initial JSONL ingest. This gives sync-path merges comfortable headroom — VCMERGE on conversations >5k turns may take several seconds (sync path); >10k turns return a `merge_id` immediately for async tracking via `VCMERGESTATUS`.
+  - **Alarm-threshold rule**: the 60s cap is a forcing function, NOT a tuning knob. If real-world p99 nears 60s, the right lever is dropping cloud's `max_sync_source_turns` to push more sources into the async path — NOT bumping this timeout further. Bumping past 60s would mask the sync-path getting too slow rather than escalating it.
+- **Test infrastructure**: the plugin now ships a `vitest` + `fetch-mock` test harness in `tests/`. Tests cover the timeout-per-branch contract, URL+body construction, and the message/error/bracket fallback chain over canonical error envelopes. Run via `npm test`. Dev-only: `tests/` and `node_modules/` do not bundle into the runtime npm package (per `package.json` `"files"`); end-user installs are unchanged.
+
 ### 5.0.1
 
 - Defensive fix: VC command error responses now render correctly when the cloud populates the `error` field without a `message` field. Previously, error responses (such as `VCATTACH` against a missing target) rendered the placeholder string `[VC <command>]` and the user saw no error context. The plugin now falls back to `prepareResult.error` before the placeholder.
