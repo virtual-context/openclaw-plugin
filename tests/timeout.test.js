@@ -1,27 +1,25 @@
 /**
- * OT4.1 — vitest unit: `vcPost` timeout selection per branch.
+ * vcPost prepare-timeout selection per branch.
  *
- * Pins the spec contract from plan §6.2 OT4.1:
- *   `isVcCommand ? 60000 : (isInitialIngest ? 120000 : 15000)`
+ *   isVcCommand ? 60000 : (isInitialIngest ? 120000 : 15000)
  *
- * - VC commands (VCMERGE, VCATTACH, VCMERGE PREVIEW, etc.) → 60s.
- * - Initial JSONL ingest path → 120s.
- * - Everything else → 15s (preserved historical default).
+ * - VC commands (VCMERGE, VCATTACH, VCMERGE PREVIEW, etc.): 60s.
+ * - Initial JSONL ingest path: 120s.
+ * - Everything else: 15s (the historical default).
  *
- * The test exercises `selectPrepareTimeout` directly (pure function) and asserts
- * `vcPost` passes the chosen timeout to fetch's AbortSignal. Together this proves
- * the call site at index.js:395 honors the per-branch contract.
+ * Exercises `selectPrepareTimeout` directly and asserts `vcPost` passes the
+ * chosen timeout to fetch's AbortSignal.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { selectPrepareTimeout, vcPost } from "../index.js";
 
-describe("OT4.1 — selectPrepareTimeout per-branch values", () => {
+describe("selectPrepareTimeout per-branch values", () => {
   it("VC command (commit path) returns 60000ms", () => {
     expect(selectPrepareTimeout({ isVcCommand: true, isInitialIngest: false })).toBe(60000);
   });
 
   it("VC command takes precedence over initial-ingest flag", () => {
-    // If both flags fire (rare but possible — first prepare call on a session whose
+    // If both flags fire (rare but possible: first prepare call on a session whose
     // user typed VCMERGE on turn 1), VC-command branch wins because the cloud-side
     // dispatch happens regardless of ingest size.
     expect(selectPrepareTimeout({ isVcCommand: true, isInitialIngest: true })).toBe(60000);
@@ -41,7 +39,7 @@ describe("OT4.1 — selectPrepareTimeout per-branch values", () => {
   });
 });
 
-describe("OT4.1 — vcPost honors the timeout argument via AbortSignal.timeout", () => {
+describe("vcPost honors the timeout argument via AbortSignal.timeout", () => {
   let originalFetch;
   let abortTimeoutSpy;
 

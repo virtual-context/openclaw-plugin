@@ -102,6 +102,12 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 
 ## Changelog
 
+### 5.1.1
+
+- **Wire-log observability**: the `[vc:wire] POST <path>` log line now appends `timeout=Nms` so the prepare-call timeout selection is grep-able from gateway logs. VCMERGE / VCMERGE PREVIEW requests show `timeout=60000ms`, normal prepares show `timeout=15000ms`, and initial JSONL ingest shows `timeout=120000ms`.
+- **Wire-shape tests strengthened** to pin the full prepare-payload body shape (role, content[].type, model presence/absence) for both `VCMERGE INTO` and `VCMERGE PREVIEW`, not just message count + prompt text.
+- **Lockfile regenerated** to record 5.1.1 (runtime payload was unaffected because `package.json` `"files"` excludes the lockfile).
+
 ### 5.1.0
 
 - **VCMERGE support**: the plugin's existing `^VC[A-Z]/i + vc_command + prependContext` rail handles `VCMERGE INTO <target>`, `VCMERGE PREVIEW <target>`, and the reserved-for-v2 `VCMERGESTATUS <merge_id>` natively. No new dispatch code; cloud's REST endpoint resolves these alongside VCATTACH/VCSTATUS/VCLABEL/etc.

@@ -1,22 +1,20 @@
 /**
- * OT4.2 — vitest unit + fetch-mock: VCMERGE / VCMERGE PREVIEW commands reach the
- * cloud REST endpoint with the correct URL and body construction.
- *
- * Pins the spec contract from plan §6.2 OT4.2: the plugin's `vcPost` against
- * `/api/v1/context/prepare` produces:
- *   - URL: `<baseUrl>/api/v1/context/prepare?vckey=<key>&vcconv=<sessionId>`
+ * VCMERGE / VCMERGE PREVIEW commands reach the cloud REST endpoint with the
+ * correct URL and body construction. The plugin's vcPost against
+ * /api/v1/context/prepare produces:
+ *   - URL: <baseUrl>/api/v1/context/prepare?vckey=<key>&vcconv=<sessionId>
  *   - Method: POST
  *   - Content-Type: application/json
- *   - Body: JSON-serialized `{messages: [...], model?: string}`
+ *   - Body: JSON-serialized {messages: [...], model?: string}
  *
- * `buildUrl` is exercised as a pure function (URL construction). `vcPost` is
+ * buildUrl is exercised as a pure function (URL construction). vcPost is
  * exercised against fetch-mock to assert the wire-level request shape.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fetchMock from "fetch-mock";
 import { buildUrl, vcPost } from "../index.js";
 
-describe("OT4.2 — buildUrl URL construction", () => {
+describe("buildUrl URL construction", () => {
   it("produces vckey + vcconv query params", () => {
     const url = buildUrl("https://api.virtual-context.com", "/api/v1/context/prepare", "vc-test-key", "session-abc");
     expect(url).toBe("https://api.virtual-context.com/api/v1/context/prepare?vckey=vc-test-key&vcconv=session-abc");
@@ -40,7 +38,7 @@ describe("OT4.2 — buildUrl URL construction", () => {
   });
 });
 
-describe("OT4.2 — vcPost fires correct wire request for VCMERGE / VCMERGE PREVIEW", () => {
+describe("vcPost fires correct wire request for VCMERGE / VCMERGE PREVIEW", () => {
   beforeEach(() => {
     fetchMock.mockGlobal();
   });
@@ -51,7 +49,7 @@ describe("OT4.2 — vcPost fires correct wire request for VCMERGE / VCMERGE PREV
     fetchMock.clearHistory();
   });
 
-  it("POSTs VCMERGE prompt to /api/v1/context/prepare with vckey+vcconv", async () => {
+  it("POSTs VCMERGE prompt to /api/v1/context/prepare with full wire shape", async () => {
     fetchMock.post(
       "https://api.virtual-context.com/api/v1/context/prepare?vckey=key&vcconv=sess",
       { vc_command: "merge", message: "merge ok" },
@@ -72,13 +70,25 @@ describe("OT4.2 — vcPost fires correct wire request for VCMERGE / VCMERGE PREV
     expect(lastCall.options.method.toLowerCase()).toBe("post");
     expect(lastCall.options.headers["content-type"]).toBe("application/json");
 
+    // Full body structure asserted via toEqual (not just length + prompt).
     const sentBody = JSON.parse(lastCall.options.body);
-    expect(sentBody.messages).toHaveLength(1);
-    expect(sentBody.messages[0].content[0].text).toBe("VCMERGE INTO target-label");
-    expect(sentBody.model).toBe("openai-direct/gpt-5.5");
+    expect(sentBody).toEqual({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "VCMERGE INTO target-label",
+            },
+          ],
+        },
+      ],
+      model: "openai-direct/gpt-5.5",
+    });
   });
 
-  it("POSTs VCMERGE PREVIEW prompt with the same wire shape", async () => {
+  it("POSTs VCMERGE PREVIEW prompt with full wire shape", async () => {
     fetchMock.post(
       "https://api.virtual-context.com/api/v1/context/prepare?vckey=key&vcconv=sess",
       { vc_command: "merge_preview", message: "would merge 358 turns" },
@@ -91,8 +101,27 @@ describe("OT4.2 — vcPost fires correct wire request for VCMERGE / VCMERGE PREV
 
     expect(result.vc_command).toBe("merge_preview");
     const lastCall = fetchMock.callHistory.lastCall();
+    expect(lastCall.url).toBe("https://api.virtual-context.com/api/v1/context/prepare?vckey=key&vcconv=sess");
+    expect(lastCall.options.method.toLowerCase()).toBe("post");
+    expect(lastCall.options.headers["content-type"]).toBe("application/json");
+
+    // PREVIEW body shape mirrors INTO; only difference is the prompt text and
+    // that PREVIEW omits the model field (caller did not pass one).
     const sentBody = JSON.parse(lastCall.options.body);
-    expect(sentBody.messages[0].content[0].text).toBe("VCMERGE PREVIEW target-label");
+    expect(sentBody).toEqual({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "VCMERGE PREVIEW target-label",
+            },
+          ],
+        },
+      ],
+    });
+    expect(sentBody.model).toBeUndefined();
   });
 
   it("throws on non-2xx response with the cloud-provided body text", async () => {

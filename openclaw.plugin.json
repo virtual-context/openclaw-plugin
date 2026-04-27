@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.1.0",
+  "version": "5.1.1",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {

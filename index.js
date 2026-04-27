@@ -139,7 +139,7 @@ function resolveSessionModel(sessionKey) {
 
 /**
  * Build a fully-qualified VC REST URL with vckey + optional vcconv query params.
- * Pure function; exported for unit tests (OT4.2).
+ * Pure function; exported for unit testing.
  */
 export function buildUrl(baseUrl, path, vcKey, sessionId) {
   const base = `${baseUrl.replace(/\/+$/, "")}${path}`;
@@ -150,17 +150,17 @@ export function buildUrl(baseUrl, path, vcKey, sessionId) {
 
 /**
  * Choose the prepare-call timeout based on which path is firing.
- * - VC commands (VCMERGE, VCATTACH, VCMERGE PREVIEW, etc.) get 60s — sync-path merges
- *   per spec §6.3 are "single-digit seconds for the largest realistic source", so 60s
+ * - VC commands (VCMERGE, VCATTACH, VCMERGE PREVIEW, etc.) get 60s. Sync-path merges
+ *   are designed to land within a few seconds for the largest realistic source, so 60s
  *   is generous comfort margin. The 60s cap is ALSO a forcing function: if real-world
  *   p99 nears 60s, the right lever is dropping cloud's `max_sync_source_turns` to push
  *   into the async path, NOT bumping this timeout further.
- * - Initial JSONL ingest gets 120s — the cloud has to chew through the full session
+ * - Initial JSONL ingest gets 120s. The cloud has to chew through the full session
  *   history on first contact; varies with conversation size.
- * - Everything else stays at 15s — preserves the historical default; tight enough to
+ * - Everything else stays at 15s. Preserves the historical default; tight enough to
  *   fail-fast on transient cloud issues.
  *
- * Pure function; exported for unit tests (OT4.1).
+ * Pure function; exported for unit testing.
  */
 export function selectPrepareTimeout({ isVcCommand = false, isInitialIngest = false } = {}) {
   if (isVcCommand) return 60000;
@@ -172,12 +172,12 @@ export function selectPrepareTimeout({ isVcCommand = false, isInitialIngest = fa
  * Render the user-facing text for a cloud-resolved VC command response.
  * The cloud envelope shape is `{vc_command, message?, error?}`. Plugin clients render
  * via `prependContext`, so we need a non-empty string. Fallback chain:
- *   1. `message` — primary, human-readable per §12.9 contract.
- *   2. `error`  — defense-in-depth fallback (covers any future cloud regression that
- *                 ships an error response without `message`; per the 5.0.1 fix).
- *   3. `[VC <command>]` — last-ditch placeholder (the original 5.0.0 behavior).
+ *   1. `message`: primary, human-readable text from the cloud.
+ *   2. `error`:   defense-in-depth fallback for envelopes that ship an error code
+ *                 without a corresponding `message` field.
+ *   3. `[VC <command>]`: last-ditch placeholder if both fields are absent.
  *
- * Pure function; exported for unit tests (OT4.3).
+ * Pure function; exported for unit testing.
  */
 export function renderVcCommandMessage(prepareResult) {
   return (
@@ -192,7 +192,7 @@ export async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 
   const serialized = JSON.stringify(body);
   const byteLen = Buffer.byteLength(serialized, "utf-8");
   const msgCount = body?.messages?.length ?? 0;
-  if (log) log.info?.(`[vc:wire] POST ${path} — ${msgCount} messages, ${byteLen} bytes serialized`);
+  if (log) log.info?.(`[vc:wire] POST ${path} — ${msgCount} messages, ${byteLen} bytes serialized, timeout=${timeoutMs}ms`);
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -412,8 +412,7 @@ export default {
       // Instead, use prependContext to inject the command output as the prompt.
       // The LLM gets a small instruction + command output, responds quickly, ingest is skipped.
       if (prepareResult.vc_command) {
-        // Render cloud's cmd response via the message/error/bracket fallback chain
-        // (renderVcCommandMessage helper; OT4.3-tested).
+        // Render cloud's command response via the message/error/bracket fallback chain.
         const cmdMessage = renderVcCommandMessage(prepareResult);
         log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting via prependContext, skipping LLM`);
         vcCommandSessions.add(sessionId);
