@@ -187,6 +187,46 @@ export function renderVcCommandMessage(prepareResult) {
   );
 }
 
+/**
+ * Hoist a leading role:"system" entry in body.messages into body.system.
+ *
+ * The /api/v1/context/prepare response may carry a system preamble (e.g.
+ * `<system-reminder>` / `<context-topics>` tag summaries) as the first
+ * entry in body.messages with role:"system" instead of placing it in the
+ * dedicated body.system field. The host runtime that consumes this body
+ * has no handler for role:"system" inputs in the messages array and
+ * silently drops them, so the preamble never reaches the model.
+ *
+ * Mutates `body` in place: shifts the leading system entry out of
+ * body.messages and appends its text into body.system. When body.system
+ * is already populated, concatenates: newline-joined strings, or
+ * block-array append for Anthropic-shaped content. Returns the number
+ * of characters hoisted, or undefined when no hoist was performed.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function hoistSystemPreamble(body) {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) return;
+  const first = body.messages[0];
+  if (!first || first.role !== "system") return;
+  const c = first.content;
+  const text = typeof c === "string"
+    ? c
+    : Array.isArray(c)
+      ? c.filter((b) => b?.type === "text").map((b) => b.text).join("\n")
+      : "";
+  if (!text) return;
+  body.messages.shift();
+  if (typeof body.system === "string" && body.system.length > 0) {
+    body.system = body.system + "\n" + text;
+  } else if (Array.isArray(body.system) && body.system.length > 0) {
+    body.system = [...body.system, { type: "text", text }];
+  } else {
+    body.system = text;
+  }
+  return text.length;
+}
+
 export async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000, log = null) {
   const url = buildUrl(baseUrl, path, vcKey, sessionId);
   const serialized = JSON.stringify(body);
@@ -438,6 +478,13 @@ export default {
       }
 
       if (!body) return;
+
+      // Hoist any leading role:"system" entry in body.messages into body.system,
+      // so the existing systemPrompt-override path below routes it to the model.
+      const hoistedChars = hoistSystemPreamble(body);
+      if (hoistedChars) {
+        log.info?.(`[vc] hoisted ${hoistedChars}-char system preamble from body.messages[0] into body.system`);
+      }
 
       // Replace messages in-place with the enriched payload's messages
       if (Array.isArray(body.messages) && Array.isArray(event.messages)) {
