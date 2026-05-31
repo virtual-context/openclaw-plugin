@@ -25,7 +25,7 @@ function parseArgs(argv) {
     probe: null, savedCloudBody: null, savedTelegramTurn: null, conv: null,
     model: "gpt-5.5", apiKey: null, outDir: "/tmp",
     noLlm: false, verbose: false,
-    controlStripHistory: false, compare: false,
+    controlStripHistory: false, controlIsolateProbe: false, compare: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -39,6 +39,7 @@ function parseArgs(argv) {
     else if (a === "--no-llm") args.noLlm = true;
     else if (a === "--verbose") args.verbose = true;
     else if (a === "--control-strip-history") args.controlStripHistory = true;
+    else if (a === "--control-isolate-probe") args.controlIsolateProbe = true;
     else if (a === "--compare") args.compare = true;
     else if (a === "--help" || a === "-h") { printHelp(); exit(0); }
   }
@@ -66,14 +67,20 @@ Options:
                                  → profiles["openai:manual"].token, or env OPENAI_API_KEY.
   --out-dir <dir>                Where to write the captured payloads. Default: /tmp.
   --no-llm                       Skip the LLM POST; emit only the bytes-level verdict.
-  --control-strip-history        Strip assistant turns, tool results, and reasoning
-                                 from input_items before the LLM POST. Keep instructions
-                                 (preamble) and user turns intact. Isolates whether the
-                                 model can answer from preload + probe alone.
-  --compare                      Run BOTH the standard and the control-stripped variants
-                                 in one invocation. Verdict includes side-by-side
-                                 per-layer attribution and response heads + a
-                                 model_answered_from_preload_alone signal.
+  --control-strip-history        Strip assistant turns, tool results, reasoning, and
+                                 function_calls from input_items before the LLM POST.
+                                 Keep instructions (preamble) and all user turns
+                                 intact. Tests whether the model can answer from
+                                 preload + user turns alone.
+  --control-isolate-probe        Strip ALL prior conversation history including prior
+                                 user turns. Keep instructions (preamble) and only
+                                 the single most-recent user turn (the probe). The
+                                 strictest preload-only test.
+  --compare                      Run ALL THREE variants (full, control-strip-history,
+                                 control-isolate-probe) in one invocation. Verdict
+                                 includes side-by-side per-layer attribution and
+                                 response heads, plus model_answered_from_preload_alone
+                                 and model_answered_from_preload_alone_strict signals.
   --verbose                      Verbose tracing.
   -h, --help                     Show this help.
 
@@ -380,6 +387,23 @@ function stripHistoryFromItems(items) {
   });
 }
 
+/**
+ * Strict isolation: keep only system/developer items (instructions) and the SINGLE
+ * most-recent user turn. Drops assistant turns, tool results, reasoning, function_calls,
+ * AND all prior user turns. The probe must be the last user item in the array.
+ */
+function isolateProbeFromItems(items) {
+  let lastUserIdx = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].role === "user") { lastUserIdx = i; break; }
+  }
+  return items.filter((it, i) => {
+    if (it.role === "developer" || it.role === "system") return true;
+    if (i === lastUserIdx) return true;
+    return false;
+  });
+}
+
 function extractAssistantText(rj) {
   if (!rj || !Array.isArray(rj.output)) return "";
   const parts = [];
@@ -545,23 +569,33 @@ async function main() {
   const cloudPath = `${args.outDir}/probe-${tsTag}-cloud-body.json`;
   writeFileSync(cloudPath, JSON.stringify(cloudResponse, null, 2));
 
-  // Decide which variants to run
-  const runFull = !args.controlStripHistory || args.compare;
-  const runControl = args.controlStripHistory || args.compare;
+  // Decide which variants to run. --compare runs all three; standalone control flags run
+  // just that variant (no full). Otherwise default to full only.
+  const anyControl = args.controlStripHistory || args.controlIsolateProbe;
+  const runFull = !anyControl || args.compare;
+  const runStrip = args.controlStripHistory || args.compare;
+  const runIsolate = args.controlIsolateProbe || args.compare;
 
   const variants = [];
   if (runFull) variants.push(await runVariant("full", items, ctx.systemPrompt, args, tsTag));
-  if (runControl) {
+  if (runStrip) {
     const strippedItems = stripHistoryFromItems(items);
     variants.push(await runVariant("control-strip-history", strippedItems, ctx.systemPrompt, args, tsTag));
   }
-
-  // If both variants ran, compute the preload-alone signal
-  let preloadAloneSignal = null;
-  if (args.compare && variants.length === 2) {
-    const ctrl = variants.find((v) => v.label === "control-strip-history");
-    preloadAloneSignal = ctrl?.content_level?.response_references_perfume === true && ctrl?.content_level?.called_vc_tool === false;
+  if (runIsolate) {
+    const isolatedItems = isolateProbeFromItems(items);
+    variants.push(await runVariant("control-isolate-probe", isolatedItems, ctx.systemPrompt, args, tsTag));
   }
+
+  // Preload-alone signals
+  const strip = variants.find((v) => v.label === "control-strip-history");
+  const isolate = variants.find((v) => v.label === "control-isolate-probe");
+  const preloadAloneSignal = strip
+    ? (strip.content_level?.response_references_perfume === true && strip.content_level?.called_vc_tool === false)
+    : null;
+  const preloadAloneStrictSignal = isolate
+    ? (isolate.content_level?.response_references_perfume === true && isolate.content_level?.called_vc_tool === false)
+    : null;
 
   const verdict = {
     source,
@@ -589,6 +623,7 @@ async function main() {
     },
     variants,
     model_answered_from_preload_alone: preloadAloneSignal,
+    model_answered_from_preload_alone_strict: preloadAloneStrictSignal,
     artifacts: { cloud_body: cloudPath },
   };
 
