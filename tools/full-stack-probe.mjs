@@ -21,7 +21,12 @@ const transformTransportMessages = transportBundle._;
 // ─────────────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { probe: null, savedCloudBody: null, savedTelegramTurn: null, conv: null, model: "gpt-5.5", apiKey: null, outDir: "/tmp", noLlm: false, verbose: false };
+  const args = {
+    probe: null, savedCloudBody: null, savedTelegramTurn: null, conv: null,
+    model: "gpt-5.5", apiKey: null, outDir: "/tmp",
+    noLlm: false, verbose: false,
+    controlStripHistory: false, compare: false,
+  };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--probe") args.probe = argv[++i];
@@ -33,6 +38,8 @@ function parseArgs(argv) {
     else if (a === "--out-dir") args.outDir = argv[++i];
     else if (a === "--no-llm") args.noLlm = true;
     else if (a === "--verbose") args.verbose = true;
+    else if (a === "--control-strip-history") args.controlStripHistory = true;
+    else if (a === "--compare") args.compare = true;
     else if (a === "--help" || a === "-h") { printHelp(); exit(0); }
   }
   return args;
@@ -59,12 +66,22 @@ Options:
                                  → profiles["openai:manual"].token, or env OPENAI_API_KEY.
   --out-dir <dir>                Where to write the captured payloads. Default: /tmp.
   --no-llm                       Skip the LLM POST; emit only the bytes-level verdict.
+  --control-strip-history        Strip assistant turns, tool results, and reasoning
+                                 from input_items before the LLM POST. Keep instructions
+                                 (preamble) and user turns intact. Isolates whether the
+                                 model can answer from preload + probe alone.
+  --compare                      Run BOTH the standard and the control-stripped variants
+                                 in one invocation. Verdict includes side-by-side
+                                 per-layer attribution and response heads + a
+                                 model_answered_from_preload_alone signal.
   --verbose                      Verbose tracing.
   -h, --help                     Show this help.
 
 Verdict signals:
-  bytes-level — does <system-reminder> reach the LLM-bound payload?
-  content-level — does the LLM response reference perfume keywords?
+  bytes-level — per-layer keyword counts: instructions vs user_turns vs
+                assistant_turns vs tool_results vs reasoning vs function_calls
+                (answers "did the preamble layer specifically carry the content").
+  content-level — does the LLM response reference expected keywords?
   tool-call — which vc_* tools did the LLM call, if any?
   perf — round-trip latency + token counts + model used.
 `);
@@ -282,6 +299,7 @@ async function callOpenAI(items, model, apiKey, verbose) {
 
 const KEYWORDS = ["<system-reminder>", "context-topics", "perfume-preference", "perfume-recommendation", "sania-perfume", "Glossier", "JHAG", "Valaya", "Amazing Grace", "Ellis Brooklyn", "Sania"];
 const VC_TOOL_NAMES = ["vc_recall_all", "vc_find_quote", "vc_expand_topic", "vc_query_facts", "vc_remember_when", "vc_restore_tool", "vc_find_session"];
+const PERFUME_CONTENT_KEYWORDS = ["Glossier", "JHAG", "Valaya", "Amazing Grace", "Ellis Brooklyn", "Sania"];
 
 function countKeywords(text) {
   const out = {};
@@ -290,6 +308,76 @@ function countKeywords(text) {
     out[kw] = (text.match(re) || []).length;
   }
   return out;
+}
+
+function emptyKeywords() {
+  const out = {};
+  for (const kw of KEYWORDS) out[kw] = 0;
+  return out;
+}
+
+function addInto(target, source) {
+  for (const kw of KEYWORDS) target[kw] = (target[kw] || 0) + (source[kw] || 0);
+}
+
+/**
+ * Split outbound items + instructions into layer buckets and count keywords per layer.
+ * Returns:
+ *   { instructions: {...}, input_items: { user_turns, assistant_turns, tool_results, reasoning, function_calls } }
+ */
+function attributeKeywordsByLayer(instructions, items) {
+  const layers = {
+    instructions: instructions ? countKeywords(instructions) : emptyKeywords(),
+    input_items: {
+      user_turns: emptyKeywords(),
+      assistant_turns: emptyKeywords(),
+      tool_results: emptyKeywords(),
+      reasoning: emptyKeywords(),
+      function_calls: emptyKeywords(),
+    },
+  };
+  const counts = {
+    user_turns: 0, assistant_turns: 0, tool_results: 0, reasoning: 0, function_calls: 0, instructions: instructions ? 1 : 0,
+  };
+  for (const it of items) {
+    let bucket = null;
+    let text = "";
+    if (it.role === "user") {
+      bucket = "user_turns";
+      if (Array.isArray(it.content)) text = it.content.map((c) => c?.text || "").join(" ");
+      else if (typeof it.content === "string") text = it.content;
+    } else if (it.type === "message" && it.role === "assistant") {
+      bucket = "assistant_turns";
+      if (Array.isArray(it.content)) text = it.content.map((c) => c?.text || "").join(" ");
+    } else if (it.type === "function_call") {
+      bucket = "function_calls";
+      text = `${it.name || ""} ${typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments || "")}`;
+    } else if (it.type === "function_call_output") {
+      bucket = "tool_results";
+      text = typeof it.output === "string" ? it.output : JSON.stringify(it.output || "");
+    } else if (it.type === "reasoning") {
+      bucket = "reasoning";
+      // Reasoning items typically carry only encrypted_content, but include summary if any
+      text = it.summary ? JSON.stringify(it.summary) : "";
+    }
+    if (bucket) {
+      counts[bucket] += 1;
+      addInto(layers.input_items[bucket], countKeywords(text));
+    }
+  }
+  return { layers, counts };
+}
+
+/**
+ * Strip assistant turns, tool results, reasoning, and function_calls from the items array.
+ * Keep system/developer (instructions) and user turns intact.
+ */
+function stripHistoryFromItems(items) {
+  return items.filter((it) => {
+    if (it.role === "developer" || it.role === "system") return true;
+    if (it.role === "user") return true;
+    return false;
+  });
 }
 
 function extractAssistantText(rj) {
@@ -360,26 +448,26 @@ async function acquireCloudBody(args) {
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function main() {
-  const args = parseArgs(argv);
-  const { rj: cloudResponse, prepareElapsedMs, source } = await acquireCloudBody(args);
-  const body = cloudResponse.body || {};
-  const cloudMsgCount = (body.messages || []).length;
-  const cloudMsgZeroRole = body.messages?.[0]?.role;
-  const cloudSystemFieldBefore = typeof body.system === "string" ? body.system.length : (body.system ? "blocks" : null);
+/**
+ * Run one variant of the LLM POST (with full items, or with stripped history) and
+ * return a compact result block: { items_count, attribution, llm }.
+ */
+async function runVariant(label, items, systemPrompt, args, tsTag) {
+  // Persist the outbound items for this variant
+  const itemsPath = `${args.outDir}/probe-${tsTag}-${label}-outbound-items.json`;
+  writeFileSync(itemsPath, JSON.stringify(items, null, 2));
 
-  // Apply plugin's hoist
-  const hoistedChars = hoistSystemPreamble(body);
-
-  // Convert to host-runtime internal shape
-  const internalMsgs = convertCloudToInternalShape(body.messages);
-  const model = { id: args.model, provider: "openai-codex", api: "openai-codex-responses", input: ["text"], reasoning: true };
-  const ctx = { messages: internalMsgs, systemPrompt: typeof body.system === "string" ? body.system : "" };
-  const { items, dropped, transformedCount } = convertResponsesMessages(model, ctx, new Set(["openai-codex"]), { includeSystemPrompt: true });
-
-  // Bytes-level: did the preamble survive into the outbound items?
-  const outboundJson = JSON.stringify(items);
-  const inputKeywords = countKeywords(outboundJson);
+  // Per-layer attribution: split system/developer items into instructions and the rest into buckets
+  let instructionsText = "";
+  const inputOnly = [];
+  for (const it of items) {
+    if ((it.role === "system" || it.role === "developer") && typeof it.content === "string") {
+      instructionsText = instructionsText ? `${instructionsText}\n${it.content}` : it.content;
+    } else {
+      inputOnly.push(it);
+    }
+  }
+  const { layers, counts } = attributeKeywordsByLayer(instructionsText, inputOnly);
 
   // Optional LLM POST
   let llmResponse = null;
@@ -398,32 +486,86 @@ async function main() {
         llmElapsedMs = r.elapsedMs;
         assistantText = extractAssistantText(llmResponse);
         assistantToolCalls = extractToolCalls(llmResponse);
+        const llmPath = `${args.outDir}/probe-${tsTag}-${label}-llm-response.json`;
+        writeFileSync(llmPath, JSON.stringify(llmResponse, null, 2));
       } catch (err) {
         llmError = String(err.message || err);
       }
     }
   }
+  const responseKeywords = assistantText ? countKeywords(assistantText) : emptyKeywords();
+  const calledVcTool = assistantToolCalls.some((c) => VC_TOOL_NAMES.includes(c.name));
+  const responseReferencesPerfume = PERFUME_CONTENT_KEYWORDS.some((kw) => (responseKeywords[kw] || 0) > 0);
 
-  // Content-level: keyword grep on the assistant response text
-  const responseKeywords = assistantText ? countKeywords(assistantText) : {};
+  return {
+    label,
+    outbound_items_count: items.length,
+    input_only_count_breakdown: counts,
+    bytes_level: {
+      per_layer: layers,
+      preamble_survived_to_llm: (layers.instructions["<system-reminder>"] >= 1 && layers.instructions["context-topics"] >= 1),
+      preamble_unique_signal_present: PERFUME_CONTENT_KEYWORDS.some((kw) => (layers.instructions[kw] || 0) > 0),
+    },
+    llm: args.noLlm ? "skipped (--no-llm)" : {
+      model: args.model,
+      error: llmError,
+      elapsed_ms: llmElapsedMs,
+      usage: llmResponse?.usage || null,
+      assistant_text_head: assistantText.slice(0, 700),
+      assistant_text_length: assistantText.length,
+      tool_calls: assistantToolCalls.map((c) => ({ name: c.name, args: typeof c.arguments === "string" ? c.arguments.slice(0, 120) : c.arguments })),
+    },
+    content_level: {
+      perfume_keywords_in_response: responseKeywords,
+      response_references_perfume: responseReferencesPerfume,
+      called_vc_tool: calledVcTool,
+    },
+    artifacts: { outbound_items: itemsPath },
+  };
+}
 
-  // Persist artifacts
+async function main() {
+  const args = parseArgs(argv);
+  const { rj: cloudResponse, prepareElapsedMs, source } = await acquireCloudBody(args);
+  const body = cloudResponse.body || {};
+  const cloudMsgCount = (body.messages || []).length;
+  const cloudMsgZeroRole = body.messages?.[0]?.role;
+  const cloudSystemFieldBefore = typeof body.system === "string" ? body.system.length : (body.system ? "blocks" : null);
+
+  // Apply plugin's hoist
+  const hoistedChars = hoistSystemPreamble(body);
+
+  // Convert to host-runtime internal shape
+  const internalMsgs = convertCloudToInternalShape(body.messages);
+  const model = { id: args.model, provider: "openai-codex", api: "openai-codex-responses", input: ["text"], reasoning: true };
+  const ctx = { messages: internalMsgs, systemPrompt: typeof body.system === "string" ? body.system : "" };
+  const { items, dropped, transformedCount } = convertResponsesMessages(model, ctx, new Set(["openai-codex"]), { includeSystemPrompt: true });
+
   const tsTag = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const cloudPath = `${args.outDir}/probe-${tsTag}-cloud-body.json`;
-  const itemsPath = `${args.outDir}/probe-${tsTag}-outbound-items.json`;
-  const llmPath = `${args.outDir}/probe-${tsTag}-llm-response.json`;
   writeFileSync(cloudPath, JSON.stringify(cloudResponse, null, 2));
-  writeFileSync(itemsPath, JSON.stringify(items, null, 2));
-  if (llmResponse) writeFileSync(llmPath, JSON.stringify(llmResponse, null, 2));
 
-  // Verdict block
-  const calledVcTool = assistantToolCalls.some((c) => VC_TOOL_NAMES.includes(c.name));
-  const preambleInOutbound = inputKeywords["<system-reminder>"] >= 1 && inputKeywords["context-topics"] >= 1;
-  const responseReferencesPerfume = ["Glossier", "JHAG", "Valaya", "Amazing Grace", "Ellis Brooklyn", "Sania"]
-    .some((kw) => (responseKeywords[kw] || 0) > 0);
+  // Decide which variants to run
+  const runFull = !args.controlStripHistory || args.compare;
+  const runControl = args.controlStripHistory || args.compare;
+
+  const variants = [];
+  if (runFull) variants.push(await runVariant("full", items, ctx.systemPrompt, args, tsTag));
+  if (runControl) {
+    const strippedItems = stripHistoryFromItems(items);
+    variants.push(await runVariant("control-strip-history", strippedItems, ctx.systemPrompt, args, tsTag));
+  }
+
+  // If both variants ran, compute the preload-alone signal
+  let preloadAloneSignal = null;
+  if (args.compare && variants.length === 2) {
+    const ctrl = variants.find((v) => v.label === "control-strip-history");
+    preloadAloneSignal = ctrl?.content_level?.response_references_perfume === true && ctrl?.content_level?.called_vc_tool === false;
+  }
 
   const verdict = {
     source,
+    probe: args.probe,
     timestamps: { startedAt: new Date().toISOString() },
     cloud: {
       conv_id: cloudResponse.conversation_id,
@@ -445,25 +587,9 @@ async function main() {
       outbound_items: items.length,
       dropped_roles: dropped,
     },
-    bytes_level: {
-      preamble_keywords_in_outbound: inputKeywords,
-      preamble_survived_to_llm: preambleInOutbound,
-    },
-    llm: args.noLlm ? "skipped (--no-llm)" : {
-      model: args.model,
-      error: llmError,
-      elapsed_ms: llmElapsedMs,
-      usage: llmResponse?.usage || null,
-      assistant_text_head: assistantText.slice(0, 500),
-      assistant_text_length: assistantText.length,
-      tool_calls: assistantToolCalls.map((c) => ({ name: c.name, args: c.arguments?.slice?.(0, 120) ?? c.arguments })),
-    },
-    content_level: {
-      perfume_keywords_in_response: responseKeywords,
-      response_references_perfume: responseReferencesPerfume,
-      called_vc_tool: calledVcTool,
-    },
-    artifacts: { cloud_body: cloudPath, outbound_items: itemsPath, llm_response: llmResponse ? llmPath : null },
+    variants,
+    model_answered_from_preload_alone: preloadAloneSignal,
+    artifacts: { cloud_body: cloudPath },
   };
 
   console.log(JSON.stringify(verdict, null, 2));
