@@ -36,6 +36,9 @@ const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 // Tracks sessions where last prepare was a VC command (skip ingest)
 const vcCommandSessions = new Set();
 
+// sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
+const filterPassState = new Map();
+
 // ── JSONL ingest tracking ──
 // Tracks which sessions have had their full JSONL history sent to the VC cloud.
 // On first prepare for a new session, reads the entire JSONL and sends all messages.
@@ -135,6 +138,30 @@ function resolveSessionModel(sessionKey) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Track per-session provider-filter outcomes so a session that previously
+ * PASSED the filter and is now being skipped produces exactly one loud
+ * transition signal (silent-degradation class: e.g. an auth failure flips the
+ * serving model to one outside the allowlist and memory quietly turns off).
+ *
+ * state: Map<sessionKey, lastPassingModel>. Returns {transition, lastPassed}.
+ * A pass records the model. A skip after a recorded pass clears the record and
+ * reports transition=true once; further skips stay quiet until the next pass.
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function noteFilterResult(state, sessionKey, model, passed) {
+  const lastPassed = state.get(sessionKey) ?? null;
+  if (passed) {
+    state.set(sessionKey, model);
+    return { transition: false, lastPassed };
+  }
+  if (lastPassed !== null) {
+    state.delete(sessionKey);
+    return { transition: true, lastPassed };
+  }
+  return { transition: false, lastPassed: null };
 }
 
 /**
@@ -368,8 +395,20 @@ export default {
       if (providerFilter && !isVcCommand) {
         const currentModel = resolveSessionModel(sessionKey);
         if (currentModel && !providerFilter.has(currentModel)) {
-          log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
+          const { transition, lastPassed } = noteFilterResult(filterPassState, sessionKey, currentModel, false);
+          if (transition) {
+            (log.warn ?? log.info)?.(
+              `[vc] WARN provider filter now SKIPPING session=${sessionId} (${currentModel}) — ` +
+              `was passing as ${lastPassed}. VC prepare/ingest are OFF for this session until ` +
+              `its model returns to the allowlist (check model fallback / provider auth).`
+            );
+          } else {
+            log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
+          }
           return;
+        }
+        if (currentModel) {
+          noteFilterResult(filterPassState, sessionKey, currentModel, true);
         }
         // If model unknown (new session), proceed — better to prepare and not need it
         // than to skip and send an unenriched payload
