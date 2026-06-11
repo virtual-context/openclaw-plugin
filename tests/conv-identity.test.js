@@ -3,8 +3,8 @@
  *
  * deriveConvIdentity(sessionKey, sessionId) -> { convId, isStable, fallbackReason? }
  *
- * Stable scopes get `sk:` + sessionKey (cron run-suffix stripped). Subagents
- * are intentionally ephemeral with a non-warning reason; explicit sessions are
+ * Stable scopes get `sk:` + sessionKey. Crons and subagents
+ * are intentionally ephemeral with non-warning reasons; explicit sessions are
  * intentionally ephemeral without a fallback reason. Missing/unparseable keys
  * fall back to the session UUID with a reason the caller counts and warns on.
  *
@@ -23,7 +23,6 @@ describe("deriveConvIdentity — stable scopes", () => {
     "agent:bastkid-dedicated:telegram:slash:8049932331",
     "agent:bastkid-dedicated:discord:channel:1485708353660260422",
     "agent:bastkid-dedicated:main",
-    "agent:bastkid-dedicated:cron:a3fd1191-ecfc-45fe-8764-3ec4b5ea0287",
   ];
   for (const key of stable) {
     it(`stable: ${key}`, () => {
@@ -32,16 +31,7 @@ describe("deriveConvIdentity — stable scopes", () => {
     });
   }
 
-  it("cron run-suffix is stripped to the per-job identity", () => {
-    const r = deriveConvIdentity(
-      "agent:bastkid-dedicated:cron:a3fd1191-ecfc-45fe-8764-3ec4b5ea0287:run:4bba53b6-b095-440a-a0e4-1eaf53d2e31a",
-      SID
-    );
-    expect(r).toEqual({
-      convId: "sk:agent:bastkid-dedicated:cron:a3fd1191-ecfc-45fe-8764-3ec4b5ea0287",
-      isStable: true,
-    });
-  });
+
 
   it("two agents sharing a peer id get distinct conv ids", () => {
     const a = deriveConvIdentity("agent:alpha:telegram:direct:42", SID);
@@ -62,6 +52,16 @@ describe("deriveConvIdentity — intentional ephemeral (no warning class)", () =
   it("subagent spawns stay per-session", () => {
     const r = deriveConvIdentity("agent:bastkid-dedicated:subagent:32049344-3585-41b4-8f41-6b522b5c6b9d", SID);
     expect(r).toEqual({ convId: SID, isStable: false, fallbackReason: "subagent" });
+  });
+
+  it("cron sessions stay per-session, with and without the run suffix", () => {
+    expect(deriveConvIdentity("agent:bastkid-dedicated:cron:a3fd1191-ecfc-45fe-8764-3ec4b5ea0287", SID))
+      .toEqual({ convId: SID, isStable: false, fallbackReason: "cron" });
+    expect(deriveConvIdentity(
+      "agent:bastkid-dedicated:cron:a3fd1191-ecfc-45fe-8764-3ec4b5ea0287:run:4bba53b6-b095-440a-a0e4-1eaf53d2e31a", SID))
+      .toEqual({ convId: SID, isStable: false, fallbackReason: "cron" });
+    expect(deriveConvIdentity("agent:bastkid-dedicated:cron:job:extra", SID).fallbackReason)
+      .toBe("unparseable_session_key");
   });
 
   it("explicit (disposable/probe) sessions stay per-session", () => {

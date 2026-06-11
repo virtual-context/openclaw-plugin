@@ -168,9 +168,9 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * Derive the VC conversation identity for a session.
  *
  * Durable chat scopes get a stable, human-readable conversation id (`sk:` +
- * sessionKey) that survives OpenClaw session-UUID rotation; cron runs collapse
- * to their per-job identity. Subagent spawns and explicit (disposable) sessions
- * are ephemeral by design. Anything missing or outside the known table falls
+ * sessionKey) that survives OpenClaw session-UUID rotation. Cron runs,
+ * subagent spawns, and explicit (disposable) sessions are ephemeral by
+ * design. Anything missing or outside the known table falls
  * back to the per-session UUID with a fallbackReason the caller is expected to
  * count and warn on — unknown scope shapes must never be wildcarded into
  * stable ids (a new scope family requires a table entry and a test).
@@ -179,8 +179,8 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * them; the full sessionKey (including the leading agent namespace) is
  * preserved verbatim so two agents sharing a peer id never collide.
  *
- * Subagent returns a non-warning fallback reason for caller observability;
- * explicit sessions are ephemeral without a fallback reason.
+ * Subagent and cron scopes return non-warning fallback reasons for caller
+ * observability; explicit sessions are ephemeral without a fallback reason.
  *
  * Pure function; exported for unit testing.
  * Returns { convId, isStable, fallbackReason? }.
@@ -205,9 +205,13 @@ export function deriveConvIdentity(sessionKey, sessionId) {
     return stable(sessionKey);
   }
   if (scope[0] === "cron" && scope[1]) {
-    if (scope.length === 2) return stable(sessionKey);
-    if (scope.length === 4 && scope[2] === "run" && scope[3]) {
-      return stable(parts.slice(0, 4).join(":")); // strip :run:<runUuid>
+    // Crons are intentionally ephemeral: cron traffic runs on models outside
+    // the VC provider allowlist by design, so prepare/ingest never fire for
+    // them and a stable per-job identity would be dead config. Recognized
+    // shapes (with or without the :run:<runUuid> suffix) stay per-session
+    // without a warning; anything else cron-ish is unparseable.
+    if (scope.length === 2 || (scope.length === 4 && scope[2] === "run" && scope[3])) {
+      return { convId: sessionId, isStable: false, fallbackReason: "cron" };
     }
     return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
   }
