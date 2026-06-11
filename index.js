@@ -179,6 +179,9 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * them; the full sessionKey (including the leading agent namespace) is
  * preserved verbatim so two agents sharing a peer id never collide.
  *
+ * Subagent returns a non-warning fallback reason for caller observability;
+ * explicit sessions are ephemeral without a fallback reason.
+ *
  * Pure function; exported for unit testing.
  * Returns { convId, isStable, fallbackReason? }.
  */
@@ -212,7 +215,7 @@ export function deriveConvIdentity(sessionKey, sessionId) {
     return { convId: sessionId, isStable: false, fallbackReason: "subagent" };
   }
   if (scope.length === 2 && scope[0] === "explicit" && scope[1]) {
-    return { convId: sessionId, isStable: false, fallbackReason: "explicit" };
+    return { convId: sessionId, isStable: false };
   }
   return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
 }

@@ -1,0 +1,293 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const SID1 = "11111111-2222-4333-8444-555555555555";
+const SID2 = "22222222-3333-4444-8555-666666666666";
+const STABLE_KEY = "agent:a:telegram:direct:42";
+const STABLE_CONV_QS = "sk%3Aagent%3Aa%3Atelegram%3Adirect%3A42";
+
+const createdHomes = [];
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
+  vi.resetModules();
+  vi.doUnmock("node:os");
+  for (const home of createdHomes.splice(0)) {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+function makeHome() {
+  const home = mkdtempSync(join(tmpdir(), "vc-plugin-test-"));
+  mkdirSync(join(home, ".openclaw", "extensions", "virtual-context"), { recursive: true });
+  createdHomes.push(home);
+  return home;
+}
+
+function writeSessionJsonl(home, agentId, sessionId, messages) {
+  const dir = join(home, ".openclaw", "agents", agentId, "sessions");
+  mkdirSync(dir, { recursive: true });
+  const lines = messages.map((message) => JSON.stringify({ message })).join("\n");
+  writeFileSync(join(dir, `${sessionId}.jsonl`), `${lines}\n`);
+}
+
+function writeSessionsStore(home, agentId, sessionKey, provider, model) {
+  const dir = join(home, ".openclaw", "agents", agentId, "sessions");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "sessions.json"),
+    JSON.stringify({
+      [sessionKey]: { modelProvider: provider, model },
+    }),
+  );
+}
+
+function trackerPath(home) {
+  return join(home, ".openclaw", "extensions", "virtual-context", "initialized-sessions.json");
+}
+
+function readTracker(home) {
+  const path = trackerPath(home);
+  return existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : {};
+}
+
+function contentText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((block) => block?.text ?? "").join("\n");
+  }
+  return "";
+}
+
+function installFetch() {
+  const fetchSpy = vi.fn(async (url, options = {}) => {
+    const body = JSON.parse(options.body ?? "{}");
+    let payload;
+    if (String(url).includes("/api/v1/tools/")) {
+      payload = { result: "tool ok" };
+    } else if (String(url).includes("/api/v1/context/ingest")) {
+      payload = { conversation_id: "conv", status: "ok" };
+    } else if (body.messages?.some((message) => contentText(message.content).includes("VCSTATUS"))) {
+      payload = { vc_command: "status", message: "status ok" };
+    } else {
+      payload = { conversation_id: "conv", body: { messages: body.messages ?? [] }, metadata: {} };
+    }
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  globalThis.fetch = fetchSpy;
+  return fetchSpy;
+}
+
+async function registerPlugin(home, pluginConfig = {}) {
+  vi.resetModules();
+  vi.doMock("node:os", async () => {
+    const actual = await vi.importActual("node:os");
+    return { ...actual, homedir: () => home };
+  });
+
+  const mod = await import("../index.js");
+  const handlers = new Map();
+  const toolFactories = [];
+  const log = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
+  const api = {
+    logger: log,
+    pluginConfig: {
+      vcKey: "k",
+      baseUrl: "https://api.example.com",
+      ...pluginConfig,
+    },
+    config: {},
+    registerTool: vi.fn((factory) => toolFactories.push(factory)),
+    on: vi.fn((name, handler) => handlers.set(name, handler)),
+  };
+
+  mod.default.register(api);
+  return { handlers, toolFactories, log };
+}
+
+function prepareEvent(prompt = "hello") {
+  return { prompt, messages: [] };
+}
+
+function ctx(sessionId, sessionKey = STABLE_KEY) {
+  return { sessionId, sessionKey, model: "openai-codex/gpt-5.5" };
+}
+
+describe("convIdentity hook routing", () => {
+  it("stable mode routes prepare, ingest, and tools through the selected conv id", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, toolFactories, log } = await registerPlugin(home, {
+      convIdentity: "stable",
+      debug: true,
+    });
+
+    await handlers.get("before_prompt_build")(prepareEvent(), ctx(SID1));
+    await handlers.get("agent_end")({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    }, ctx(SID1));
+    const tool = toolFactories[0](ctx(SID1));
+    await tool.execute("call-1", { tag: "x" });
+
+    const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+    expect(urls[0]).toBe(
+      `https://api.example.com/api/v1/context/prepare?vckey=k&vcconv=${STABLE_CONV_QS}&predecessor=${SID1}`,
+    );
+    expect(urls[1]).toBe(
+      `https://api.example.com/api/v1/context/ingest?vckey=k&vcconv=${STABLE_CONV_QS}`,
+    );
+    expect(urls[2]).toContain(`/api/v1/tools/`);
+    expect(urls[2]).toContain(`vcconv=${STABLE_CONV_QS}`);
+    expect(urls[2]).not.toContain("predecessor=");
+
+    const debugPrepareLogs = log.info.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message.includes("[vc:debug] prepare request"));
+    expect(debugPrepareLogs.some((message) => message.includes(`vcconv=sk:${STABLE_KEY}`))).toBe(true);
+    expect(debugPrepareLogs.some((message) => message.includes(`vcconv=${SID1}`))).toBe(false);
+  });
+
+  it("session mode keeps the legacy URL shape and emits no fallback warning", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home, { convIdentity: "session" });
+
+    await handlers.get("before_prompt_build")(prepareEvent(), ctx(SID1));
+
+    expect(fetchSpy.mock.calls[0][0]).toBe(
+      `https://api.example.com/api/v1/context/prepare?vckey=k&vcconv=${SID1}`,
+    );
+    expect(fetchSpy.mock.calls[0][0]).not.toContain("predecessor=");
+    expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
+      .not.toContain("ephemeral conv-id fallback");
+  });
+
+  it("invalid convIdentity resolves to session mode with one config warning", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home, { convIdentity: "bogus" });
+
+    await handlers.get("before_prompt_build")(prepareEvent(), ctx(SID1));
+
+    expect(fetchSpy.mock.calls[0][0]).toBe(
+      `https://api.example.com/api/v1/context/prepare?vckey=k&vcconv=${SID1}`,
+    );
+    const warnings = log.warn.mock.calls.map(([message]) => message);
+    expect(warnings.filter((message) => message.includes("convIdentity="))).toHaveLength(1);
+    expect(warnings.join("\n")).not.toContain("ephemeral conv-id fallback");
+  });
+
+  it("warns only missing and unparseable stable-mode fallbacks", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home, { convIdentity: "stable" });
+    const prepare = handlers.get("before_prompt_build");
+
+    await prepare(prepareEvent(), { sessionId: SID1 });
+    await prepare(prepareEvent(), { sessionId: SID2, sessionKey: "agent:a:matrix:room:abc" });
+    await prepare(prepareEvent(), { sessionId: "subagent-session", sessionKey: "agent:a:subagent:spawn" });
+    await prepare(prepareEvent(), { sessionId: "explicit-session", sessionKey: "agent:a:explicit:explicit-session" });
+
+    const fallbackWarnings = log.warn.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message.includes("ephemeral conv-id fallback"));
+    expect(fallbackWarnings).toHaveLength(2);
+    expect(fallbackWarnings[0]).toContain("missing_session_key");
+    expect(fallbackWarnings[0]).toContain("count=1");
+    expect(fallbackWarnings[1]).toContain("unparseable_session_key");
+    expect(fallbackWarnings[1]).toContain("count=2");
+    for (const [url] of fetchSpy.mock.calls) {
+      expect(String(url)).not.toContain("predecessor=");
+    }
+  });
+
+  it("keeps the ingest tracker sessionId-keyed, including VCREINGEST replay", async () => {
+    const home = makeHome();
+    writeSessionJsonl(home, "a", SID1, [
+      { role: "user", content: "old 1" },
+      { role: "assistant", content: "old 2" },
+    ]);
+    writeSessionJsonl(home, "a", SID2, [
+      { role: "user", content: "old a" },
+      { role: "assistant", content: "old b" },
+    ]);
+
+    const fetchSpy = installFetch();
+    const { handlers } = await registerPlugin(home, { convIdentity: "stable" });
+    const prepare = handlers.get("before_prompt_build");
+
+    await prepare(prepareEvent("new 1"), ctx(SID1));
+    await prepare(prepareEvent("new 2"), ctx(SID2));
+
+    let tracker = readTracker(home);
+    expect(Object.keys(tracker).sort()).toEqual([SID1, SID2].sort());
+    expect(tracker).not.toHaveProperty(`sk:${STABLE_KEY}`);
+    expect(JSON.parse(fetchSpy.mock.calls[0][1].body).messages).toHaveLength(3);
+    expect(JSON.parse(fetchSpy.mock.calls[1][1].body).messages).toHaveLength(3);
+
+    await prepare(prepareEvent("VCREINGEST"), ctx(SID1));
+    tracker = readTracker(home);
+    expect(tracker).not.toHaveProperty(SID1);
+    expect(tracker).toHaveProperty(SID2);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    await prepare(prepareEvent("new 1 again"), ctx(SID1));
+
+    tracker = readTracker(home);
+    expect(Object.keys(tracker).sort()).toEqual([SID1, SID2].sort());
+    expect(fetchSpy.mock.calls[2][0]).toBe(
+      `https://api.example.com/api/v1/context/prepare?vckey=k&vcconv=${STABLE_CONV_QS}&predecessor=${SID1}`,
+    );
+    expect(JSON.parse(fetchSpy.mock.calls[2][1].body).messages).toHaveLength(3);
+  });
+
+  it("keeps VC-command ingest skip state scoped to sessionId", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers } = await registerPlugin(home, { convIdentity: "stable" });
+
+    await handlers.get("before_prompt_build")(prepareEvent("VCSTATUS"), ctx(SID1));
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    await handlers.get("agent_end")({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "sid2 done" }] }],
+    }, ctx(SID2));
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls[1][0]).toContain("/api/v1/context/ingest");
+
+    await handlers.get("agent_end")({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "sid1 done" }] }],
+    }, ctx(SID1));
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("provider-filter transition warnings do not trigger identity fallback warnings", async () => {
+    const home = makeHome();
+    writeSessionsStore(home, "a", STABLE_KEY, "openai-codex", "gpt-5.5");
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      convIdentity: "stable",
+      providers: ["openai-codex/gpt-5.5"],
+    });
+
+    await handlers.get("before_prompt_build")(prepareEvent(), ctx(SID1));
+    writeSessionsStore(home, "a", STABLE_KEY, "minimax", "m2.7");
+    await handlers.get("before_prompt_build")(prepareEvent("skipped"), ctx(SID1));
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const warnings = log.warn.mock.calls.map(([message]) => message).join("\n");
+    expect(warnings).toContain("provider filter now SKIPPING");
+    expect(warnings).not.toContain("ephemeral conv-id fallback");
+  });
+});

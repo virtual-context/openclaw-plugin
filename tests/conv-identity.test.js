@@ -3,10 +3,10 @@
  *
  * deriveConvIdentity(sessionKey, sessionId) -> { convId, isStable, fallbackReason? }
  *
- * Stable scopes get `sk:` + sessionKey (cron run-suffix stripped); subagent and
- * explicit sessions are intentionally ephemeral (no warning reason beyond their
- * scope name); missing/unparseable keys fall back to the session UUID with a
- * reason the caller counts and warns on.
+ * Stable scopes get `sk:` + sessionKey (cron run-suffix stripped). Subagents
+ * are intentionally ephemeral with a non-warning reason; explicit sessions are
+ * intentionally ephemeral without a fallback reason. Missing/unparseable keys
+ * fall back to the session UUID with a reason the caller counts and warns on.
  *
  * buildUrl gains an options object: { predecessor } appends an encoded
  * `predecessor` param after `vcconv`.
@@ -48,6 +48,14 @@ describe("deriveConvIdentity — stable scopes", () => {
     const b = deriveConvIdentity("agent:beta:telegram:direct:42", SID);
     expect(a.convId).not.toBe(b.convId);
   });
+
+  it("preserves agent id casing verbatim", () => {
+    const key = "agent:BastKid-Dedicated:telegram:direct:8049932331";
+    expect(deriveConvIdentity(key, SID)).toEqual({
+      convId: `sk:${key}`,
+      isStable: true,
+    });
+  });
 });
 
 describe("deriveConvIdentity — intentional ephemeral (no warning class)", () => {
@@ -58,7 +66,7 @@ describe("deriveConvIdentity — intentional ephemeral (no warning class)", () =
 
   it("explicit (disposable/probe) sessions stay per-session", () => {
     const r = deriveConvIdentity(`agent:bastkid-dedicated:explicit:${SID}`, SID);
-    expect(r).toEqual({ convId: SID, isStable: false, fallbackReason: "explicit" });
+    expect(r).toEqual({ convId: SID, isStable: false });
   });
 });
 
@@ -78,8 +86,22 @@ describe("deriveConvIdentity — fallbacks that must be warned on", () => {
   });
 
   it("case variants of structural tokens are unparseable, not best-effort", () => {
-    const r = deriveConvIdentity("Agent:bastkid-dedicated:telegram:direct:42", SID);
-    expect(r).toEqual({ convId: SID, isStable: false, fallbackReason: "unparseable_session_key" });
+    for (const key of [
+      "Agent:bastkid-dedicated:telegram:direct:42",
+      "agent:bastkid-dedicated:Telegram:direct:42",
+      "agent:bastkid-dedicated:telegram:Direct:42",
+      "agent:bastkid-dedicated:discord:Channel:42",
+      "agent:bastkid-dedicated:Cron:job",
+      "agent:bastkid-dedicated:cron:job:Run:run",
+      "agent:bastkid-dedicated:Subagent:spawn",
+      "agent:bastkid-dedicated:Explicit:session",
+    ]) {
+      expect(deriveConvIdentity(key, SID)).toEqual({
+        convId: SID,
+        isStable: false,
+        fallbackReason: "unparseable_session_key",
+      });
+    }
   });
 
   it("truncated scopes are unparseable", () => {
@@ -136,5 +158,17 @@ describe("vcPost forwards predecessor to the wire", () => {
       { assistant_message: "x" }, 15000, null);
     const calledUrl = fetchSpy.mock.calls[0][0];
     expect(calledUrl).toBe("https://api.example.com/api/v1/context/ingest?vckey=k&vcconv=conv-1");
+  });
+});
+
+describe("plugin schema", () => {
+  it("exposes convIdentity as a session-defaulted config gate", async () => {
+    const manifest = await import("../openclaw.plugin.json", { with: { type: "json" } });
+    expect(manifest.default.configSchema.properties.convIdentity).toEqual({
+      type: "string",
+      enum: ["session", "stable"],
+      default: "session",
+      description: expect.any(String),
+    });
   });
 });
