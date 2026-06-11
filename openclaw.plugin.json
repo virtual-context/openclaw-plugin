@@ -2,11 +2,15 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.1.1",
+  "version": "5.1.2",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {
-    "onCapabilities": ["hook", "tool"]
+    "onCapabilities": [
+      "hook",
+      "tool"
+    ],
+    "onStartup": true
   },
   "configSchema": {
     "type": "object",
@@ -21,7 +25,9 @@
       },
       "providers": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "List of provider/model strings to activate for (e.g. [\"openai-direct/gpt-5.4\"]). Empty or omitted = all providers."
       },
       "debug": {
@@ -30,5 +36,17 @@
       }
     },
     "additionalProperties": false
-  }
+  },
+  "contracts": {
+    "tools": [
+      "vc_expand_topic",
+      "vc_find_quote",
+      "vc_recall_all",
+      "vc_query_facts",
+      "vc_remember_when",
+      "vc_restore_tool",
+      "vc_find_session"
+    ]
+  },
+  "enabledByDefault": true
 }

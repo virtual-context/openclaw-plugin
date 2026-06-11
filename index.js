@@ -1,3 +1,4 @@
+import { r as markReplyPayloadForSourceSuppressionDelivery } from "/usr/lib/node_modules/openclaw/dist/reply-payload-CK0pmGzM.js";
 /**
  * virtual-context — OpenClaw lifecycle plugin (v5)
  *
@@ -187,6 +188,46 @@ export function renderVcCommandMessage(prepareResult) {
   );
 }
 
+/**
+ * Hoist a leading role:"system" entry in body.messages into body.system.
+ *
+ * The /api/v1/context/prepare response may carry a system preamble (e.g.
+ * `<system-reminder>` / `<context-topics>` tag summaries) as the first
+ * entry in body.messages with role:"system" instead of placing it in the
+ * dedicated body.system field. The host runtime that consumes this body
+ * has no handler for role:"system" inputs in the messages array and
+ * silently drops them, so the preamble never reaches the model.
+ *
+ * Mutates `body` in place: shifts the leading system entry out of
+ * body.messages and appends its text into body.system. When body.system
+ * is already populated, concatenates: newline-joined strings, or
+ * block-array append for Anthropic-shaped content. Returns the number
+ * of characters hoisted, or undefined when no hoist was performed.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function hoistSystemPreamble(body) {
+  if (!body || !Array.isArray(body.messages) || body.messages.length === 0) return;
+  const first = body.messages[0];
+  if (!first || first.role !== "system") return;
+  const c = first.content;
+  const text = typeof c === "string"
+    ? c
+    : Array.isArray(c)
+      ? c.filter((b) => b?.type === "text").map((b) => b.text).join("\n")
+      : "";
+  if (!text) return;
+  body.messages.shift();
+  if (typeof body.system === "string" && body.system.length > 0) {
+    body.system = body.system + "\n" + text;
+  } else if (Array.isArray(body.system) && body.system.length > 0) {
+    body.system = [...body.system, { type: "text", text }];
+  } else {
+    body.system = text;
+  }
+  return text.length;
+}
+
 export async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000, log = null) {
   const url = buildUrl(baseUrl, path, vcKey, sessionId);
   const serialized = JSON.stringify(body);
@@ -296,14 +337,142 @@ export default {
             };
           }
         },
-      }));
+      }), { names: [def.name] });
     }
     log.info?.(`[vc] registered ${vcTools.length} tools (hardcoded)`);
+
+    // ── Native slash commands (/vcstatus, /vcmerge, /vclabel, /vcattach, /vcreingest) ──
+    // Use api.registerCommand so each channel (Telegram, Discord, etc.) auto-registers
+    // the slash commands and routes invocations through the native-command pipeline,
+    // which auto-delivers the handler's returned {text} to the originating channel.
+    // This bypasses the prepend-context+LLM round-trip used by the prompt-text intercept
+    // hook below — important for agent-mode bots (Bast) whose harness only delivers via
+    // the message tool, where prepend-context responses are stranded in the assistant
+    // turn and never sent to the user.
+    const vcSlashCommands = [
+      { name: "vcstatus", description: "Show VC conversation status (ingest, watermarks, tokens).", acceptsArgs: false, cmd: "VCSTATUS" },
+      { name: "vcmerge",  description: "Merge VC tags (e.g. /vcmerge PREVIEW or /vcmerge tag1 tag2 ...).", acceptsArgs: true,  cmd: "VCMERGE"  },
+      { name: "vclabel",  description: "Set or update conversation label (e.g. /vclabel My Project).",     acceptsArgs: true,  cmd: "VCLABEL"  },
+      { name: "vcattach", description: "Attach a tag/topic to the VC conversation (/vcattach <tag>).",     acceptsArgs: true,  cmd: "VCATTACH" },
+    ];
+    for (const def of vcSlashCommands) {
+      api.registerCommand({
+        name: def.name,
+        description: def.description,
+        acceptsArgs: def.acceptsArgs,
+        handler: async (ctx) => {
+          const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+          const args = (ctx?.args ?? "").trim();
+          const promptText = args ? `${def.cmd} ${args}` : def.cmd;
+          const synthMessages = [{
+            role: "user",
+            content: [{ type: "text", text: promptText }],
+            timestamp: Date.now(),
+          }];
+          try {
+            const prepareResult = await vcPost(
+              baseUrl,
+              "/api/v1/context/prepare",
+              vcKey,
+              sessionId,
+              { messages: synthMessages },
+              60000,
+              debug ? log : null
+            );
+            if (prepareResult?.vc_command) {
+              return { text: renderVcCommandMessage(prepareResult) };
+            }
+            return { text: `[VC ${def.cmd}] no command response from cloud (raw: ${JSON.stringify(prepareResult).slice(0, 200)})` };
+          } catch (err) {
+            log.error?.(`[vc] /${def.name} command failed: ${err}`);
+            return { text: `Error running /${def.name}: ${err.message}` };
+          }
+        },
+      });
+    }
+
+    // /vcreingest — local-only (no cloud call); mirrors the prompt-text intercept handler.
+    api.registerCommand({
+      name: "vcreingest",
+      description: "Reset VC ingest tracker; the next message will re-send full history.",
+      acceptsArgs: false,
+      handler: async (ctx) => {
+        const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+        resetSessionIngest(sessionId);
+        log.info?.(`[vc] /vcreingest — reset ingest tracker for session=${sessionId}`);
+        return { text: `Session ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
+      },
+    });
+
+    log.info?.(`[vc] registered ${vcSlashCommands.length + 1} native slash commands (vcstatus, vcmerge, vclabel, vcattach, vcreingest)`);
 
     // ── before_prompt_build: prepare context ──
     // FILESYSTEM: Reads sessions.json to resolve the current model (read-only).
     // NETWORK: POST /api/v1/context/prepare — sends full message history to cloud.
     // PAYLOAD: Replaces messages in-place with the compressed payload from the cloud.
+    // ── before_agent_reply: claim VC commands before the agent harness runs ──
+    // For VCSTATUS / VCMERGE / VCLABEL / VCATTACH / VCREINGEST typed as plain text,
+    // claim the reply directly here. The gateway's before_agent_reply pipeline accepts
+    // {handled: true, reply: {text}} and short-circuits the LLM round-trip, so the
+    // response bypasses Bast's message-tool-only delivery harness entirely. Without
+    // this, the legacy `before_prompt_build` prependContext path emits the response
+    // into the LLM assistant.content, which the agent harness then drops in
+    // messageToolOnly mode (group/channel chats by default), and the user sees
+    // nothing.
+    api.on("before_agent_reply", async (event, ctx) => {
+      const promptText = (event?.cleanedBody ?? "").trim();
+      // DIAG: log every invocation so we know who's calling
+      log.info?.(`[vc:DIAG-bar] entry trigger=${ctx?.trigger ?? "?"} sessionKey=${ctx?.sessionKey ?? "?"} sessionId=${ctx?.sessionId ?? "?"} channel=${ctx?.channel ?? ctx?.messageProvider ?? "?"} channelId=${ctx?.channelId ?? "?"} promptHead=${JSON.stringify(promptText.slice(0,60))}`);
+      if (!/^VC[A-Z]/i.test(promptText)) {
+        log.info?.(`[vc:DIAG-bar] not a VC command, falling through`);
+        return;
+      }
+      const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+      log.info?.(`[vc:DIAG-bar] matched VC command, will call cloud sessionId=${sessionId}`);
+
+      // VCREINGEST is local-only — no cloud round-trip
+      if (/^VCREINGEST\b/i.test(promptText)) {
+        resetSessionIngest(sessionId);
+        vcCommandSessions.add(sessionId);
+        log.info?.(`[vc] before_agent_reply: VCREINGEST — reset ingest tracker for session=${sessionId}`);
+        return {
+          handled: true,
+          reply: markReplyPayloadForSourceSuppressionDelivery({ text: `Session ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` }),
+        };
+      }
+
+      // Cloud-handled commands: synthesize a minimal prepare request with the VC prompt
+      const synthMessages = [{
+        role: "user",
+        content: [{ type: "text", text: promptText }],
+        timestamp: Date.now(),
+      }];
+      try {
+        const prepareResult = await vcPost(
+          baseUrl,
+          "/api/v1/context/prepare",
+          vcKey,
+          sessionId,
+          { messages: synthMessages },
+          60000,
+          debug ? log : null
+        );
+        if (prepareResult?.vc_command) {
+          vcCommandSessions.add(sessionId);
+          const replyText = renderVcCommandMessage(prepareResult);
+          log.info?.(`[vc:DIAG-bar] returning handled reply: vc_command=${prepareResult.vc_command} replyTextHead=${JSON.stringify(replyText.slice(0,80))}`);
+          log.info?.(`[vc] before_agent_reply: VC command ${prepareResult.vc_command} — handled directly (skipping LLM)`);
+          return { handled: true, reply: markReplyPayloadForSourceSuppressionDelivery({ text: replyText }) };
+        }
+        // Cloud didn't recognize it as a VC command — let the normal flow run
+        log.warn?.(`[vc] before_agent_reply: prompt looked like VC command but cloud did not respond with vc_command (got keys: ${Object.keys(prepareResult || {}).join(",")})`);
+        return;
+      } catch (err) {
+        log.error?.(`[vc] before_agent_reply: VC command failed: ${err}`);
+        return { handled: true, reply: markReplyPayloadForSourceSuppressionDelivery({ text: `Error running VC command: ${err.message}` }) };
+      }
+    });
+
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
@@ -438,6 +607,13 @@ export default {
       }
 
       if (!body) return;
+
+      // Hoist any leading role:"system" entry in body.messages into body.system,
+      // so the existing systemPrompt-override path below routes it to the model.
+      const hoistedChars = hoistSystemPreamble(body);
+      if (hoistedChars) {
+        log.info?.(`[vc] hoisted ${hoistedChars}-char system preamble from body.messages[0] into body.system`);
+      }
 
       // Replace messages in-place with the enriched payload's messages
       if (Array.isArray(body.messages) && Array.isArray(event.messages)) {
