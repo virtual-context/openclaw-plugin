@@ -516,6 +516,7 @@ export default {
         acceptsArgs: def.acceptsArgs,
         handler: async (ctx) => {
           const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
           const args = (ctx?.args ?? "").trim();
           const promptText = args ? `${def.cmd} ${args}` : def.cmd;
           const synthMessages = [{
@@ -528,7 +529,7 @@ export default {
               baseUrl,
               "/api/v1/context/prepare",
               vcKey,
-              sessionId,
+              identity.convId,
               { messages: synthMessages },
               60000,
               debug ? log : null
@@ -583,7 +584,8 @@ export default {
         return;
       }
       const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
-      log.info?.(`[vc:DIAG-bar] matched VC command, will call cloud sessionId=${sessionId}`);
+      const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
+      log.info?.(`[vc:DIAG-bar] matched VC command, will call cloud sessionId=${sessionId} conv=${identity.convId}`);
 
       // VCREINGEST is local-only — no cloud round-trip
       if (/^VCREINGEST\b/i.test(promptText)) {
@@ -607,7 +609,7 @@ export default {
           baseUrl,
           "/api/v1/context/prepare",
           vcKey,
-          sessionId,
+          identity.convId,
           { messages: synthMessages },
           60000,
           debug ? log : null
