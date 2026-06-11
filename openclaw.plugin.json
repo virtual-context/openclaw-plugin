@@ -2,11 +2,14 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.1.2",
+  "version": "5.2.0",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {
-    "onCapabilities": ["hook", "tool"]
+    "onCapabilities": [
+      "hook",
+      "tool"
+    ]
   },
   "configSchema": {
     "type": "object",
@@ -21,12 +24,23 @@
       },
       "providers": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "description": "List of provider/model strings to activate for (e.g. [\"openai-direct/gpt-5.4\"]). Empty or omitted = all providers."
       },
       "debug": {
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."
+      },
+      "convIdentity": {
+        "type": "string",
+        "enum": [
+          "session",
+          "stable"
+        ],
+        "default": "session",
+        "description": "Conversation identity mode: 'session' keys VC conversations by the rotating OpenClaw session UUID (legacy); 'stable' keys durable chat scopes by their session key so memory survives session rotation."
       }
     },
     "additionalProperties": false

@@ -165,13 +165,69 @@ export function noteFilterResult(state, sessionKey, model, passed) {
 }
 
 /**
+ * Derive the VC conversation identity for a session.
+ *
+ * Durable chat scopes get a stable, human-readable conversation id (`sk:` +
+ * sessionKey) that survives OpenClaw session-UUID rotation; cron runs collapse
+ * to their per-job identity. Subagent spawns and explicit (disposable) sessions
+ * are ephemeral by design. Anything missing or outside the known table falls
+ * back to the per-session UUID with a fallbackReason the caller is expected to
+ * count and warn on — unknown scope shapes must never be wildcarded into
+ * stable ids (a new scope family requires a table entry and a test).
+ *
+ * Structural tokens are matched case-sensitively, exactly as OpenClaw emits
+ * them; the full sessionKey (including the leading agent namespace) is
+ * preserved verbatim so two agents sharing a peer id never collide.
+ *
+ * Pure function; exported for unit testing.
+ * Returns { convId, isStable, fallbackReason? }.
+ */
+export function deriveConvIdentity(sessionKey, sessionId) {
+  if (typeof sessionKey !== "string" || sessionKey.length === 0) {
+    return { convId: sessionId, isStable: false, fallbackReason: "missing_session_key" };
+  }
+  const parts = sessionKey.split(":");
+  if (parts[0] !== "agent" || !parts[1]) {
+    return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
+  }
+  const scope = parts.slice(2);
+  const stable = (key) => ({ convId: `sk:${key}`, isStable: true });
+
+  if (scope.length === 1 && scope[0] === "main") return stable(sessionKey);
+  if (scope.length === 3 && scope[0] === "telegram" &&
+      ["direct", "group", "slash"].includes(scope[1]) && scope[2]) {
+    return stable(sessionKey);
+  }
+  if (scope.length === 3 && scope[0] === "discord" && scope[1] === "channel" && scope[2]) {
+    return stable(sessionKey);
+  }
+  if (scope[0] === "cron" && scope[1]) {
+    if (scope.length === 2) return stable(sessionKey);
+    if (scope.length === 4 && scope[2] === "run" && scope[3]) {
+      return stable(parts.slice(0, 4).join(":")); // strip :run:<runUuid>
+    }
+    return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
+  }
+  if (scope.length === 2 && scope[0] === "subagent" && scope[1]) {
+    return { convId: sessionId, isStable: false, fallbackReason: "subagent" };
+  }
+  if (scope.length === 2 && scope[0] === "explicit" && scope[1]) {
+    return { convId: sessionId, isStable: false, fallbackReason: "explicit" };
+  }
+  return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
+}
+
+/**
  * Build a fully-qualified VC REST URL with vckey + optional vcconv query params.
+ * opts.predecessor, when present, is appended (encoded) after vcconv — the
+ * forward-link hint sent on stable prepares only (see deriveConvIdentity).
  * Pure function; exported for unit testing.
  */
-export function buildUrl(baseUrl, path, vcKey, sessionId) {
+export function buildUrl(baseUrl, path, vcKey, convId, opts = {}) {
   const base = `${baseUrl.replace(/\/+$/, "")}${path}`;
   const params = [`vckey=${encodeURIComponent(vcKey)}`];
-  if (sessionId) params.push(`vcconv=${encodeURIComponent(sessionId)}`);
+  if (convId) params.push(`vcconv=${encodeURIComponent(convId)}`);
+  if (opts.predecessor) params.push(`predecessor=${encodeURIComponent(opts.predecessor)}`);
   return `${base}?${params.join("&")}`;
 }
 
@@ -254,8 +310,8 @@ export function hoistSystemPreamble(body) {
   return text.length;
 }
 
-export async function vcPost(baseUrl, path, vcKey, sessionId, body, timeoutMs = 15000, log = null) {
-  const url = buildUrl(baseUrl, path, vcKey, sessionId);
+export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 15000, log = null, urlOpts = {}) {
+  const url = buildUrl(baseUrl, path, vcKey, convId, urlOpts);
   const serialized = JSON.stringify(body);
   const byteLen = Buffer.byteLength(serialized, "utf-8");
   const msgCount = body?.messages?.length ?? 0;
@@ -293,12 +349,39 @@ export default {
       : null; // null = all providers
     const debug = cfg.debug === true;
 
+    // Conversation identity mode. Defensive even with schema validation: anything
+    // other than the literal "stable" behaves as "session" (exact legacy behavior)
+    // and unexpected values log a config warning once here at register.
+    const stableMode = cfg.convIdentity === "stable";
+    if (cfg.convIdentity !== undefined && !["session", "stable"].includes(cfg.convIdentity)) {
+      log.warn?.(`[vc] WARNING: convIdentity="${cfg.convIdentity}" is not "session"|"stable" — treating as "session"`);
+    }
+
+    // In stable mode, count ephemeral fallbacks for scopes that SHOULD be stable
+    // (missing/unparseable sessionKey). Intentional ephemeral scopes (subagent,
+    // explicit) never warn. In session mode derivation is bypassed entirely.
+    let fallbackWarnCount = 0;
+    function selectConvId(sessionKey, sessionId) {
+      if (!stableMode) return { convId: sessionId, isStable: false };
+      const identity = deriveConvIdentity(sessionKey, sessionId);
+      if (identity.fallbackReason === "missing_session_key" || identity.fallbackReason === "unparseable_session_key") {
+        fallbackWarnCount++;
+        (log.warn ?? log.info)?.(
+          `[vc] WARN ephemeral conv-id fallback (${identity.fallbackReason}) — ` +
+          `session=${sessionId} sessionKey=${JSON.stringify(sessionKey ?? "")} ` +
+          `count=${fallbackWarnCount} this boot. This scope is getting per-UUID conv ` +
+          `identity; if systematic, a caller is not passing sessionKey.`
+        );
+      }
+      return identity;
+    }
+
     if (!vcKey) {
       log.warn?.("[vc] no vcKey configured — plugin disabled");
       return;
     }
 
-    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     // ── Config compatibility checks ──
     const ocConfig = api.config ?? {};
@@ -339,7 +422,8 @@ export default {
         parameters: def.input_schema,
         async execute(toolCallId, params) {
           const sessionId = ctx?.sessionId ?? "unknown";
-          log.info?.(`[vc] tool call — ${def.name} session=${sessionId}`);
+          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
+          log.info?.(`[vc] tool call — ${def.name} session=${sessionId} conv=${identity.convId}`);
           if (debug) log.info?.(`[vc:debug] tool ${def.name} request: ${JSON.stringify(params).slice(0, 500)}`);
 
           try {
@@ -347,7 +431,7 @@ export default {
               baseUrl,
               `/api/v1/tools/${def.name}`,
               vcKey,
-              sessionId,
+              identity.convId,
               { arguments: params },
               15000,
               debug ? log : null
@@ -463,8 +547,14 @@ export default {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
       };
+      // Conversation identity: stable scopes get the sk: id; the predecessor
+      // forward-link hint goes on prepare ONLY, and only when the selected
+      // identity is stable (it then necessarily differs from the session UUID).
+      const identity = selectConvId(sessionKey, sessionId);
+      const predecessor = identity.isStable && identity.convId !== sessionId ? sessionId : undefined;
+
       if (debug) {
-        log.info?.(`[vc:debug] prepare request — url=${baseUrl}/api/v1/context/prepare vcconv=${sessionId} messages=${prepareBody.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
+        log.info?.(`[vc:debug] prepare request — url=${baseUrl}/api/v1/context/prepare vcconv=${identity.convId}${predecessor ? ` predecessor=${predecessor}` : ""} messages=${prepareBody.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
         log.info?.(`[vc:debug] prepare first message: ${JSON.stringify(prepareBody.messages?.[0])?.slice(0, 300)}`);
         log.info?.(`[vc:debug] prepare last message: ${JSON.stringify(prepareBody.messages?.[prepareBody.messages.length - 1])?.slice(0, 300)}`);
       }
@@ -472,7 +562,7 @@ export default {
       let prepareResult;
       try {
         const prepareTimeoutMs = selectPrepareTimeout({ isVcCommand, isInitialIngest });
-        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, sessionId, prepareBody, prepareTimeoutMs, log);
+        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, identity.convId, prepareBody, prepareTimeoutMs, log, predecessor ? { predecessor } : {});
       } catch (err) {
         log.error?.(`[vc] prepare failed: ${err} — passing through unmodified`);
         if (debug) log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
@@ -618,11 +708,12 @@ export default {
 
       if (!assistantMessage) return;
 
-      log.info?.(`[vc] ingest — session=${sessionId} assistant_message=${assistantMessage.length} chars`);
+      const identity = selectConvId(sessionKey, sessionId);
+      log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
       if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
       try {
-        const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, sessionId, {
+        const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
           assistant_message: assistantMessage,
         }, 15000, log);
         log.info?.(
