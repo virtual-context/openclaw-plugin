@@ -9,7 +9,8 @@
     "onCapabilities": [
       "hook",
       "tool"
-    ]
+    ],
+    "onStartup": true
   },
   "configSchema": {
     "type": "object",
@@ -44,5 +45,17 @@
       }
     },
     "additionalProperties": false
-  }
+  },
+  "contracts": {
+    "tools": [
+      "vc_expand_topic",
+      "vc_find_quote",
+      "vc_recall_all",
+      "vc_query_facts",
+      "vc_remember_when",
+      "vc_restore_tool",
+      "vc_find_session"
+    ]
+  },
+  "enabledByDefault": true
 }

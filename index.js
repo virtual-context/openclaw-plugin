@@ -39,6 +39,40 @@ const vcCommandSessions = new Set();
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
 
+// ── Host runtime suppression marker (lazy) ──
+// The suppression-delivery helper lives in the gateway dist under a
+// hash-suffixed filename that changes per release, at a prefix that differs per
+// host. Resolve it lazily by scanning known dist roots; outside a gateway host
+// (unit tests, dev) fall back to identity so replies still deliver, just without
+// the suppression marking.
+let _suppressionMarkerPromise = null;
+function loadSuppressionMarker(log) {
+  if (!_suppressionMarkerPromise) {
+    _suppressionMarkerPromise = (async () => {
+      const roots = [
+        "/usr/lib/node_modules/openclaw/dist",
+        "/opt/homebrew/lib/node_modules/openclaw/dist",
+        "/usr/local/lib/node_modules/openclaw/dist",
+      ];
+      for (const root of roots) {
+        try {
+          const { readdirSync } = await import("node:fs");
+          const file = readdirSync(root).find((f) => /^reply-payload-.*\.js$/.test(f));
+          if (!file) continue;
+          const mod = await import(join(root, file));
+          if (typeof mod.r === "function") return mod.r;
+          const named = Object.values(mod).find((v) => typeof v === "function");
+          if (named) return named;
+        } catch { /* try next root */ }
+      }
+      log?.warn?.("[vc] reply-payload suppression marker not found in gateway dist — replies deliver unmarked");
+      return (payload) => payload;
+    })();
+  }
+  return _suppressionMarkerPromise;
+}
+
+
 // ── JSONL ingest tracking ──
 // Tracks which sessions have had their full JSONL history sent to the VC cloud.
 // On first prepare for a new session, reads the entire JSONL and sends all messages.
@@ -454,14 +488,146 @@ export default {
             };
           }
         },
-      }));
+      }), { names: [def.name] });
     }
     log.info?.(`[vc] registered ${vcTools.length} tools (hardcoded)`);
+
+    // ── Native slash commands (/vcstatus, /vcmerge, /vclabel, /vcattach, /vcreingest) ──
+    // Use api.registerCommand so each channel (Telegram, Discord, etc.) auto-registers
+    // the slash commands and routes invocations through the native-command pipeline,
+    // which auto-delivers the handler's returned {text} to the originating channel.
+    // This bypasses the prepend-context+LLM round-trip used by the prompt-text intercept
+    // hook below — important for agent-mode bots (Bast) whose harness only delivers via
+    // the message tool, where prepend-context responses are stranded in the assistant
+    // turn and never sent to the user.
+    if (typeof api.registerCommand !== "function") {
+      log.info?.("[vc] gateway does not expose registerCommand — native slash commands skipped");
+    } else {
+    const vcSlashCommands = [
+      { name: "vcstatus", description: "Show VC conversation status (ingest, watermarks, tokens).", acceptsArgs: false, cmd: "VCSTATUS" },
+      { name: "vcmerge",  description: "Merge VC tags (e.g. /vcmerge PREVIEW or /vcmerge tag1 tag2 ...).", acceptsArgs: true,  cmd: "VCMERGE"  },
+      { name: "vclabel",  description: "Set or update conversation label (e.g. /vclabel My Project).",     acceptsArgs: true,  cmd: "VCLABEL"  },
+      { name: "vcattach", description: "Attach a tag/topic to the VC conversation (/vcattach <tag>).",     acceptsArgs: true,  cmd: "VCATTACH" },
+    ];
+    for (const def of vcSlashCommands) {
+      api.registerCommand({
+        name: def.name,
+        description: def.description,
+        acceptsArgs: def.acceptsArgs,
+        handler: async (ctx) => {
+          const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+          const args = (ctx?.args ?? "").trim();
+          const promptText = args ? `${def.cmd} ${args}` : def.cmd;
+          const synthMessages = [{
+            role: "user",
+            content: [{ type: "text", text: promptText }],
+            timestamp: Date.now(),
+          }];
+          try {
+            const prepareResult = await vcPost(
+              baseUrl,
+              "/api/v1/context/prepare",
+              vcKey,
+              sessionId,
+              { messages: synthMessages },
+              60000,
+              debug ? log : null
+            );
+            if (prepareResult?.vc_command) {
+              return { text: renderVcCommandMessage(prepareResult) };
+            }
+            return { text: `[VC ${def.cmd}] no command response from cloud (raw: ${JSON.stringify(prepareResult).slice(0, 200)})` };
+          } catch (err) {
+            log.error?.(`[vc] /${def.name} command failed: ${err}`);
+            return { text: `Error running /${def.name}: ${err.message}` };
+          }
+        },
+      });
+    }
+
+    // /vcreingest — local-only (no cloud call); mirrors the prompt-text intercept handler.
+    api.registerCommand({
+      name: "vcreingest",
+      description: "Reset VC ingest tracker; the next message will re-send full history.",
+      acceptsArgs: false,
+      handler: async (ctx) => {
+        const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+        resetSessionIngest(sessionId);
+        log.info?.(`[vc] /vcreingest — reset ingest tracker for session=${sessionId}`);
+        return { text: `Session ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
+      },
+    });
+
+    log.info?.(`[vc] registered ${vcSlashCommands.length + 1} native slash commands (vcstatus, vcmerge, vclabel, vcattach, vcreingest)`);
+    }
 
     // ── before_prompt_build: prepare context ──
     // FILESYSTEM: Reads sessions.json to resolve the current model (read-only).
     // NETWORK: POST /api/v1/context/prepare — sends full message history to cloud.
     // PAYLOAD: Replaces messages in-place with the compressed payload from the cloud.
+    // ── before_agent_reply: claim VC commands before the agent harness runs ──
+    // For VCSTATUS / VCMERGE / VCLABEL / VCATTACH / VCREINGEST typed as plain text,
+    // claim the reply directly here. The gateway's before_agent_reply pipeline accepts
+    // {handled: true, reply: {text}} and short-circuits the LLM round-trip, so the
+    // response bypasses Bast's message-tool-only delivery harness entirely. Without
+    // this, the legacy `before_prompt_build` prependContext path emits the response
+    // into the LLM assistant.content, which the agent harness then drops in
+    // messageToolOnly mode (group/channel chats by default), and the user sees
+    // nothing.
+    api.on("before_agent_reply", async (event, ctx) => {
+      const promptText = (event?.cleanedBody ?? "").trim();
+      // DIAG: log every invocation so we know who's calling
+      log.info?.(`[vc:DIAG-bar] entry trigger=${ctx?.trigger ?? "?"} sessionKey=${ctx?.sessionKey ?? "?"} sessionId=${ctx?.sessionId ?? "?"} channel=${ctx?.channel ?? ctx?.messageProvider ?? "?"} channelId=${ctx?.channelId ?? "?"} promptHead=${JSON.stringify(promptText.slice(0,60))}`);
+      if (!/^VC[A-Z]/i.test(promptText)) {
+        log.info?.(`[vc:DIAG-bar] not a VC command, falling through`);
+        return;
+      }
+      const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+      log.info?.(`[vc:DIAG-bar] matched VC command, will call cloud sessionId=${sessionId}`);
+
+      // VCREINGEST is local-only — no cloud round-trip
+      if (/^VCREINGEST\b/i.test(promptText)) {
+        resetSessionIngest(sessionId);
+        vcCommandSessions.add(sessionId);
+        log.info?.(`[vc] before_agent_reply: VCREINGEST — reset ingest tracker for session=${sessionId}`);
+        return {
+          handled: true,
+          reply: (await loadSuppressionMarker(log))({ text: `Session ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` }),
+        };
+      }
+
+      // Cloud-handled commands: synthesize a minimal prepare request with the VC prompt
+      const synthMessages = [{
+        role: "user",
+        content: [{ type: "text", text: promptText }],
+        timestamp: Date.now(),
+      }];
+      try {
+        const prepareResult = await vcPost(
+          baseUrl,
+          "/api/v1/context/prepare",
+          vcKey,
+          sessionId,
+          { messages: synthMessages },
+          60000,
+          debug ? log : null
+        );
+        if (prepareResult?.vc_command) {
+          vcCommandSessions.add(sessionId);
+          const replyText = renderVcCommandMessage(prepareResult);
+          log.info?.(`[vc:DIAG-bar] returning handled reply: vc_command=${prepareResult.vc_command} replyTextHead=${JSON.stringify(replyText.slice(0,80))}`);
+          log.info?.(`[vc] before_agent_reply: VC command ${prepareResult.vc_command} — handled directly (skipping LLM)`);
+          return { handled: true, reply: (await loadSuppressionMarker(log))({ text: replyText }) };
+        }
+        // Cloud didn't recognize it as a VC command — let the normal flow run
+        log.warn?.(`[vc] before_agent_reply: prompt looked like VC command but cloud did not respond with vc_command (got keys: ${Object.keys(prepareResult || {}).join(",")})`);
+        return;
+      } catch (err) {
+        log.error?.(`[vc] before_agent_reply: VC command failed: ${err}`);
+        return { handled: true, reply: (await loadSuppressionMarker(log))({ text: `Error running VC command: ${err.message}` }) };
+      }
+    });
+
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
