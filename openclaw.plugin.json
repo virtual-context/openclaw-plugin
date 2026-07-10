@@ -42,6 +42,16 @@
         ],
         "default": "session",
         "description": "Conversation identity mode: 'session' keys VC conversations by the rotating OpenClaw session UUID (legacy); 'stable' keys durable chat scopes by their session key so memory survives session rotation."
+      },
+      "conversationGroups": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": "Map of group session key -> member session keys. Every member shares the group key's stable VC conversation (e.g. all channels of one Discord guild). Requires convIdentity=\"stable\"; both group and member keys must be stable scopes."
       }
     },
     "additionalProperties": false

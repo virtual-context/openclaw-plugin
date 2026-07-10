@@ -219,9 +219,17 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * Pure function; exported for unit testing.
  * Returns { convId, isStable, fallbackReason? }.
  */
-export function deriveConvIdentity(sessionKey, sessionId) {
+export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
   if (typeof sessionKey !== "string" || sessionKey.length === 0) {
     return { convId: sessionId, isStable: false, fallbackReason: "missing_session_key" };
+  }
+  // Conversation grouping: a member session key adopts its group key's stable
+  // identity so multiple sessions share one VC conversation. The index only
+  // contains entries validated by buildConversationGroupIndex (both sides
+  // derive stable), so remapping here cannot stabilize an ephemeral scope.
+  const groupKey = groupIndex?.get(sessionKey);
+  if (groupKey) {
+    return { convId: `sk:${groupKey}`, isStable: true };
   }
   const parts = sessionKey.split(":");
   if (parts[0] !== "agent" || !parts[1]) {
@@ -257,6 +265,54 @@ export function deriveConvIdentity(sessionKey, sessionId) {
     return { convId: sessionId, isStable: false };
   }
   return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
+}
+
+/**
+ * Build the member->group index for the conversationGroups config.
+ *
+ * Config shape: { "<groupSessionKey>": ["<memberSessionKey>", ...], ... }.
+ * Every member session key adopts the group key's stable conversation id, so
+ * all grouped sessions read and write one VC conversation.
+ *
+ * Both sides must derive stable on their own: grouping can widen a stable
+ * scope but must never stabilize an ephemeral one (cron/subagent/explicit),
+ * which would bleed disposable traffic into a durable conversation. Invalid
+ * groups and members are skipped with a warning; a member claimed by two
+ * groups keeps its first assignment.
+ *
+ * Pure given (config, logger); exported for unit testing.
+ */
+export function buildConversationGroupIndex(groupsCfg, log) {
+  const index = new Map();
+  if (groupsCfg === undefined || groupsCfg === null) return index;
+  if (typeof groupsCfg !== "object" || Array.isArray(groupsCfg)) {
+    log?.warn?.("[vc] conversationGroups: expected an object of groupKey -> member[] — config ignored");
+    return index;
+  }
+  for (const [groupKey, members] of Object.entries(groupsCfg)) {
+    if (!deriveConvIdentity(groupKey, "probe").isStable) {
+      log?.warn?.(`[vc] conversationGroups: group key ${JSON.stringify(groupKey)} does not derive a stable identity — group ignored`);
+      continue;
+    }
+    if (!Array.isArray(members)) {
+      log?.warn?.(`[vc] conversationGroups: members of ${JSON.stringify(groupKey)} must be an array — group ignored`);
+      continue;
+    }
+    for (const member of members) {
+      if (typeof member !== "string" || !deriveConvIdentity(member, "probe").isStable) {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} of ${JSON.stringify(groupKey)} does not derive a stable identity — member ignored`);
+        continue;
+      }
+      if (member === groupKey) continue;
+      const existing = index.get(member);
+      if (existing && existing !== groupKey) {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} already grouped under ${JSON.stringify(existing)} — keeping first assignment`);
+        continue;
+      }
+      index.set(member, groupKey);
+    }
+  }
+  return index;
 }
 
 /**
@@ -402,10 +458,18 @@ export default {
     // In stable mode, count ephemeral fallbacks for scopes that SHOULD be stable
     // (missing/unparseable sessionKey). Intentional ephemeral scopes (subagent,
     // explicit) never warn. In session mode derivation is bypassed entirely.
+    // Conversation grouping (stable mode only): validated member->group index.
+    const groupIndex = stableMode
+      ? buildConversationGroupIndex(cfg.conversationGroups, log)
+      : new Map();
+    if (!stableMode && cfg.conversationGroups !== undefined) {
+      log.warn?.("[vc] WARNING: conversationGroups requires convIdentity=\"stable\" — config ignored");
+    }
+
     let fallbackWarnCount = 0;
     function selectConvId(sessionKey, sessionId) {
       if (!stableMode) return { convId: sessionId, isStable: false };
-      const identity = deriveConvIdentity(sessionKey, sessionId);
+      const identity = deriveConvIdentity(sessionKey, sessionId, groupIndex);
       if (identity.fallbackReason === "missing_session_key" || identity.fallbackReason === "unparseable_session_key") {
         fallbackWarnCount++;
         (log.warn ?? log.info)?.(
@@ -423,7 +487,7 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     // ── Config compatibility checks ──
     const ocConfig = api.config ?? {};

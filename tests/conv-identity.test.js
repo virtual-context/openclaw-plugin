@@ -12,7 +12,7 @@
  * `predecessor` param after `vcconv`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { deriveConvIdentity, buildUrl, vcPost } from "../index.js";
+import { deriveConvIdentity, buildConversationGroupIndex, buildUrl, vcPost } from "../index.js";
 
 const SID = "11111111-2222-4333-8444-555555555555";
 
@@ -116,6 +116,67 @@ describe("deriveConvIdentity — fallbacks that must be warned on", () => {
       .toBe("unparseable_session_key");
     expect(deriveConvIdentity("agent::main", SID).fallbackReason)
       .toBe("unparseable_session_key");
+  });
+});
+
+describe("conversationGroups — member->group identity remap", () => {
+  const GUILD = "agent:vast:discord:guild:1524917037191925871";
+  const GENERAL = "agent:vast:discord:channel:1524917037787250834";
+  const VASTTEST = "agent:vast:discord:channel:1524946242499514418";
+  const cfg = { [GUILD]: [GENERAL, VASTTEST] };
+
+  it("members adopt the group key's stable conversation id", () => {
+    const index = buildConversationGroupIndex(cfg);
+    for (const member of [GENERAL, VASTTEST]) {
+      expect(deriveConvIdentity(member, SID, index)).toEqual({
+        convId: `sk:${GUILD}`, isStable: true,
+      });
+    }
+  });
+
+  it("non-members and the group key itself derive normally", () => {
+    const index = buildConversationGroupIndex(cfg);
+    const other = "agent:vast:discord:channel:999";
+    expect(deriveConvIdentity(other, SID, index).convId).toBe(`sk:${other}`);
+    expect(deriveConvIdentity(GUILD, SID, index).convId).toBe(`sk:${GUILD}`);
+  });
+
+  it("without an index the derivation is unchanged", () => {
+    expect(deriveConvIdentity(GENERAL, SID)).toEqual({ convId: `sk:${GENERAL}`, isStable: true });
+  });
+
+  it("rejects ephemeral member keys — grouping must never stabilize them", () => {
+    const warn = vi.fn();
+    const index = buildConversationGroupIndex(
+      { [GUILD]: [`agent:vast:explicit:${SID}`, GENERAL] }, { warn },
+    );
+    expect(index.size).toBe(1);
+    expect(index.get(GENERAL)).toBe(GUILD);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(deriveConvIdentity(`agent:vast:explicit:${SID}`, SID, index))
+      .toEqual({ convId: SID, isStable: false });
+  });
+
+  it("rejects a non-stable group key wholesale", () => {
+    const warn = vi.fn();
+    const index = buildConversationGroupIndex({ "agent:vast:subagent:abc": [GENERAL] }, { warn });
+    expect(index.size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("first group wins when a member is claimed twice", () => {
+    const warn = vi.fn();
+    const G2 = "agent:vast:discord:guild:222";
+    const index = buildConversationGroupIndex({ [GUILD]: [GENERAL], [G2]: [GENERAL] }, { warn });
+    expect(index.get(GENERAL)).toBe(GUILD);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("tolerates absent or malformed config", () => {
+    expect(buildConversationGroupIndex(undefined).size).toBe(0);
+    expect(buildConversationGroupIndex(null).size).toBe(0);
+    expect(buildConversationGroupIndex("nope").size).toBe(0);
+    expect(buildConversationGroupIndex({ [GUILD]: "not-an-array" }).size).toBe(0);
   });
 });
 
