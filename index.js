@@ -235,7 +235,8 @@ export function deriveConvIdentity(sessionKey, sessionId) {
       ["direct", "group", "slash"].includes(scope[1]) && scope[2]) {
     return stable(sessionKey);
   }
-  if (scope.length === 3 && scope[0] === "discord" && scope[1] === "channel" && scope[2]) {
+  if (scope.length === 3 && scope[0] === "discord" &&
+      ["channel", "guild", "direct", "group"].includes(scope[1]) && scope[2]) {
     return stable(sessionKey);
   }
   if (scope[0] === "cron" && scope[1]) {

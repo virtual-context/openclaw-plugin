@@ -22,6 +22,9 @@ describe("deriveConvIdentity — stable scopes", () => {
     "agent:bastkid-dedicated:telegram:group:-5156869263",
     "agent:bastkid-dedicated:telegram:slash:8049932331",
     "agent:bastkid-dedicated:discord:channel:1485708353660260422",
+    "agent:vast:discord:guild:1524917037191925871",
+    "agent:vast:discord:direct:387316537012518913",
+    "agent:vast:discord:group:1524946242499514418",
     "agent:bastkid-dedicated:main",
   ];
   for (const key of stable) {
@@ -91,6 +94,8 @@ describe("deriveConvIdentity — fallbacks that must be warned on", () => {
       "agent:bastkid-dedicated:Telegram:direct:42",
       "agent:bastkid-dedicated:telegram:Direct:42",
       "agent:bastkid-dedicated:discord:Channel:42",
+      "agent:vast:discord:Guild:42",
+      "agent:vast:discord:Direct:42",
       "agent:bastkid-dedicated:Cron:job",
       "agent:bastkid-dedicated:cron:job:Run:run",
       "agent:bastkid-dedicated:Subagent:spawn",
