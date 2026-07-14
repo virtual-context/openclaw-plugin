@@ -27,7 +27,10 @@
  *              If empty or omitted, activates for all providers.
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, existsSync,
+  statSync, openSync, readSync, closeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -102,6 +105,141 @@ function resetSessionIngest(sessionId) {
   const tracker = readIngestTracker();
   delete tracker[sessionId];
   writeIngestTracker(tracker);
+}
+
+// ── Speaker labeling for multi-party chats ──────────────────────────────
+// In a group chat the model is handed every prior human turn as a bare
+// `user` message: OpenClaw strips senderName before the prompt hook runs
+// (verified — a history entry arrives as {role, content, timestamp,
+// __openclaw}). Distinct people therefore collapse into one anonymous
+// speaker, and the agent reads whatever the last human said as the words of
+// whoever is speaking now. The session JSONL is the one surface that still
+// carries `senderName`, so identity is recovered from there and stamped
+// into the message text, which is the only channel the model actually reads.
+//
+// The current inbound message is already present in the JSONL when this hook
+// runs, so a message is labeled on its FIRST pass and keeps that exact text
+// on every later pass. That matters beyond tidiness: the memory layer
+// content-hashes each message to recognize it again, so a message that
+// changed shape between turns would be stored twice.
+
+const SPEAKER_JSONL_TAIL_BYTES = 512 * 1024;
+
+/** Plain text of a message body, whichever content shape it uses. */
+function speakerMessageText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b?.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/** A copy of `msg` whose leading text block is replaced with `text`. */
+function withSpeakerText(msg, text) {
+  if (typeof msg.content === "string") return { ...msg, content: text };
+  if (Array.isArray(msg.content)) {
+    const content = msg.content.slice();
+    const i = content.findIndex((b) => b?.type === "text");
+    if (i >= 0) content[i] = { ...content[i], text };
+    else content.unshift({ type: "text", text });
+    return { ...msg, content };
+  }
+  return msg;
+}
+
+/**
+ * Map a session's user-message text to the name of whoever wrote it.
+ *
+ * Reads only the tail of the JSONL so a long session cannot turn every turn
+ * into a full-file scan; a message older than that window simply goes
+ * unlabeled. Text that two different people have written verbatim is dropped
+ * from the map entirely: leaving such a message unlabeled is honest, whereas
+ * guessing between two speakers would invent exactly the misattribution this
+ * whole mechanism exists to prevent.
+ */
+export function readSpeakerNames(sessionKey, sessionId, log) {
+  try {
+    const agentId = (sessionKey ?? "").split(":")[1];
+    if (!agentId) return null;
+    const jsonlPath = join(
+      homedir(), ".openclaw", "agents", agentId, "sessions", `${sessionId}.jsonl`,
+    );
+    if (!existsSync(jsonlPath)) return null;
+
+    const size = statSync(jsonlPath).size;
+    const start = Math.max(0, size - SPEAKER_JSONL_TAIL_BYTES);
+    const fd = openSync(jsonlPath, "r");
+    let raw;
+    try {
+      const buf = Buffer.allocUnsafe(size - start);
+      readSync(fd, buf, 0, buf.length, start);
+      raw = buf.toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+    // A mid-file start almost certainly lands inside a line; drop the partial.
+    const lines = raw.split("\n").filter(Boolean);
+    if (start > 0) lines.shift();
+
+    const byText = new Map();
+    const ambiguous = new Set();
+    for (const line of lines) {
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const msg = entry?.message ?? entry;
+      if (msg?.role !== "user") continue;
+      const name = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
+      if (!name) continue;
+      const text = speakerMessageText(msg.content).trim();
+      if (!text) continue;
+      const seen = byText.get(text);
+      if (seen && seen !== name) {
+        ambiguous.add(text);
+        continue;
+      }
+      byText.set(text, name);
+    }
+    for (const text of ambiguous) byText.delete(text);
+    return byText.size > 0 ? byText : null;
+  } catch (err) {
+    log?.info?.(`[vc] speaker-name read failed: ${err}`);
+    return null;
+  }
+}
+
+/**
+ * Prefix each user message with the name of whoever wrote it.
+ *
+ * Returns a new array; the caller's message objects are not mutated. A
+ * conversation with fewer than two known speakers is left exactly as it was,
+ * so one-on-one chats send a byte-identical payload. Already-labeled text is
+ * left alone, which makes repeat passes over the same history a no-op.
+ */
+export function labelSpeakers(messages, names, log) {
+  if (!names || new Set(names.values()).size < 2) return messages;
+  let labeled = 0;
+  const out = messages.map((msg) => {
+    if (msg?.role !== "user") return msg;
+    const text = speakerMessageText(msg.content);
+    const name = names.get(text.trim());
+    if (!name || text.startsWith(`${name}: `)) return msg;
+    labeled++;
+    return withSpeakerText(msg, `${name}: ${text}`);
+  });
+  if (labeled) {
+    log?.info?.(
+      `[vc] speaker-labeled ${labeled} message(s) across ` +
+      `${new Set(names.values()).size} speakers`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -428,7 +566,51 @@ export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 150
   return res.json();
 }
 
-// vcGet removed — tool definitions are now hardcoded, no bootstrap network call needed.
+export async function vcGet(baseUrl, path, vcKey, convId, timeoutMs = 8000, log = null) {
+  const url = buildUrl(baseUrl, path, vcKey, convId);
+  const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(timeoutMs) });
+  if (log) log.info?.(`[vc:wire] GET ${path} — HTTP ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`VC API ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// Per-conversation tool-definition cache. The server binds a request-local
+// speaker enum into eligible tool schemas from the conversation's current
+// roster snapshot; hardcoded definitions remain the fail-open baseline
+// whenever the fetch is stale, failing, or the feature is disabled.
+const toolDefsCache = new Map(); // convId -> { byName: Map, fetchedAt }
+const TOOL_DEFS_TTL_MS = 60_000;
+const toolDefsInflight = new Set();
+
+export function maybeRefreshToolDefs(baseUrl, vcKey, convId, log = null) {
+  if (!convId) return;
+  const entry = toolDefsCache.get(convId);
+  if (entry && Date.now() - entry.fetchedAt < TOOL_DEFS_TTL_MS) return;
+  if (toolDefsInflight.has(convId)) return;
+  toolDefsInflight.add(convId);
+  vcGet(baseUrl, "/api/v1/tools/definitions", vcKey, convId, 8000, null)
+    .then((resp) => {
+      const byName = new Map();
+      for (const tdef of resp?.tools ?? []) {
+        if (tdef?.name) byName.set(tdef.name, tdef);
+      }
+      toolDefsCache.set(convId, { byName, fetchedAt: Date.now() });
+    })
+    .catch((err) => {
+      const prior = toolDefsCache.get(convId)?.byName ?? new Map();
+      toolDefsCache.set(convId, { byName: prior, fetchedAt: Date.now() });
+      log?.info?.(`[vc] tool definitions refresh failed for ${convId}: ${err.message}`);
+    })
+    .finally(() => toolDefsInflight.delete(convId));
+}
+
+export function cachedToolDef(convId, name) {
+  return toolDefsCache.get(convId)?.byName?.get(name);
+}
+
 
 export default {
   id: "virtual-context",
@@ -522,10 +704,15 @@ export default {
     ];
 
     for (const def of vcTools) {
-      api.registerTool((ctx) => ({
+      api.registerTool((ctx) => {
+        const factorySession = ctx?.sessionId ?? "unknown";
+        const factoryIdentity = selectConvId(ctx?.sessionKey ?? "", factorySession);
+        maybeRefreshToolDefs(baseUrl, vcKey, factoryIdentity.convId, log);
+        const fetched = cachedToolDef(factoryIdentity.convId, def.name);
+        return {
         name: def.name,
-        description: def.description,
-        parameters: def.input_schema,
+        description: fetched?.description ?? def.description,
+        parameters: fetched?.input_schema ?? def.input_schema,
         async execute(toolCallId, params) {
           const sessionId = ctx?.sessionId ?? "unknown";
           const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
@@ -553,9 +740,10 @@ export default {
             };
           }
         },
-      }), { names: [def.name] });
+      };
+      }, { names: [def.name] });
     }
-    log.info?.(`[vc] registered ${vcTools.length} tools (hardcoded)`);
+    log.info?.(`[vc] registered ${vcTools.length} tools (dynamic schemas, hardcoded fallback)`);
 
     // ── Native slash commands (/vcstatus, /vcmerge, /vclabel, /vcattach, /vcreingest) ──
     // Use api.registerCommand so each channel (Telegram, Discord, etc.) auto-registers
@@ -782,6 +970,14 @@ export default {
           log.info?.(`[vc] no JSONL advantage — marked session=${sessionId} as ingested (${messagesWithCurrentTurn.length} messages)`);
         }
       }
+
+      // Stamp who said what, before the payload leaves. This is applied to the
+      // messages the cloud stores AND to the ones that come back as the model's
+      // prompt, so the two never disagree about a message's text.
+      const speakerNames = readSpeakerNames(sessionKey, sessionId, log);
+      messagesWithCurrentTurn = labelSpeakers(
+        messagesWithCurrentTurn, speakerNames, log,
+      );
 
       const prepareBody = {
         messages: messagesWithCurrentTurn,
