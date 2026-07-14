@@ -39,6 +39,20 @@ const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 // Tracks sessions where last prepare was a VC command (skip ingest)
 const vcCommandSessions = new Set();
 
+// sessionId -> the user text this turn's prepare sent to the cloud.
+//
+// The cloud pairs a turn's user half with its assistant half, but those arrive
+// on two separate requests minutes apart, and the memory holding the user half
+// in between belongs to whichever worker served prepare. When that memory dies
+// — a restart, an eviction, a differently-routed ingest — the cloud is left
+// with an assistant and no user, refuses to store a half-turn, and the turn is
+// lost from memory entirely. The plugin is the one component that holds both
+// halves, so it carries the user text forward and sends it with the reply.
+//
+// It must be the text prepare actually sent (speaker label included), or the
+// cloud would hash it as a different message and store the turn twice.
+const pendingUserTurn = new Map();
+
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
 
@@ -979,6 +993,16 @@ export default {
         messagesWithCurrentTurn, speakerNames, log,
       );
 
+      // Carry this turn's user text to agent_end so the pair can be rebuilt if
+      // the cloud loses the half it recorded here.
+      for (let i = messagesWithCurrentTurn.length - 1; i >= 0; i--) {
+        const m = messagesWithCurrentTurn[i];
+        if (m?.role !== "user") continue;
+        const text = speakerMessageText(m.content);
+        if (text) pendingUserTurn.set(sessionId, text);
+        break;
+      }
+
       const prepareBody = {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
@@ -1148,9 +1172,15 @@ export default {
       log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
       if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
+      const userMessage = pendingUserTurn.get(sessionId);
+      pendingUserTurn.delete(sessionId);
+
       try {
         const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
           assistant_message: assistantMessage,
+          // Repairs the pair when the cloud lost the user half it recorded at
+          // prepare; ignored when it still has it.
+          ...(userMessage ? { user_message: userMessage } : {}),
         }, 15000, log);
         log.info?.(
           `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
