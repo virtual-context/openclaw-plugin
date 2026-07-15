@@ -121,6 +121,111 @@ function resetSessionIngest(sessionId) {
   writeIngestTracker(tracker);
 }
 
+// ── Reply-only invocation fail-safe ──────────────────────────────────────
+// A native Discord reply whose body is just the bot mention ("@Vast") carries
+// its real request in the replied-to message, not in the message text. The
+// host delivers this correctly: the current-turn envelope marks the reply and
+// includes the replied-to body, and the host's own prompt keeps that as the
+// request. But the host also appends the RAW current-message body as the final
+// "Current user request:" line, and when VC replaces the system prompt with its
+// compressed context, that trailing raw mention becomes the authoritative last
+// line — the model answers "@Vast" and the replied-to question is lost.
+//
+// So when the current turn is a reply whose body is only a mention, VC declines
+// to override for that turn and lets the host's native, reply-bearing prompt
+// stand. Losing VC retrieval for one turn is preferable to losing the question.
+//
+// Detection prefers the host's STRUCTURED fields: the current-turn envelope is
+// a labeled "Conversation info (untrusted metadata)" JSON block carrying
+// `has_reply_context` / `reply_to_id`. String matching is only the fallback
+// for locating that block.
+
+const _CONV_INFO_LABEL = "Conversation info (untrusted metadata):";
+const _CURRENT_TURN_LABELS = [
+  _CONV_INFO_LABEL,
+  "Reply target of current user message (untrusted, for context):",
+  "Chat history since last reply (untrusted, for context):",
+];
+
+/** The host's structured conversation-info object for the current turn, or null. */
+export function parseConversationInfo(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const at = text.indexOf(_CONV_INFO_LABEL);
+  if (at < 0) return null;
+  const fence = text.indexOf("```json", at);
+  if (fence < 0) return null;
+  const start = text.indexOf("\n", fence);
+  if (start < 0) return null;
+  const end = text.indexOf("```", start + 1);
+  if (end < 0) return null;
+  try {
+    return JSON.parse(text.slice(start + 1, end).trim());
+  } catch {
+    return null;
+  }
+}
+
+/** The actual user-typed body: the current-turn text with the host's labeled
+ *  untrusted-metadata blocks removed. */
+export function currentMessageBody(promptText) {
+  let text = typeof promptText === "string" ? promptText : "";
+  for (const label of _CURRENT_TURN_LABELS) {
+    const at = text.indexOf(label);
+    if (at < 0) continue;
+    const fenceStart = text.indexOf("```", at);
+    if (fenceStart < 0) continue;
+    const fenceEnd = text.indexOf("```", fenceStart + 3);
+    if (fenceEnd < 0) continue;
+    text = text.slice(0, at) + text.slice(fenceEnd + 3);
+  }
+  return text.trim();
+}
+
+/** True when a body is only a bot mention (or empty) — no request of its own. */
+function isBareMentionOrEmpty(body) {
+  const stripped = (typeof body === "string" ? body : "")
+    .replace(/<@!?\d+>/g, " ")   // raw Discord mention
+    .replace(/@[\w.\-]+/g, " ")   // resolved @Name mention
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped.length === 0;
+}
+
+/** True when the current turn is a native reply (structured signal). */
+export function hasReplyContext(promptText) {
+  const info = parseConversationInfo(promptText);
+  if (!info) return false;
+  return info.has_reply_context === true
+    || (typeof info.reply_to_id === "string" && info.reply_to_id.trim().length > 0);
+}
+
+/**
+ * Whether VC should keep its hands off the current turn.
+ *
+ * True only for the proven failure shape: the turn is a reply AND the typed
+ * body is nothing but a mention, so the real request lives in the reply
+ * target. An inline question, a reply that also types a real question, and an
+ * ordinary non-reply message all return false and are enriched normally.
+ */
+export function isReplyOnlyInvocation(promptText) {
+  if (!hasReplyContext(promptText)) return false;
+  return isBareMentionOrEmpty(currentMessageBody(promptText));
+}
+
+/**
+ * Whether VC's prepared body is unusable for a reply turn.
+ *
+ * A reply's real request lives in the current turn, so on a reply turn a
+ * malformed prepared body (no usable messages to install) must not be pushed
+ * over the host's native, reply-bearing prompt. Non-reply turns keep their
+ * existing tolerance for VC returning system-only enrichment.
+ */
+export function preparedBodyUnusableForReply(promptText, body) {
+  if (!hasReplyContext(promptText)) return false;
+  if (!body || typeof body !== "object") return true;
+  return !Array.isArray(body.messages) || body.messages.length === 0;
+}
+
 // ── Speaker labeling for multi-party chats ──────────────────────────────
 // In a group chat the model is handed every prior human turn as a bare
 // `user` message: OpenClaw strips senderName before the prompt hook runs
@@ -1067,6 +1172,33 @@ export default {
       }
 
       if (!body) return;
+
+      // Fail-safe for reply-only invocations. When the current turn is a native
+      // reply whose body is just the bot mention, the real request is the
+      // replied-to message. Overriding the system prompt here lets the host's
+      // trailing raw "Current user request: @Vast" win and the question is lost
+      // (proven: reply to a question with only "@Vast" -> "What needs doing?").
+      // Decline the override for this turn; the host's native prompt already
+      // carries the reply target. The turn is still ingested at agent_end.
+      if (isReplyOnlyInvocation(event.prompt)) {
+        log.warn?.(
+          `[vc] reply-only invocation — leaving the native turn unchanged so the ` +
+          `replied-to request is preserved (VC enrichment skipped this turn). ` +
+          `session=${sessionId}`
+        );
+        return;
+      }
+
+      // Defensive fail-open: on any reply turn, if VC's prepared body is
+      // malformed (no usable messages), do not push it over the host's native
+      // reply-bearing prompt. Losing enrichment beats losing the request.
+      if (preparedBodyUnusableForReply(event.prompt, body)) {
+        log.warn?.(
+          `[vc] reply turn with malformed prepared body — leaving the native ` +
+          `turn unchanged. session=${sessionId}`
+        );
+        return;
+      }
 
       // Hoist any leading role:"system" entry in body.messages into body.system,
       // so the existing systemPrompt-override path below routes it to the model.
