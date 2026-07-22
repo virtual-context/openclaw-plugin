@@ -3,6 +3,7 @@ import {
   buildReplyOnlyDirective,
   currentTurnBody,
   currentTurnForIngest,
+  currentTurnProvenance,
   leadingEnvelope,
   isReplyOnlyInvocation,
   stripHistoryBlock,
@@ -117,13 +118,8 @@ describe("currentTurnBody", () => {
   });
 });
 
-describe("current-turn append never drops a turn", () => {
-  // Mirrors the handler: derive, and fall back to the raw prompt if nothing
-  // survives. An unpaired assistant half is discarded downstream as a fragment,
-  // so an empty derivation must never mean "append nothing".
-  const appended = (prompt) => currentTurnBody(prompt) || (prompt ?? "");
-
-  it("falls back to the raw prompt when derivation yields nothing", () => {
+describe("current-turn admission never falls back to host scaffolding", () => {
+  it("rejects a metadata-only carrier as conversational content", () => {
     const scaffoldOnly = [
       "Conversation info (untrusted metadata):",
       "```json",
@@ -132,17 +128,17 @@ describe("current-turn append never drops a turn", () => {
       "",
     ].join("\n");
     expect(currentTurnBody(scaffoldOnly)).toBe("");
-    expect(appended(scaffoldOnly)).not.toBe("");
+    expect(currentTurnForIngest(scaffoldOnly)).toBe("");
   });
 
   it("still yields text for a media-only turn", () => {
     const prompt = `${olderMetadata()}[media attached: /tmp/x.pdf (application/pdf)]`;
-    expect(appended(prompt)).toContain("media attached");
+    expect(currentTurnForIngest(prompt)).toContain("media attached");
   });
 
-  it("yields nothing only when the prompt itself is empty", () => {
-    expect(appended("")).toBe("");
-    expect(appended(undefined)).toBe("");
+  it("yields nothing for an absent prompt", () => {
+    expect(currentTurnForIngest("")).toBe("");
+    expect(currentTurnForIngest(undefined)).toBe("");
   });
 });
 
@@ -284,7 +280,7 @@ describe("reply-only invocation on the wrapped prompt the host actually sends", 
   });
 });
 
-describe("what gets sent to the cloud keeps the provenance envelope", () => {
+describe("what gets sent to the cloud separates content from provenance", () => {
   // The engine parses the leading metadata envelope for sender, message id,
   // channel and reply target, and strips it from the stored text itself.
   // Stripping it here as well threw that provenance away, so only the replay
@@ -305,11 +301,24 @@ describe("what gets sent to the cloud keeps the provenance envelope", () => {
     "do ugl brewers do their own filtration?",
   ].join("\n");
 
-  it("keeps the envelope so the engine can attribute the turn", () => {
+  it("keeps the envelope out of stored content", () => {
     const out = currentTurnForIngest(full);
-    expect(out).toContain("message_id");
-    expect(out).toContain("optics");
-    expect(out).toContain("387316537012518913");
+    expect(out).toBe("do ugl brewers do their own filtration?");
+    expect(out).not.toContain("Conversation info");
+    expect(out).not.toContain("message_id");
+  });
+
+  it("sends the envelope's useful fields as structured provenance", () => {
+    expect(currentTurnProvenance(
+      full,
+      "agent:vast:discord:guild:1524917037191925871",
+    )).toEqual({
+      sender_name: "optics",
+      sender_actor_id: "actor:discord:387316537012518913",
+      source_message_id: "1527728060617719990",
+      origin_channel_id: "152491",
+      reply_target_message_id: "888",
+    });
   });
 
   it("still removes the replay", () => {

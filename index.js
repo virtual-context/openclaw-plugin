@@ -52,6 +52,10 @@ const vcCommandSessions = new Set();
 // It must be the text prepare actually sent (speaker label included), or the
 // cloud would hash it as a different message and store the turn twice.
 const pendingUserTurn = new Map();
+// sessionId -> structured provenance extracted from the same host prompt as
+// pendingUserTurn. It travels beside the text so storage never needs to parse
+// routing/sender scaffolding back out of conversational content.
+const pendingUserTurnProvenance = new Map();
 // Host message id that pendingUserTurn's value came from, so a stale entry
 // left by an earlier turn is never mistaken for this turn's user half.
 const pendingUserTurnMessage = new Map();
@@ -196,6 +200,51 @@ export function parseConversationInfo(promptText) {
   return parseLabeledJsonBlock(promptText, _CONV_INFO_LABEL);
 }
 
+/** Structured provenance for the current turn, with no prompt text attached. */
+export function currentTurnProvenance(promptText, sessionKey = "") {
+  const info = parseConversationInfo(promptText);
+  if (!info || typeof info !== "object" || Array.isArray(info)) return {};
+
+  const clean = (value) => {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    return /[\x00-\x1f\x7f]/.test(text) ? "" : text;
+  };
+  const result = {};
+  const put = (name, value) => {
+    const text = clean(value);
+    if (text) result[name] = text;
+  };
+
+  const sender = info.sender && typeof info.sender === "object"
+    ? info.sender
+    : {};
+  const senderName = typeof info.sender === "string"
+    ? info.sender
+    : sender.name || sender.display_name || sender.label || sender.username;
+  put(
+    "sender_name",
+    senderName,
+  );
+  put("source_message_id", info.message_id);
+  put("reply_target_message_id", info.reply_to_id);
+  put("origin_channel_label", info.group_channel);
+
+  const chatId = clean(info.chat_id);
+  const channelMatch = /^(?:channel|group):(.+)$/.exec(chatId);
+  if (channelMatch) put("origin_channel_id", channelMatch[1]);
+
+  const senderId = clean(sender.id || info.sender_id);
+  const platformMatch = /^(?:sk:)?agent:[^:]+:([^:]+):(?:channel|group|guild|direct|dm):.+$/.exec(
+    clean(sessionKey),
+  );
+  const platform = clean(platformMatch?.[1] ?? "").toLowerCase();
+  if (senderId && platform && /^[a-z0-9._-]+$/.test(platform)) {
+    put("sender_actor_id", `actor:${platform}:${senderId}`);
+  }
+  return result;
+}
+
 /** The nearest replied-to message body supplied by the host, or an empty string. */
 export function replyTargetBody(promptText) {
   const target = parseLabeledJsonBlock(promptText, _REPLY_TARGET_LABEL);
@@ -310,19 +359,12 @@ export function leadingEnvelope(promptText) {
 /**
  * What this turn should be sent to the cloud as.
  *
- * The replay and the numbered history are removed here because they are
- * duplicates of turns already stored and nothing downstream can undo them. The
- * leading metadata envelope is deliberately kept: the engine parses it for the
- * sender, message id, channel and reply target, and strips it from the stored
- * text itself. Removing it here threw that provenance away and left the engine
- * nothing to attribute the turn with.
+ * Every host wrapper is removed here. Provenance travels separately through
+ * currentTurnProvenance(), so this value is only the content that should be
+ * hashed, embedded, retrieved, and shown as the user's message.
  */
 export function currentTurnForIngest(promptText) {
-  const body = currentTurnBody(promptText);
-  const envelope = leadingEnvelope(promptText);
-  if (!envelope) return body;
-  if (!body) return envelope;
-  return `${envelope.trimEnd()}\n\n${body}`;
+  return currentTurnBody(promptText);
 }
 
 /** True when a body is only a bot mention (or empty) — no request of its own. */
@@ -1213,6 +1255,7 @@ export default {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
       const promptText = (event.prompt ?? "").trim();
+      const turnProvenance = currentTurnProvenance(event.prompt, sessionKey);
 
       // This must run before VC prepare and on EVERY prompt-build pass. The
       // Codex Discord harness rebuilds the prompt after the first hook result;
@@ -1237,9 +1280,10 @@ export default {
         // sent as this turn's user half.
         const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
         if (!pendingUserTurn.has(sessionId) || pendingUserTurnMessage.get(sessionId) !== replyOnlyId) {
-          const replyOnlyBody = currentTurnForIngest(event.prompt) || (event.prompt ?? "");
+          const replyOnlyBody = currentTurnForIngest(event.prompt);
           if (replyOnlyBody) {
             pendingUserTurn.set(sessionId, replyOnlyBody);
+            pendingUserTurnProvenance.set(sessionId, turnProvenance);
             pendingUserTurnMessage.set(sessionId, replyOnlyId);
           }
         }
@@ -1305,12 +1349,10 @@ export default {
       // the speaker labels, and the user half carried to agent_end all describe
       // the same text. Deriving it twice would let those disagree and hash the
       // same logical turn two different ways.
-      // Falls back to the raw prompt when nothing survives derivation, e.g. a
-      // turn whose entire text is host scaffolding. Appending nothing would
-      // leave the completed-turn ingest unpaired and discard the whole turn as
-      // a fragment. A row that still carries scaffolding can be repaired later;
-      // a turn that was never recorded cannot.
-      const currentBody = currentTurnForIngest(event.prompt) || (event.prompt ?? "");
+      // If nothing survives, the prompt contained no admissible user content.
+      // Never fall back to the raw host wrapper: that is the pollution path
+      // this boundary exists to close.
+      const currentBody = currentTurnForIngest(event.prompt);
       let messagesWithCurrentTurn = [...event.messages];
       if (currentBody) {
         messagesWithCurrentTurn.push({
@@ -1360,6 +1402,7 @@ export default {
         const text = speakerMessageText(m.content);
         if (text) {
           pendingUserTurn.set(sessionId, text);
+          pendingUserTurnProvenance.set(sessionId, turnProvenance);
           pendingUserTurnMessage.set(sessionId, parseConversationInfo(event.prompt)?.message_id ?? "");
         }
         break;
@@ -1368,6 +1411,7 @@ export default {
       const prepareBody = {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
+        ...(currentBody ? turnProvenance : {}),
       };
       // Conversation identity: stable scopes get the sk: id; the predecessor
       // forward-link hint goes on prepare ONLY, and only when the selected
@@ -1546,7 +1590,9 @@ export default {
       if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
       const userMessage = pendingUserTurn.get(sessionId);
+      const userProvenance = pendingUserTurnProvenance.get(sessionId) ?? {};
       pendingUserTurn.delete(sessionId);
+      pendingUserTurnProvenance.delete(sessionId);
       pendingUserTurnMessage.delete(sessionId);
 
       try {
@@ -1555,6 +1601,7 @@ export default {
           // Repairs the pair when the cloud lost the user half it recorded at
           // prepare; ignored when it still has it.
           ...(userMessage ? { user_message: userMessage } : {}),
+          ...userProvenance,
         }, 15000, log);
         log.info?.(
           `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
