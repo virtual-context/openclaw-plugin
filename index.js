@@ -52,6 +52,9 @@ const vcCommandSessions = new Set();
 // It must be the text prepare actually sent (speaker label included), or the
 // cloud would hash it as a different message and store the turn twice.
 const pendingUserTurn = new Map();
+// Host message id that pendingUserTurn's value came from, so a stale entry
+// left by an earlier turn is never mistaken for this turn's user half.
+const pendingUserTurnMessage = new Map();
 
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
@@ -160,6 +163,7 @@ const _replyOnlyDirectiveCache = new Map();
 // query and buries the actual messages.
 const _ASSEMBLED_CONTEXT_LABEL = "OpenClaw assembled context for this turn:";
 const _CURRENT_REQUEST_LABEL = "Current user request:";
+const _REPLAY_CLOSE_TAG = "</conversation_context>";
 
 // A third scaffold block, emitted by the host itself rather than the provider
 // adapter, and placed after the request label so it survives that split. Unlike
@@ -248,12 +252,15 @@ export function stripHistoryBlock(text) {
  * replay and labeled metadata blocks removed.
  *
  * The adapter emits the replay first and the real message last, after
- * _CURRENT_REQUEST_LABEL, so everything up to and including that label is
- * scaffolding. The first label following the replay is the adapter's; a later
- * one would be the user quoting the phrase, so searching forward from the
- * replay keeps a quoted copy inside the user's own text.
+ * _CURRENT_REQUEST_LABEL. The split anchors on the END of the replay container
+ * rather than its header, because replayed turns can themselves contain the
+ * request label — a quoted mention of it, or a previously stored turn that was
+ * polluted before this stripping existed. Anchoring on the header and taking
+ * the first match would split inside the replay and keep the rest of it.
  *
- * Fails open. If the replay is present but the label is not, the host format
+ * The outermost close is the last one, so nesting cannot fool it.
+ *
+ * Fails open. If the replay is present but no anchor is found, the host format
  * has changed, and returning the text unchanged costs fidelity on one turn
  * where dropping it would cost the turn.
  */
@@ -261,7 +268,9 @@ export function currentTurnBody(promptText) {
   const text = typeof promptText === "string" ? promptText : "";
   const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
   if (replayAt >= 0) {
-    const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, replayAt);
+    const closeAt = text.lastIndexOf(_REPLAY_CLOSE_TAG);
+    const searchFrom = closeAt >= 0 ? closeAt + _REPLAY_CLOSE_TAG.length : replayAt;
+    const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, searchFrom);
     if (labelAt >= 0) {
       return stripHistoryBlock(
         currentMessageBody(text.slice(labelAt + _CURRENT_REQUEST_LABEL.length)),
@@ -1170,9 +1179,19 @@ export default {
         // whole turn — the answer included — is discarded as a fragment.
         // Only the earliest prompt-build pass carries the untouched body;
         // later passes fold the host's assembled context into the prompt.
-        if (!pendingUserTurn.has(sessionId)) {
-          const replyOnlyBody = currentTurnBody(event.prompt);
-          if (replyOnlyBody) pendingUserTurn.set(sessionId, replyOnlyBody);
+        //
+        // Keyed by the host message id so a later pass of THIS message keeps the
+        // earlier body, while a value left behind by a previous turn is replaced.
+        // Without that distinction a stale entry — from a turn that exited early
+        // via a VC command, the provider filter, or an empty answer — would be
+        // sent as this turn's user half.
+        const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
+        if (!pendingUserTurn.has(sessionId) || pendingUserTurnMessage.get(sessionId) !== replyOnlyId) {
+          const replyOnlyBody = currentTurnBody(event.prompt) || (event.prompt ?? "");
+          if (replyOnlyBody) {
+            pendingUserTurn.set(sessionId, replyOnlyBody);
+            pendingUserTurnMessage.set(sessionId, replyOnlyId);
+          }
         }
         log.warn?.(
           `[vc] reply-only invocation — enforcing replied-to request on this ` +
@@ -1289,7 +1308,10 @@ export default {
         const m = messagesWithCurrentTurn[i];
         if (m?.role !== "user") continue;
         const text = speakerMessageText(m.content);
-        if (text) pendingUserTurn.set(sessionId, text);
+        if (text) {
+          pendingUserTurn.set(sessionId, text);
+          pendingUserTurnMessage.set(sessionId, parseConversationInfo(event.prompt)?.message_id ?? "");
+        }
         break;
       }
 
@@ -1475,6 +1497,7 @@ export default {
 
       const userMessage = pendingUserTurn.get(sessionId);
       pendingUserTurn.delete(sessionId);
+      pendingUserTurnMessage.delete(sessionId);
 
       try {
         const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
