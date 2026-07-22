@@ -153,6 +153,14 @@ const _CURRENT_TURN_LABELS = [
 const _REPLY_ONLY_DIRECTIVE_TTL_MS = 5 * 60 * 1000;
 const _replyOnlyDirectiveCache = new Map();
 
+// The provider adapter wraps the turn before this plugin is ever called: it
+// prepends a replay of earlier turns and marks the real message with a trailing
+// label. Stored verbatim, that replay becomes a canonical turn holding sixty
+// turns' worth of duplicated text, which then matches almost every retrieval
+// query and buries the actual messages.
+const _ASSEMBLED_CONTEXT_LABEL = "OpenClaw assembled context for this turn:";
+const _CURRENT_REQUEST_LABEL = "Current user request:";
+
 /** Parse the fenced JSON block following one of the host's prompt labels. */
 export function parseLabeledJsonBlock(promptText, label) {
   const text = typeof promptText === "string" ? promptText : "";
@@ -207,6 +215,34 @@ export function currentMessageBody(promptText) {
     text = text.slice(0, at) + text.slice(fenceEnd + 3);
   }
   return text.trim();
+}
+
+/**
+ * The turn as the user actually wrote it, with the host's assembled-context
+ * replay and labeled metadata blocks removed.
+ *
+ * The adapter emits the replay first and the real message last, after
+ * _CURRENT_REQUEST_LABEL, so everything up to and including that label is
+ * scaffolding. The first label following the replay is the adapter's; a later
+ * one would be the user quoting the phrase, so searching forward from the
+ * replay keeps a quoted copy inside the user's own text.
+ *
+ * Fails open. If the replay is present but the label is not, the host format
+ * has changed, and returning the text unchanged costs fidelity on one turn
+ * where dropping it would cost the turn.
+ */
+export function currentTurnBody(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
+  if (replayAt >= 0) {
+    const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, replayAt);
+    if (labelAt >= 0) {
+      return currentMessageBody(
+        text.slice(labelAt + _CURRENT_REQUEST_LABEL.length),
+      );
+    }
+  }
+  return currentMessageBody(text);
 }
 
 /** True when a body is only a bot mention (or empty) — no request of its own. */
@@ -1109,7 +1145,7 @@ export default {
         // Only the earliest prompt-build pass carries the untouched body;
         // later passes fold the host's assembled context into the prompt.
         if (!pendingUserTurn.has(sessionId)) {
-          const replyOnlyBody = currentMessageBody(event.prompt);
+          const replyOnlyBody = currentTurnBody(event.prompt);
           if (replyOnlyBody) pendingUserTurn.set(sessionId, replyOnlyBody);
         }
         log.warn?.(
@@ -1169,11 +1205,17 @@ export default {
       // event.prompt is the current user message. Append it so the cloud sees the
       // full conversation including the current turn — needed for VC command detection
       // and accurate context preparation.
+      //
+      // Derived once here and reused for every append below, so the payload,
+      // the speaker labels, and the user half carried to agent_end all describe
+      // the same text. Deriving it twice would let those disagree and hash the
+      // same logical turn two different ways.
+      const currentBody = currentTurnBody(event.prompt);
       let messagesWithCurrentTurn = [...event.messages];
-      if (event.prompt) {
+      if (currentBody) {
         messagesWithCurrentTurn.push({
           role: "user",
-          content: [{ type: "text", text: event.prompt }],
+          content: [{ type: "text", text: currentBody }],
         });
       }
 
@@ -1188,10 +1230,10 @@ export default {
         if (fullMessages && fullMessages.length > messagesWithCurrentTurn.length) {
           log.info?.(`[vc] initial ingest — sending ${fullMessages.length} JSONL messages (was ${messagesWithCurrentTurn.length} windowed)`);
           messagesWithCurrentTurn = [...fullMessages];
-          if (event.prompt) {
+          if (currentBody) {
             messagesWithCurrentTurn.push({
               role: "user",
-              content: [{ type: "text", text: event.prompt }],
+              content: [{ type: "text", text: currentBody }],
             });
           }
           isInitialIngest = true;
