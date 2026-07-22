@@ -280,6 +280,51 @@ export function currentTurnBody(promptText) {
   return stripHistoryBlock(currentMessageBody(text));
 }
 
+/**
+ * The leading labelled metadata blocks, verbatim, or an empty string.
+ *
+ * Only blocks ahead of the host's replay are taken. Blocks inside the replay
+ * describe older turns, not this one.
+ */
+export function leadingEnvelope(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
+  const limit = replayAt >= 0 ? replayAt : text.length;
+  let end = 0;
+  for (;;) {
+    let next = -1;
+    for (const label of _CURRENT_TURN_LABELS) {
+      const at = text.indexOf(label, end);
+      if (at >= 0 && at < limit && (next < 0 || at < next)) next = at;
+    }
+    if (next < 0) break;
+    const fence = text.indexOf("```", next);
+    if (fence < 0 || fence >= limit) break;
+    const fenceEnd = text.indexOf("```", fence + 3);
+    if (fenceEnd < 0 || fenceEnd >= limit) break;
+    end = fenceEnd + 3;
+  }
+  return end > 0 ? text.slice(0, end) : "";
+}
+
+/**
+ * What this turn should be sent to the cloud as.
+ *
+ * The replay and the numbered history are removed here because they are
+ * duplicates of turns already stored and nothing downstream can undo them. The
+ * leading metadata envelope is deliberately kept: the engine parses it for the
+ * sender, message id, channel and reply target, and strips it from the stored
+ * text itself. Removing it here threw that provenance away and left the engine
+ * nothing to attribute the turn with.
+ */
+export function currentTurnForIngest(promptText) {
+  const body = currentTurnBody(promptText);
+  const envelope = leadingEnvelope(promptText);
+  if (!envelope) return body;
+  if (!body) return envelope;
+  return `${envelope.trimEnd()}\n\n${body}`;
+}
+
 /** True when a body is only a bot mention (or empty) — no request of its own. */
 function isBareMentionOrEmpty(body) {
   const stripped = (typeof body === "string" ? body : "")
@@ -1192,7 +1237,7 @@ export default {
         // sent as this turn's user half.
         const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
         if (!pendingUserTurn.has(sessionId) || pendingUserTurnMessage.get(sessionId) !== replyOnlyId) {
-          const replyOnlyBody = currentTurnBody(event.prompt) || (event.prompt ?? "");
+          const replyOnlyBody = currentTurnForIngest(event.prompt) || (event.prompt ?? "");
           if (replyOnlyBody) {
             pendingUserTurn.set(sessionId, replyOnlyBody);
             pendingUserTurnMessage.set(sessionId, replyOnlyId);
@@ -1265,7 +1310,7 @@ export default {
       // leave the completed-turn ingest unpaired and discard the whole turn as
       // a fragment. A row that still carries scaffolding can be repaired later;
       // a turn that was never recorded cannot.
-      const currentBody = currentTurnBody(event.prompt) || (event.prompt ?? "");
+      const currentBody = currentTurnForIngest(event.prompt) || (event.prompt ?? "");
       let messagesWithCurrentTurn = [...event.messages];
       if (currentBody) {
         messagesWithCurrentTurn.push({

@@ -115,8 +115,15 @@ describe("reply-only invocation still records the turn", () => {
 
     // Without a user half the completed-turn ingest is rejected as a fragment
     // and the answer is lost, so the user half must be present here.
+    //
+    // It carries the leading metadata envelope as well as the typed body. The
+    // engine parses that envelope for sender, message id and reply target and
+    // strips it from the stored text, so sending the body alone would store
+    // the turn with nothing to attribute it to.
     const bodies = ingestBodies(fetchSpy);
     expect(bodies).toHaveLength(1);
-    expect(bodies[0].user_message).toBe("<@1485681229608259666>");
+    expect(bodies[0].user_message).toContain("<@1485681229608259666>");
+    expect(bodies[0].user_message).toContain("Conversation info (untrusted metadata)");
+    expect(bodies[0].user_message).not.toContain("assembled context for this turn");
   });
 });

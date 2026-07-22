@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildReplyOnlyDirective,
   currentTurnBody,
+  currentTurnForIngest,
+  leadingEnvelope,
   isReplyOnlyInvocation,
   stripHistoryBlock,
 } from "../index.js";
@@ -279,5 +281,60 @@ describe("reply-only invocation on the wrapped prompt the host actually sends", 
 
   it("does not fire on an ordinary non-reply turn", () => {
     expect(isReplyOnlyInvocation(`${olderMetadata()}${replay()}${REQUEST_LABEL}\njust asking`)).toBe(false);
+  });
+});
+
+describe("what gets sent to the cloud keeps the provenance envelope", () => {
+  // The engine parses the leading metadata envelope for sender, message id,
+  // channel and reply target, and strips it from the stored text itself.
+  // Stripping it here as well threw that provenance away, so only the replay
+  // and the numbered history — which nothing downstream can undo — are removed.
+  const full = [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      chat_id: "channel:152491",
+      message_id: "1527728060617719990",
+      sender: { id: "387316537012518913", name: "optics", username: "kidw.ai" },
+      reply_to_id: "888",
+    }, null, 2),
+    "```",
+    "",
+    replay("[user] SIXTY EARLIER TURNS"),
+    REQUEST_LABEL,
+    "do ugl brewers do their own filtration?",
+  ].join("\n");
+
+  it("keeps the envelope so the engine can attribute the turn", () => {
+    const out = currentTurnForIngest(full);
+    expect(out).toContain("message_id");
+    expect(out).toContain("optics");
+    expect(out).toContain("387316537012518913");
+  });
+
+  it("still removes the replay", () => {
+    const out = currentTurnForIngest(full);
+    expect(out).not.toContain("SIXTY EARLIER TURNS");
+    expect(out).not.toContain("conversation_context");
+  });
+
+  it("still carries the user's own message", () => {
+    expect(currentTurnForIngest(full)).toContain("do ugl brewers do their own filtration?");
+  });
+
+  it("takes no envelope from inside the replay", () => {
+    // Blocks quoted in the replay describe older turns, not this one.
+    const nested = [
+      replay('Conversation info (untrusted metadata):\n```json\n{"message_id":"OLD"}\n```'),
+      REQUEST_LABEL,
+      "current question",
+    ].join("\n");
+    expect(leadingEnvelope(nested)).toBe("");
+    expect(currentTurnForIngest(nested)).not.toContain("OLD");
+  });
+
+  it("returns just the message when there is no envelope", () => {
+    expect(currentTurnForIngest(`${replay()}${REQUEST_LABEL}\nplain question`))
+      .toBe("plain question");
   });
 });
