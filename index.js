@@ -1210,7 +1210,12 @@ export default {
       // the speaker labels, and the user half carried to agent_end all describe
       // the same text. Deriving it twice would let those disagree and hash the
       // same logical turn two different ways.
-      const currentBody = currentTurnBody(event.prompt);
+      // Falls back to the raw prompt when nothing survives derivation, e.g. a
+      // turn whose entire text is host scaffolding. Appending nothing would
+      // leave the completed-turn ingest unpaired and discard the whole turn as
+      // a fragment. A row that still carries scaffolding can be repaired later;
+      // a turn that was never recorded cannot.
+      const currentBody = currentTurnBody(event.prompt) || (event.prompt ?? "");
       let messagesWithCurrentTurn = [...event.messages];
       if (currentBody) {
         messagesWithCurrentTurn.push({

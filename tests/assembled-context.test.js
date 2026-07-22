@@ -109,3 +109,32 @@ describe("currentTurnBody", () => {
     expect(currentTurnBody(prompt)).toBe("short question");
   });
 });
+
+describe("current-turn append never drops a turn", () => {
+  // Mirrors the handler: derive, and fall back to the raw prompt if nothing
+  // survives. An unpaired assistant half is discarded downstream as a fragment,
+  // so an empty derivation must never mean "append nothing".
+  const appended = (prompt) => currentTurnBody(prompt) || (prompt ?? "");
+
+  it("falls back to the raw prompt when derivation yields nothing", () => {
+    const scaffoldOnly = [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      JSON.stringify({ message_id: "1", sender_id: "2" }, null, 2),
+      "```",
+      "",
+    ].join("\n");
+    expect(currentTurnBody(scaffoldOnly)).toBe("");
+    expect(appended(scaffoldOnly)).not.toBe("");
+  });
+
+  it("still yields text for a media-only turn", () => {
+    const prompt = `${olderMetadata()}[media attached: /tmp/x.pdf (application/pdf)]`;
+    expect(appended(prompt)).toContain("media attached");
+  });
+
+  it("yields nothing only when the prompt itself is empty", () => {
+    expect(appended("")).toBe("");
+    expect(appended(undefined)).toBe("");
+  });
+});
