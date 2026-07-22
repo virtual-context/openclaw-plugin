@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { currentTurnBody, stripHistoryBlock } from "../index.js";
+import {
+  buildReplyOnlyDirective,
+  currentTurnBody,
+  isReplyOnlyInvocation,
+  stripHistoryBlock,
+} from "../index.js";
 
 const REPLAY_LABEL = "OpenClaw assembled context for this turn:";
 const REQUEST_LABEL = "Current user request:";
@@ -236,5 +241,43 @@ describe("replay containing the request label", () => {
       "the current question",
     ].join("\n");
     expect(currentTurnBody(nested)).toBe("the current question");
+  });
+});
+
+describe("reply-only invocation on the wrapped prompt the host actually sends", () => {
+  // Replying "@Vast" to a message that never mentioned Vast: the request lives
+  // in the reply target. Detection has to run on the wrapper-aware body, or the
+  // quoted replay makes the body look non-bare and the whole path goes silent.
+  const wrappedReply = (typed) => [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({ message_id: "999", reply_to_id: "888", has_reply_context: true }, null, 2),
+    "```",
+    "",
+    "Reply target of current user message (untrusted, for context):",
+    "```json",
+    JSON.stringify({ sender_label: "BigTex", body: "what reddits is the job pulling from" }, null, 2),
+    "```",
+    "",
+    replay("[user] earlier chatter"),
+    REQUEST_LABEL,
+    typed,
+  ].join("\n");
+
+  it("detects the bare-mention reply through the wrapper", () => {
+    expect(isReplyOnlyInvocation(wrappedReply("<@1485681229608259666>"))).toBe(true);
+  });
+
+  it("produces a directive naming the replied-to request", () => {
+    const directive = buildReplyOnlyDirective(wrappedReply("<@1485681229608259666>"));
+    expect(directive).toContain("what reddits is the job pulling from");
+  });
+
+  it("leaves a reply that types a real question to normal enrichment", () => {
+    expect(isReplyOnlyInvocation(wrappedReply("<@1485681229608259666> and the dosage?"))).toBe(false);
+  });
+
+  it("does not fire on an ordinary non-reply turn", () => {
+    expect(isReplyOnlyInvocation(`${olderMetadata()}${replay()}${REQUEST_LABEL}\njust asking`)).toBe(false);
   });
 });

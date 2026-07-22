@@ -305,10 +305,15 @@ export function hasReplyContext(promptText) {
  * body is nothing but a mention, so the real request lives in the reply
  * target. An inline question, a reply that also types a real question, and an
  * ordinary non-reply message all return false and are enriched normally.
+ *
+ * The body must be derived with the wrapper-aware helper. The host wraps the
+ * turn before this plugin sees it, so testing the metadata-stripped text alone
+ * left the quoted replay in the body, which never looks like a bare mention.
+ * That silently disabled this whole path on every real reply-only turn.
  */
 export function isReplyOnlyInvocation(promptText) {
   if (!hasReplyContext(promptText)) return false;
-  return isBareMentionOrEmpty(currentMessageBody(promptText));
+  return isBareMentionOrEmpty(currentTurnBody(promptText));
 }
 
 /**
