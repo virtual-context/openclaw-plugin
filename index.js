@@ -1102,6 +1102,16 @@ export default {
         sessionId,
       );
       if (replyOnlyDirective) {
+        // Enrichment is skipped for this turn, but the turn still has to be
+        // recorded. Prepare never runs on this path, so unless the user half
+        // is captured here the completed-turn ingest arrives unpaired and the
+        // whole turn — the answer included — is discarded as a fragment.
+        // Only the earliest prompt-build pass carries the untouched body;
+        // later passes fold the host's assembled context into the prompt.
+        if (!pendingUserTurn.has(sessionId)) {
+          const replyOnlyBody = currentMessageBody(event.prompt);
+          if (replyOnlyBody) pendingUserTurn.set(sessionId, replyOnlyBody);
+        }
         log.warn?.(
           `[vc] reply-only invocation — enforcing replied-to request on this ` +
           `prompt-build pass (VC enrichment skipped). session=${sessionId}`
