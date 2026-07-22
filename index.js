@@ -125,15 +125,14 @@ function resetSessionIngest(sessionId) {
 // A native Discord reply whose body is just the bot mention ("@Vast") carries
 // its real request in the replied-to message, not in the message text. The
 // host delivers this correctly: the current-turn envelope marks the reply and
-// includes the replied-to body, and the host's own prompt keeps that as the
-// request. But the host also appends the RAW current-message body as the final
-// "Current user request:" line, and when VC replaces the system prompt with its
-// compressed context, that trailing raw mention becomes the authoritative last
-// line — the model answers "@Vast" and the replied-to question is lost.
+// includes the replied-to body. It also leaves the bare mention as the final
+// current-message text, though, and the model can treat that mention as the
+// operative request even when the reply target is present elsewhere.
 //
-// So when the current turn is a reply whose body is only a mention, VC declines
-// to override for that turn and lets the host's native, reply-bearing prompt
-// stand. Losing VC retrieval for one turn is preferable to losing the question.
+// For this one message shape, make the relationship explicit: the reply target
+// is the request to answer. VC enrichment is still skipped so it cannot replace
+// the host's native reply-bearing prompt, while prependContext removes the
+// ambiguity that previously produced generic greetings.
 //
 // Detection prefers the host's STRUCTURED fields: the current-turn envelope is
 // a labeled "Conversation info (untrusted metadata)" JSON block carrying
@@ -141,16 +140,23 @@ function resetSessionIngest(sessionId) {
 // for locating that block.
 
 const _CONV_INFO_LABEL = "Conversation info (untrusted metadata):";
+const _REPLY_TARGET_LABEL =
+  "Reply target of current user message (untrusted, for context):";
+const _REPLY_CHAIN_LABEL =
+  "Reply chain of current user message (untrusted, nearest first):";
 const _CURRENT_TURN_LABELS = [
   _CONV_INFO_LABEL,
-  "Reply target of current user message (untrusted, for context):",
+  _REPLY_TARGET_LABEL,
+  _REPLY_CHAIN_LABEL,
   "Chat history since last reply (untrusted, for context):",
 ];
+const _REPLY_ONLY_DIRECTIVE_TTL_MS = 5 * 60 * 1000;
+const _replyOnlyDirectiveCache = new Map();
 
-/** The host's structured conversation-info object for the current turn, or null. */
-export function parseConversationInfo(promptText) {
+/** Parse the fenced JSON block following one of the host's prompt labels. */
+export function parseLabeledJsonBlock(promptText, label) {
   const text = typeof promptText === "string" ? promptText : "";
-  const at = text.indexOf(_CONV_INFO_LABEL);
+  const at = text.indexOf(label);
   if (at < 0) return null;
   const fence = text.indexOf("```json", at);
   if (fence < 0) return null;
@@ -163,6 +169,28 @@ export function parseConversationInfo(promptText) {
   } catch {
     return null;
   }
+}
+
+/** The host's structured conversation-info object for the current turn, or null. */
+export function parseConversationInfo(promptText) {
+  return parseLabeledJsonBlock(promptText, _CONV_INFO_LABEL);
+}
+
+/** The nearest replied-to message body supplied by the host, or an empty string. */
+export function replyTargetBody(promptText) {
+  const target = parseLabeledJsonBlock(promptText, _REPLY_TARGET_LABEL);
+  if (typeof target?.body === "string" && target.body.trim()) {
+    return target.body.trim();
+  }
+
+  const chain = parseLabeledJsonBlock(promptText, _REPLY_CHAIN_LABEL);
+  if (Array.isArray(chain)) {
+    const nearest = chain.find(
+      (entry) => typeof entry?.body === "string" && entry.body.trim(),
+    );
+    if (nearest) return nearest.body.trim();
+  }
+  return "";
 }
 
 /** The actual user-typed body: the current-turn text with the host's labeled
@@ -210,6 +238,64 @@ export function hasReplyContext(promptText) {
 export function isReplyOnlyInvocation(promptText) {
   if (!hasReplyContext(promptText)) return false;
   return isBareMentionOrEmpty(currentMessageBody(promptText));
+}
+
+/**
+ * An explicit model instruction for the ambiguous "reply + bare mention" form.
+ * JSON encoding keeps the user-supplied request visibly delimited without
+ * inventing an XML/Markdown delimiter that the request itself could close.
+ */
+export function buildReplyOnlyDirective(promptText) {
+  if (!isReplyOnlyInvocation(promptText)) return "";
+  const targetBody = replyTargetBody(promptText);
+  if (!targetBody) return "";
+  return [
+    "The current user invoked you by replying to a message with only your mention.",
+    "Treat the replied-to message below as the current user request and answer it directly.",
+    "Do not greet the user or ask what they need merely because the new message is only a mention.",
+    `Replied-to request: ${JSON.stringify(targetBody)}`,
+  ].join("\n");
+}
+
+/**
+ * Resolve the directive across repeated prompt-build passes for one message.
+ *
+ * The Codex Discord harness builds the prompt twice. The first pass's
+ * prependContext is folded into the second pass, which means the second prompt
+ * no longer looks like a bare mention and buildReplyOnlyDirective() returns an
+ * empty string. Cache by the host-generated message id so the same directive
+ * is returned on every build of that message, without leaking into the next
+ * Discord turn.
+ */
+export function resolveReplyOnlyDirective(promptText, sessionId = "", now = Date.now()) {
+  for (const [key, entry] of _replyOnlyDirectiveCache) {
+    if (entry.expiresAt <= now) _replyOnlyDirectiveCache.delete(key);
+  }
+
+  const info = parseConversationInfo(promptText);
+  const messageId = typeof info?.message_id === "string"
+    ? info.message_id.trim()
+    : "";
+  const key = messageId ? `${sessionId}:${messageId}` : "";
+  const fresh = buildReplyOnlyDirective(promptText);
+
+  if (fresh) {
+    if (key) {
+      _replyOnlyDirectiveCache.set(key, {
+        directive: fresh,
+        expiresAt: now + _REPLY_ONLY_DIRECTIVE_TTL_MS,
+      });
+    }
+    return fresh;
+  }
+
+  if (!key) return "";
+  return _replyOnlyDirectiveCache.get(key)?.directive ?? "";
+}
+
+/** Test-only state reset; harmless if called by external diagnostics. */
+export function clearReplyOnlyDirectiveCache() {
+  _replyOnlyDirectiveCache.clear();
 }
 
 /**
@@ -1007,6 +1093,22 @@ export default {
       const sessionKey = ctx?.sessionKey ?? "";
       const promptText = (event.prompt ?? "").trim();
 
+      // This must run before VC prepare and on EVERY prompt-build pass. The
+      // Codex Discord harness rebuilds the prompt after the first hook result;
+      // if only the first pass is guarded, the second pass replaces it with VC
+      // context and the bare @Vast mention becomes authoritative again.
+      const replyOnlyDirective = resolveReplyOnlyDirective(
+        event.prompt,
+        sessionId,
+      );
+      if (replyOnlyDirective) {
+        log.warn?.(
+          `[vc] reply-only invocation — enforcing replied-to request on this ` +
+          `prompt-build pass (VC enrichment skipped). session=${sessionId}`
+        );
+        return { prependContext: replyOnlyDirective };
+      }
+
       // Handle VCREINGEST locally — resets the ingest tracker for this session.
       // Next prepare call will re-read the full JSONL and send all messages to the cloud.
       if (/^VCREINGEST$/i.test(promptText)) {
@@ -1172,22 +1274,6 @@ export default {
       }
 
       if (!body) return;
-
-      // Fail-safe for reply-only invocations. When the current turn is a native
-      // reply whose body is just the bot mention, the real request is the
-      // replied-to message. Overriding the system prompt here lets the host's
-      // trailing raw "Current user request: @Vast" win and the question is lost
-      // (proven: reply to a question with only "@Vast" -> "What needs doing?").
-      // Decline the override for this turn; the host's native prompt already
-      // carries the reply target. The turn is still ingested at agent_end.
-      if (isReplyOnlyInvocation(event.prompt)) {
-        log.warn?.(
-          `[vc] reply-only invocation — leaving the native turn unchanged so the ` +
-          `replied-to request is preserved (VC enrichment skipped this turn). ` +
-          `session=${sessionId}`
-        );
-        return;
-      }
 
       // Defensive fail-open: on any reply turn, if VC's prepared body is
       // malformed (no usable messages), do not push it over the host's native
