@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.2.0",
+  "version": "5.3.0",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {
@@ -51,7 +51,7 @@
             "type": "string"
           }
         },
-        "description": "Map of group session key -> member session keys. Every member shares the group key's stable VC conversation (e.g. all channels of one Discord guild). Requires convIdentity=\"stable\"; both group and member keys must be stable scopes."
+        "description": "Map of group session key -> member session keys. Every member shares the group key's stable VC conversation. Requires convIdentity=\"stable\". Exact stable keys are supported; a terminal agent:<agent>:discord:channel:* wildcard is accepted only when OpenClaw binds that agent to an allowlisted Discord account with exactly one explicit guild, and the group key names that guild. Discord DMs and group DMs remain separate."
       }
     },
     "additionalProperties": false

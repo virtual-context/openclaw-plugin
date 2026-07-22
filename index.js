@@ -733,7 +733,7 @@ export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
   // identity so multiple sessions share one VC conversation. The index only
   // contains entries validated by buildConversationGroupIndex (both sides
   // derive stable), so remapping here cannot stabilize an ephemeral scope.
-  const groupKey = groupIndex?.get(sessionKey);
+  const groupKey = resolveConversationGroup(sessionKey, groupIndex);
   if (groupKey) {
     return { convId: `sk:${groupKey}`, isStable: true };
   }
@@ -773,6 +773,73 @@ export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
   return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
 }
 
+/** Resolve exact members before any certified terminal wildcard. */
+export function resolveConversationGroup(sessionKey, groupIndex) {
+  if (!groupIndex || typeof sessionKey !== "string") return undefined;
+  const exact = groupIndex.get(sessionKey);
+  if (exact) return exact;
+  for (const [member, groupKey] of groupIndex.entries()) {
+    if (member.endsWith("*")) {
+      const prefix = member.slice(0, -1);
+      const tail = sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : "";
+      // OpenClaw emits both channels and threads as one terminal id under the
+      // `discord:channel:<id>` scope. Refuse an empty or multi-segment tail so
+      // a future unknown scope shape is never silently stabilized.
+      if (tail && !tail.includes(":")) return groupKey;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Derive the only Discord wildcard mappings that OpenClaw's own routing
+ * config proves safe. A binding must name an account whose group policy is an
+ * allowlist with exactly one explicit guild. That makes the terminal
+ * `discord:channel:*` pattern equivalent to every channel/thread reachable by
+ * that agent/account, while structurally excluding direct and group DMs.
+ */
+export function buildCertifiedConversationGroupWildcards(ocConfig, log) {
+  const certified = new Map();
+  const conflicted = new Set();
+  const bindings = Array.isArray(ocConfig?.bindings) ? ocConfig.bindings : [];
+  const accounts = ocConfig?.channels?.discord?.accounts;
+  if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) {
+    return certified;
+  }
+
+  for (const binding of bindings) {
+    const agentId = binding?.agentId;
+    const match = binding?.match;
+    const accountId = match?.accountId;
+    if (match?.channel !== "discord" || typeof agentId !== "string" || !agentId ||
+        typeof accountId !== "string" || !accountId) {
+      continue;
+    }
+    const account = accounts[accountId];
+    const guilds = account?.guilds;
+    if (account?.groupPolicy !== "allowlist" || !guilds ||
+        typeof guilds !== "object" || Array.isArray(guilds)) {
+      continue;
+    }
+    const guildIds = Object.keys(guilds).filter((guildId) => guildId && guildId !== "*");
+    if (guildIds.length !== 1 || Object.hasOwn(guilds, "*")) continue;
+
+    const member = `agent:${agentId}:discord:channel:*`;
+    const groupKey = `agent:${agentId}:discord:guild:${guildIds[0]}`;
+    const existing = certified.get(member);
+    if (existing && existing !== groupKey) {
+      certified.delete(member);
+      conflicted.add(member);
+      log?.warn?.(
+        `[vc] conversationGroups: ${JSON.stringify(member)} spans multiple Discord guild bindings — wildcard disabled`,
+      );
+      continue;
+    }
+    if (!conflicted.has(member)) certified.set(member, groupKey);
+  }
+  return certified;
+}
+
 /**
  * Build the member->group index for the conversationGroups config.
  *
@@ -786,10 +853,18 @@ export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
  * groups and members are skipped with a warning; a member claimed by two
  * groups keeps its first assignment.
  *
- * Pure given (config, logger); exported for unit testing.
+ * A member may instead be a terminal wildcard only when certifiedWildcards
+ * proves that exact pattern and target from OpenClaw's account binding. This
+ * deliberately supports Discord `channel:*` only; arbitrary globs are never
+ * interpreted.
+ *
+ * Pure given (config, logger, options); exported for unit testing.
  */
-export function buildConversationGroupIndex(groupsCfg, log) {
+export function buildConversationGroupIndex(groupsCfg, log, options = {}) {
   const index = new Map();
+  const certifiedWildcards = options.certifiedWildcards instanceof Map
+    ? options.certifiedWildcards
+    : new Map();
   if (groupsCfg === undefined || groupsCfg === null) return index;
   if (typeof groupsCfg !== "object" || Array.isArray(groupsCfg)) {
     log?.warn?.("[vc] conversationGroups: expected an object of groupKey -> member[] — config ignored");
@@ -805,7 +880,20 @@ export function buildConversationGroupIndex(groupsCfg, log) {
       continue;
     }
     for (const member of members) {
-      if (typeof member !== "string" || !deriveConvIdentity(member, "probe").isStable) {
+      if (typeof member !== "string") {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} of ${JSON.stringify(groupKey)} does not derive a stable identity — member ignored`);
+        continue;
+      }
+      if (member.includes("*")) {
+        const terminalOnly = member.endsWith("*") && member.indexOf("*") === member.length - 1;
+        const certifiedTarget = terminalOnly ? certifiedWildcards.get(member) : undefined;
+        if (certifiedTarget !== groupKey) {
+          log?.warn?.(
+            `[vc] conversationGroups: wildcard member ${JSON.stringify(member)} is not certified for ${JSON.stringify(groupKey)} — member ignored`,
+          );
+          continue;
+        }
+      } else if (!deriveConvIdentity(member, "probe").isStable) {
         log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} of ${JSON.stringify(groupKey)} does not derive a stable identity — member ignored`);
         continue;
       }
@@ -990,6 +1078,7 @@ export default {
   register(api) {
     const log = api.logger ?? console;
     const cfg = api.pluginConfig ?? {};
+    const ocConfig = api.config ?? {};
     const vcKey = cfg.vcKey || "";
     const baseUrl = cfg.baseUrl || "https://api.virtual-context.com";
     const providerFilter = Array.isArray(cfg.providers) && cfg.providers.length > 0
@@ -1009,8 +1098,13 @@ export default {
     // (missing/unparseable sessionKey). Intentional ephemeral scopes (subagent,
     // explicit) never warn. In session mode derivation is bypassed entirely.
     // Conversation grouping (stable mode only): validated member->group index.
+    const certifiedWildcards = stableMode
+      ? buildCertifiedConversationGroupWildcards(ocConfig, log)
+      : new Map();
     const groupIndex = stableMode
-      ? buildConversationGroupIndex(cfg.conversationGroups, log)
+      ? buildConversationGroupIndex(
+          cfg.conversationGroups, log, { certifiedWildcards },
+        )
       : new Map();
     if (!stableMode && cfg.conversationGroups !== undefined) {
       log.warn?.("[vc] WARNING: conversationGroups requires convIdentity=\"stable\" — config ignored");
@@ -1037,10 +1131,9 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.3 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     // ── Config compatibility checks ──
-    const ocConfig = api.config ?? {};
     const defaults = ocConfig.agents?.defaults ?? {};
 
     const pruningMode = defaults.contextPruning?.mode;
