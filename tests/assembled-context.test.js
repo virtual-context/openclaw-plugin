@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentTurnBody } from "../index.js";
+import { currentTurnBody, stripHistoryBlock } from "../index.js";
 
 const REPLAY_LABEL = "OpenClaw assembled context for this turn:";
 const REQUEST_LABEL = "Current user request:";
@@ -136,5 +136,57 @@ describe("current-turn append never drops a turn", () => {
   it("yields nothing only when the prompt itself is empty", () => {
     expect(appended("")).toBe("");
     expect(appended(undefined)).toBe("");
+  });
+});
+
+describe("stripHistoryBlock", () => {
+  const HISTORY_LABEL =
+    "Conversation context (untrusted, chronological, selected for current message):";
+
+  const historyBlock = (typed) => [
+    HISTORY_LABEL,
+    "#21568 2026-07-12 00:39:33 UTC Y: Hey bast",
+    "#21569 2026-07-12 00:39:53 UTC Bast: Hey, what's stirring?",
+    "#21570 2026-07-12 00:40:15 UTC Y: Its only 8:40pm",
+    "",
+    typed,
+  ].join("\n");
+
+  it("keeps the user's message and drops the numbered history", () => {
+    const out = stripHistoryBlock(historyBlock("Bast I do not like going unacknowledged"));
+    expect(out).toBe("Bast I do not like going unacknowledged");
+  });
+
+  it("does not leak history content", () => {
+    const out = stripHistoryBlock(historyBlock("new question"));
+    expect(out).not.toContain("Hey bast");
+    expect(out).not.toContain("#21568");
+  });
+
+  it("leaves text without the block untouched", () => {
+    expect(stripHistoryBlock("just a message")).toBe("just a message");
+  });
+
+  it("keeps a user message that itself starts with a hash and digits", () => {
+    // History lines carry a timestamp, so requiring one keeps a user line that
+    // merely opens with a number from being swallowed as history.
+    expect(stripHistoryBlock(historyBlock("#1 priority is the calendar")))
+      .toBe("#1 priority is the calendar");
+  });
+
+  it("stops consuming at the first line that is not timestamped history", () => {
+    const out = stripHistoryBlock([
+      HISTORY_LABEL,
+      "#21568 2026-07-12 00:39:33 UTC Y: Hey bast",
+      "still my words #22 not history",
+      "#21569 2026-07-12 00:39:53 UTC Bast: reply",
+    ].join("\n"));
+    expect(out).toContain("still my words #22 not history");
+    expect(out).not.toContain("Hey bast");
+  });
+
+  it("runs as part of currentTurnBody after the request label", () => {
+    const prompt = `${replay()}${REQUEST_LABEL}\n${historyBlock("the real ask")}`;
+    expect(currentTurnBody(prompt)).toBe("the real ask");
   });
 });

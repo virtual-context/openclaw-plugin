@@ -161,6 +161,14 @@ const _replyOnlyDirectiveCache = new Map();
 const _ASSEMBLED_CONTEXT_LABEL = "OpenClaw assembled context for this turn:";
 const _CURRENT_REQUEST_LABEL = "Current user request:";
 
+// A third scaffold block, emitted by the host itself rather than the provider
+// adapter, and placed after the request label so it survives that split. Unlike
+// the metadata headers it is not fenced JSON — it is a run of numbered history
+// lines — so the fence-based strip cannot see it.
+const _HISTORY_BLOCK_LABEL =
+  "Conversation context (untrusted, chronological, selected for current message):";
+const _HISTORY_LINE_RE = /^#\d+\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/;
+
 /** Parse the fenced JSON block following one of the host's prompt labels. */
 export function parseLabeledJsonBlock(promptText, label) {
   const text = typeof promptText === "string" ? promptText : "";
@@ -218,6 +226,24 @@ export function currentMessageBody(promptText) {
 }
 
 /**
+ * Drop the host's numbered chat-history block, keeping the text around it.
+ *
+ * Only the unbroken run of numbered lines after the label is removed, so the
+ * user's own message — which follows that run and is not numbered — survives.
+ */
+export function stripHistoryBlock(text) {
+  const at = text.indexOf(_HISTORY_BLOCK_LABEL);
+  if (at < 0) return text;
+  const before = text.slice(0, at);
+  const lines = text.slice(at + _HISTORY_BLOCK_LABEL.length).split("\n");
+  let i = 0;
+  while (i < lines.length && (!lines[i].trim() || _HISTORY_LINE_RE.test(lines[i].trim()))) {
+    i += 1;
+  }
+  return `${before}\n${lines.slice(i).join("\n")}`.trim();
+}
+
+/**
  * The turn as the user actually wrote it, with the host's assembled-context
  * replay and labeled metadata blocks removed.
  *
@@ -237,12 +263,12 @@ export function currentTurnBody(promptText) {
   if (replayAt >= 0) {
     const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, replayAt);
     if (labelAt >= 0) {
-      return currentMessageBody(
-        text.slice(labelAt + _CURRENT_REQUEST_LABEL.length),
+      return stripHistoryBlock(
+        currentMessageBody(text.slice(labelAt + _CURRENT_REQUEST_LABEL.length)),
       );
     }
   }
-  return currentMessageBody(text);
+  return stripHistoryBlock(currentMessageBody(text));
 }
 
 /** True when a body is only a bot mention (or empty) — no request of its own. */
