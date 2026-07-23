@@ -9,7 +9,12 @@
 
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { argv, env, exit } from "node:process";
-import { hoistSystemPreamble } from "../index.js";
+import {
+  applyCodexContinuityProjection,
+  continuityMessageHash,
+  hoistSystemPreamble,
+  normalizePreparedMessagesForOpenClaw,
+} from "../index.js";
 import { createRequire } from "node:module";
 
 // transformTransportMessages is exported (as `_`) from the host runtime bundle.
@@ -41,6 +46,7 @@ function parseArgs(argv) {
     model: "gpt-5.5", apiKey: null, outDir: "/tmp",
     noLlm: false, verbose: false,
     controlStripHistory: false, controlIsolateProbe: false, compare: false,
+    runtime: "openclaw", nativeReplayCount: null, expectMarker: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -56,6 +62,9 @@ function parseArgs(argv) {
     else if (a === "--control-strip-history") args.controlStripHistory = true;
     else if (a === "--control-isolate-probe") args.controlIsolateProbe = true;
     else if (a === "--compare") args.compare = true;
+    else if (a === "--runtime") args.runtime = argv[++i];
+    else if (a === "--native-replay-count") args.nativeReplayCount = Number(argv[++i]);
+    else if (a === "--expect-marker") args.expectMarker = argv[++i];
     else if (a === "--help" || a === "-h") { printHelp(); exit(0); }
   }
   return args;
@@ -96,6 +105,14 @@ Options:
                                  includes side-by-side per-layer attribution and
                                  response heads, plus model_answered_from_preload_alone
                                  and model_answered_from_preload_alone_strict signals.
+  --runtime <openclaw|codex>     Apply the VC plugin's runtime-specific delivery
+                                 path before host conversion. Default: openclaw.
+  --native-replay-count <N>      Diagnostic override for a saved response captured
+                                 before core emitted replay hashes. Hashes are derived
+                                 from the N messages immediately before the active
+                                 user turn. Saved-response mode only.
+  --expect-marker <text>         Report exactly which outbound layer contains a
+                                 canary such as NativeGuild92.
   --verbose                      Verbose tracing.
   -h, --help                     Show this help.
 
@@ -149,7 +166,7 @@ async function callCloudPrepare(inputMessages, sessionId, verbose) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function convertCloudToInternalShape(msgs) {
-  return msgs.map((m) => {
+  return normalizePreparedMessagesForOpenClaw(msgs).map((m) => {
     if (m.role === "user" || m.role === "system") return m;
     if (m.role === "tool") {
       const content = typeof m.content === "string"
@@ -179,6 +196,36 @@ function convertCloudToInternalShape(msgs) {
     }
     return m;
   });
+}
+
+function messageText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block?.type === "text")
+    .map((block) => block.text ?? "")
+    .join("\n");
+}
+
+function diagnosticReplayMetadata(messages, count) {
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    throw new Error("--native-replay-count must be a positive integer");
+  }
+  if (!Array.isArray(messages) || messages.at(-1)?.role !== "user") {
+    throw new Error("saved prepared body does not end in the active user turn");
+  }
+  const start = messages.length - 1 - count;
+  if (start < 0) {
+    throw new Error("--native-replay-count exceeds the prepared body");
+  }
+  const replay = messages.slice(start, messages.length - 1);
+  return {
+    recent_conversation_native: {
+      message_count: count,
+      message_hashes: replay.map((message) =>
+        continuityMessageHash(message.role, messageText(message.content))),
+    },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,6 +629,22 @@ async function main() {
 
   // Apply plugin's hoist
   const hoistedChars = hoistSystemPreamble(body);
+  let deliveryMetadata = cloudResponse.metadata ?? {};
+  if (args.nativeReplayCount !== null) {
+    if (!args.savedCloudBody) {
+      throw new Error("--native-replay-count is allowed only with --saved-cloud-body");
+    }
+    deliveryMetadata = {
+      ...deliveryMetadata,
+      ...diagnosticReplayMetadata(body.messages, args.nativeReplayCount),
+    };
+  }
+  const continuityProjection = applyCodexContinuityProjection(
+    body,
+    deliveryMetadata,
+    args.runtime,
+    "full-stack-probe",
+  );
 
   // Convert to host-runtime internal shape
   const internalMsgs = convertCloudToInternalShape(body.messages);
@@ -639,6 +702,12 @@ async function main() {
       hoist_chars: hoistedChars || 0,
       body_messages_count_post_hoist: body.messages.length,
       body_system_chars_post_hoist: typeof body.system === "string" ? body.system.length : null,
+      continuity_projection: {
+        applied: continuityProjection.applied,
+        reason: continuityProjection.reason ?? null,
+        message_count: continuityProjection.messageCount ?? 0,
+        fingerprint: continuityProjection.fingerprint ?? null,
+      },
     },
     host_runtime: {
       transformed_messages: transformedCount,
@@ -648,6 +717,18 @@ async function main() {
     variants,
     model_answered_from_preload_alone: preloadAloneSignal,
     model_answered_from_preload_alone_strict: preloadAloneStrictSignal,
+    expected_marker: args.expectMarker ? {
+      value: args.expectMarker,
+      in_system: typeof body.system === "string" && body.system.includes(args.expectMarker),
+      in_user_messages: body.messages.some(
+        (message) => message.role === "user"
+          && messageText(message.content).includes(args.expectMarker),
+      ),
+      in_assistant_messages: body.messages.some(
+        (message) => message.role === "assistant"
+          && messageText(message.content).includes(args.expectMarker),
+      ),
+    } : null,
     artifacts: { cloud_body: cloudPath },
   };
 

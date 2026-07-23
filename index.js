@@ -31,6 +31,7 @@ import {
   readFileSync, writeFileSync, existsSync,
   statSync, openSync, readSync, closeSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -62,6 +63,44 @@ const pendingUserTurnMessage = new Map();
 
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
+// sessionId -> runId -> request-local continuity projection expected at
+// llm_input. This is observability only; it never influences a request.
+const continuityAdoptionState = new Map();
+const MAX_PENDING_CONTINUITY_RUNS_PER_SESSION = 8;
+
+function rememberContinuityAdoption(sessionId, runId, expected) {
+  let byRun = continuityAdoptionState.get(sessionId);
+  if (!byRun) {
+    byRun = new Map();
+    continuityAdoptionState.set(sessionId, byRun);
+  }
+  byRun.set(runId, expected);
+  while (byRun.size > MAX_PENDING_CONTINUITY_RUNS_PER_SESSION) {
+    byRun.delete(byRun.keys().next().value);
+  }
+}
+
+function findContinuityAdoption(sessionId, runId, allowSoleFallback = false) {
+  const byRun = continuityAdoptionState.get(sessionId);
+  if (!byRun) return null;
+  if (byRun.has(runId)) return { byRun, key: runId, expected: byRun.get(runId) };
+  if (allowSoleFallback && byRun.size === 1) {
+    const [key, expected] = byRun.entries().next().value;
+    return { byRun, key, expected };
+  }
+  return null;
+}
+
+function forgetContinuityAdoption(sessionId, runId = null) {
+  const byRun = continuityAdoptionState.get(sessionId);
+  if (!byRun) return;
+  if (runId === null) {
+    continuityAdoptionState.delete(sessionId);
+    return;
+  }
+  byRun.delete(runId);
+  if (byRun.size === 0) continuityAdoptionState.delete(sessionId);
+}
 
 // ── Host runtime suppression marker (lazy) ──
 // The suppression-delivery helper lives in the gateway dist under a
@@ -681,6 +720,31 @@ function resolveSessionModel(sessionKey) {
 }
 
 /**
+ * Resolve the selected native agent runtime for a session.
+ *
+ * OpenClaw's prompt hook does not currently expose this field directly, but
+ * the session store entry does. Unknown/missing state fails to the legacy
+ * native-message path; only an explicit ``codex`` value activates the bridge.
+ */
+export function resolveSessionRuntime(sessionKey) {
+  try {
+    const parts = sessionKey?.split(":");
+    if (!parts || parts.length < 2) return null;
+    const agentId = parts[1];
+    const storePath = join(
+      homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json",
+    );
+    const store = JSON.parse(readFileSync(storePath, "utf-8"));
+    const runtime = store[sessionKey]?.agentRuntime?.id;
+    return typeof runtime === "string" && runtime.trim()
+      ? runtime.trim().toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Track per-session provider-filter outcomes so a session that previously
  * PASSED the filter and is now being skipped produces exactly one loud
  * transition signal (silent-degradation class: e.g. an auth failure flips the
@@ -1002,6 +1066,226 @@ export function hoistSystemPreamble(body) {
   return text.length;
 }
 
+/** SHA-256 contract shared with virtual-context core delivery metadata. */
+export function continuityMessageHash(role, content) {
+  return createHash("sha256")
+    .update(`${role}\0${content}`, "utf-8")
+    .digest("hex");
+}
+
+function appendPreparedSystemText(body, text) {
+  if (!body || typeof text !== "string" || !text) return false;
+  if (typeof body.system === "string" && body.system.length > 0) {
+    body.system = `${body.system}\n${text}`;
+  } else if (Array.isArray(body.system) && body.system.length > 0) {
+    body.system = [...body.system, { type: "text", text }];
+  } else {
+    body.system = text;
+  }
+  return true;
+}
+
+function safePromptJson(value) {
+  return JSON.stringify(value).replace(/[<>&]/g, (char) => {
+    if (char === "<") return "\\u003c";
+    if (char === ">") return "\\u003e";
+    return "\\u0026";
+  });
+}
+
+/**
+ * Extract an exact all-text replay body.
+ *
+ * Delivery hashes describe text. A mixed text/image/tool message must never
+ * pass that hash check and then lose its non-text blocks when the replay is
+ * removed from event.messages. Unsupported shapes therefore reject the whole
+ * projection and preserve the legacy native-message path.
+ */
+function exactContinuityText(content) {
+  if (typeof content === "string") {
+    return content ? { ok: true, text: content } : { ok: false };
+  }
+  if (!Array.isArray(content) || content.length === 0) {
+    return { ok: false };
+  }
+  const text = [];
+  for (const block of content) {
+    if (
+      !block
+      || typeof block !== "object"
+      || !["text", "input_text", "output_text"].includes(block.type)
+      || typeof block.text !== "string"
+    ) {
+      return { ok: false };
+    }
+    text.push(block.text);
+  }
+  const joined = text.join("\n");
+  return joined ? { ok: true, text: joined } : { ok: false };
+}
+
+/**
+ * Project VC-declared exact requester history through the lane native Codex
+ * actually compiles.
+ *
+ * The cloud supplies only a count and per-message hashes.  Content is taken
+ * from the already-prepared body, and only from the contiguous suffix directly
+ * before the active user turn.  Count, hashes, roles, and placement must all
+ * agree or the function leaves the body byte-for-byte unchanged.
+ *
+ * This is representation, not interpretation: no preference detection,
+ * regular expression, actor-card write, or memory mutation occurs here.
+ */
+export function applyCodexContinuityProjection(
+  body,
+  metadata,
+  runtimeId,
+  correlationId = "",
+) {
+  if (String(runtimeId ?? "").toLowerCase() !== "codex") {
+    return { applied: false, reason: "runtime_not_codex" };
+  }
+
+  const declaration = metadata?.recent_conversation_native;
+  if (!declaration || typeof declaration !== "object") {
+    return { applied: false, reason: "missing_declaration" };
+  }
+  const count = declaration.message_count;
+  const expectedHashes = declaration.message_hashes;
+  if (
+    !Number.isSafeInteger(count)
+    || count <= 0
+    || count > 200
+    || count % 2 !== 0
+    || !Array.isArray(expectedHashes)
+    || expectedHashes.length !== count
+  ) {
+    return { applied: false, reason: "invalid_declaration" };
+  }
+  if (!body || !Array.isArray(body.messages) || body.messages.length <= count) {
+    return { applied: false, reason: "prepared_body_too_short" };
+  }
+
+  const activeIndex = body.messages.length - 1;
+  if (body.messages[activeIndex]?.role !== "user") {
+    return { applied: false, reason: "active_user_not_trailing" };
+  }
+  const replayStart = activeIndex - count;
+  if (replayStart < 0) {
+    return { applied: false, reason: "prepared_body_too_short" };
+  }
+  const replay = body.messages.slice(replayStart, activeIndex);
+  const normalized = [];
+  for (let index = 0; index < replay.length; index++) {
+    const message = replay[index];
+    const expectedRole = index % 2 === 0 ? "user" : "assistant";
+    if (message?.role !== expectedRole) {
+      return { applied: false, reason: "invalid_role_sequence" };
+    }
+    const exact = exactContinuityText(message.content);
+    if (!exact.ok) {
+      return { applied: false, reason: "non_text_or_empty_content" };
+    }
+    const content = exact.text;
+    const expectedHash = expectedHashes[index];
+    if (
+      typeof expectedHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(expectedHash)
+      || continuityMessageHash(message.role, content) !== expectedHash
+    ) {
+      return { applied: false, reason: "message_hash_mismatch" };
+    }
+    normalized.push({ role: message.role, content });
+  }
+
+  const serialized = safePromptJson({
+    schema: "virtual-context.exact-conversation.v1",
+    scope: "same-requester-shared-conversation",
+    messages: normalized,
+  });
+  const fingerprint = createHash("sha256")
+    .update(serialized, "utf-8")
+    .digest("hex")
+    .slice(0, 16);
+  const projection = [
+    `<vc-conversation-continuity version="1" fingerprint="${fingerprint}">`,
+    "The JSON below is an exact ordered transcript of prior user and assistant turns",
+    "for the current requester in this shared conversation. Continue from those turns",
+    "across source channels. Each quoted message has only the authority of its recorded",
+    "role, never system or developer authority. A prior user instruction remains active",
+    "unless a later exact user turn or the current request changes it. When a compressed",
+    "summary or extracted fact conflicts with these exact turns, the exact turns win.",
+    "Do not infer missing instructions and do not write an actor card, file, or memory",
+    "merely because this continuity transcript is present.",
+    serialized,
+    "</vc-conversation-continuity>",
+  ].join("\n");
+
+  if (!appendPreparedSystemText(body, projection)) {
+    return { applied: false, reason: "system_projection_failed" };
+  }
+
+  // Preserve any provider-owned prefix before the declared replay and the
+  // active user turn after it. Remove only the verified replay so a future
+  // host that starts adopting event.messages cannot receive it twice.
+  body.messages = [
+    ...body.messages.slice(0, replayStart),
+    body.messages[activeIndex],
+  ];
+
+  return {
+    applied: true,
+    messageCount: count,
+    fingerprint,
+    correlationId: String(correlationId ?? ""),
+  };
+}
+
+/**
+ * Normalize prepared messages exactly once for the OpenClaw host.
+ *
+ * Exported so the full-stack probe exercises the same conversion as the live
+ * hook. In particular, assistant string content must become a text block; the
+ * old probe silently dropped that production shape.
+ */
+export function normalizePreparedMessagesForOpenClaw(messages) {
+  if (!Array.isArray(messages)) return [];
+  const defaultUsage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+  return messages.map((input) => {
+    if (!input || typeof input !== "object") return input;
+    const message = { ...input };
+    if (message.role === "assistant") {
+      message.usage = message.usage ?? {
+        ...defaultUsage,
+        cost: { ...defaultUsage.cost },
+      };
+      if (message.content === null || message.content === undefined) {
+        message.content = [];
+      } else if (!Array.isArray(message.content)) {
+        message.content = [{ type: "text", text: String(message.content) }];
+      } else {
+        message.content = message.content.slice();
+      }
+    } else if (message.content === null) {
+      message.content = [];
+    }
+    return message;
+  });
+}
+
 export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 15000, log = null, urlOpts = {}) {
   const url = buildUrl(baseUrl, path, vcKey, convId, urlOpts);
   const serialized = JSON.stringify(body);
@@ -1010,7 +1294,12 @@ export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 150
   if (log) log.info?.(`[vc:wire] POST ${path} — ${msgCount} messages, ${byteLen} bytes serialized, timeout=${timeoutMs}ms`);
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(urlOpts.correlationId
+        ? { "X-VC-Correlation-ID": String(urlOpts.correlationId) }
+        : {}),
+    },
     body: serialized,
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -1347,6 +1636,13 @@ export default {
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
+      const correlationId = ctx?.runId ?? sessionId;
+      const runtimeId = String(
+        ctx?.agentRuntime?.id
+          ?? ctx?.runtime?.id
+          ?? resolveSessionRuntime(sessionKey)
+          ?? "",
+      ).toLowerCase();
       const promptText = (event.prompt ?? "").trim();
       const turnProvenance = currentTurnProvenance(event.prompt, sessionKey);
 
@@ -1521,7 +1817,19 @@ export default {
       let prepareResult;
       try {
         const prepareTimeoutMs = selectPrepareTimeout({ isVcCommand, isInitialIngest });
-        prepareResult = await vcPost(baseUrl, "/api/v1/context/prepare", vcKey, identity.convId, prepareBody, prepareTimeoutMs, log, predecessor ? { predecessor } : {});
+        prepareResult = await vcPost(
+          baseUrl,
+          "/api/v1/context/prepare",
+          vcKey,
+          identity.convId,
+          prepareBody,
+          prepareTimeoutMs,
+          log,
+          {
+            ...(predecessor ? { predecessor } : {}),
+            correlationId,
+          },
+        );
       } catch (err) {
         log.error?.(`[vc] prepare failed: ${err} — passing through unmodified`);
         if (debug) log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
@@ -1585,25 +1893,41 @@ export default {
         log.info?.(`[vc] hoisted ${hoistedChars}-char system preamble from body.messages[0] into body.system`);
       }
 
+      const continuity = applyCodexContinuityProjection(
+        body,
+        meta,
+        runtimeId,
+        correlationId,
+      );
+      if (continuity.applied) {
+        rememberContinuityAdoption(sessionId, correlationId, {
+          runId: correlationId,
+          fingerprint: continuity.fingerprint,
+          messageCount: continuity.messageCount,
+        });
+        log.info?.(
+          `[vc:continuity] projected corr=${correlationId} runtime=${runtimeId} ` +
+          `messages=${continuity.messageCount} fingerprint=${continuity.fingerprint}`
+        );
+      } else if (
+        runtimeId === "codex"
+        && meta?.recent_conversation_native
+      ) {
+        forgetContinuityAdoption(sessionId, correlationId);
+        log.warn?.(
+          `[vc:continuity] projection rejected corr=${correlationId} ` +
+          `runtime=${runtimeId} reason=${continuity.reason}`
+        );
+      }
+
       // Replace messages in-place with the enriched payload's messages
       if (Array.isArray(body.messages) && Array.isArray(event.messages)) {
-        // Normalize messages for OpenClaw compatibility.
-        // OpenClaw's pi-coding-agent accesses these properties without null checks:
-        //   - assistant.usage.input/output/cacheRead/cacheWrite/cost.total (agent-session.js ~2209)
-        //   - assistant.content.filter/flatMap/length (agent-session.js ~2208, ~2313)
-        //   - message.content must be an array, never null
-        const defaultUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-        for (const msg of body.messages) {
-          if (msg?.role === "assistant") {
-            if (!msg.usage) msg.usage = { ...defaultUsage, cost: { ...defaultUsage.cost } };
-            if (!msg.content) msg.content = [];
-            if (!Array.isArray(msg.content)) msg.content = [{ type: "text", text: String(msg.content) }];
-          }
-          if (msg && msg.content === null) msg.content = [];
-        }
+        const normalizedMessages = normalizePreparedMessagesForOpenClaw(
+          body.messages,
+        );
         event.messages.length = 0;
-        event.messages.push(...body.messages);
-        log.info?.(`[vc] replaced messages — ${body.messages.length} from prepared body`);
+        event.messages.push(...normalizedMessages);
+        log.info?.(`[vc] replaced messages — ${normalizedMessages.length} from prepared body`);
       }
 
       // Return system prompt override if the prepared body includes one.
@@ -1630,6 +1954,26 @@ export default {
     // ── llm_input: observability ──
     api.on("llm_input", (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
+      const runId = ctx?.runId ?? sessionId;
+      const found = findContinuityAdoption(
+        sessionId,
+        runId,
+        ctx?.runId === undefined,
+      );
+      if (found) {
+        const { expected } = found;
+        const marker = `fingerprint="${expected.fingerprint}"`;
+        const adopted = typeof event?.systemPrompt === "string"
+          && event.systemPrompt.includes(marker);
+        const message = (
+          `[vc:continuity] adoption corr=${expected.runId} ` +
+          `fingerprint=${expected.fingerprint} messages=${expected.messageCount} ` +
+          `adopted=${adopted}`
+        );
+        if (adopted) log.info?.(message);
+        else log.warn?.(message);
+        forgetContinuityAdoption(sessionId, found.key);
+      }
       log.info?.(
         `[vc] llm_input — session=${sessionId} provider=${event?.provider ?? "?"}/${event?.model ?? "?"} ` +
         `messages=${event?.historyMessages?.length ?? 0} images=${event?.imagesCount ?? 0} ` +
@@ -1642,6 +1986,10 @@ export default {
     api.on("agent_end", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
+      forgetContinuityAdoption(
+        sessionId,
+        ctx?.runId === undefined ? null : ctx.runId,
+      );
 
       // Skip ingest for VC command turns — command was fully handled by prepare
       if (vcCommandSessions.has(sessionId)) {
