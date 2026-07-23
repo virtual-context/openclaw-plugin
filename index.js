@@ -27,7 +27,10 @@
  *              If empty or omitted, activates for all providers.
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, existsSync,
+  statSync, openSync, readSync, closeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +38,27 @@ const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Tracks sessions where last prepare was a VC command (skip ingest)
 const vcCommandSessions = new Set();
+
+// sessionId -> the user text this turn's prepare sent to the cloud.
+//
+// The cloud pairs a turn's user half with its assistant half, but those arrive
+// on two separate requests minutes apart, and the memory holding the user half
+// in between belongs to whichever worker served prepare. When that memory dies
+// — a restart, an eviction, a differently-routed ingest — the cloud is left
+// with an assistant and no user, refuses to store a half-turn, and the turn is
+// lost from memory entirely. The plugin is the one component that holds both
+// halves, so it carries the user text forward and sends it with the reply.
+//
+// It must be the text prepare actually sent (speaker label included), or the
+// cloud would hash it as a different message and store the turn twice.
+const pendingUserTurn = new Map();
+// sessionId -> structured provenance extracted from the same host prompt as
+// pendingUserTurn. It travels beside the text so storage never needs to parse
+// routing/sender scaffolding back out of conversational content.
+const pendingUserTurnProvenance = new Map();
+// Host message id that pendingUserTurn's value came from, so a stale entry
+// left by an earlier turn is never mistaken for this turn's user half.
+const pendingUserTurnMessage = new Map();
 
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
@@ -102,6 +126,488 @@ function resetSessionIngest(sessionId) {
   const tracker = readIngestTracker();
   delete tracker[sessionId];
   writeIngestTracker(tracker);
+}
+
+// ── Reply-only invocation fail-safe ──────────────────────────────────────
+// A native Discord reply whose body is just the bot mention ("@Vast") carries
+// its real request in the replied-to message, not in the message text. The
+// host delivers this correctly: the current-turn envelope marks the reply and
+// includes the replied-to body. It also leaves the bare mention as the final
+// current-message text, though, and the model can treat that mention as the
+// operative request even when the reply target is present elsewhere.
+//
+// For this one message shape, make the relationship explicit: the reply target
+// is the request to answer. VC enrichment is still skipped so it cannot replace
+// the host's native reply-bearing prompt, while prependContext removes the
+// ambiguity that previously produced generic greetings.
+//
+// Detection prefers the host's STRUCTURED fields: the current-turn envelope is
+// a labeled "Conversation info (untrusted metadata)" JSON block carrying
+// `has_reply_context` / `reply_to_id`. String matching is only the fallback
+// for locating that block.
+
+const _CONV_INFO_LABEL = "Conversation info (untrusted metadata):";
+const _REPLY_TARGET_LABEL =
+  "Reply target of current user message (untrusted, for context):";
+const _REPLY_CHAIN_LABEL =
+  "Reply chain of current user message (untrusted, nearest first):";
+const _CURRENT_TURN_LABELS = [
+  _CONV_INFO_LABEL,
+  _REPLY_TARGET_LABEL,
+  _REPLY_CHAIN_LABEL,
+  "Chat history since last reply (untrusted, for context):",
+];
+const _REPLY_ONLY_DIRECTIVE_TTL_MS = 5 * 60 * 1000;
+const _replyOnlyDirectiveCache = new Map();
+
+// The provider adapter wraps the turn before this plugin is ever called: it
+// prepends a replay of earlier turns and marks the real message with a trailing
+// label. Stored verbatim, that replay becomes a canonical turn holding sixty
+// turns' worth of duplicated text, which then matches almost every retrieval
+// query and buries the actual messages.
+const _ASSEMBLED_CONTEXT_LABEL = "OpenClaw assembled context for this turn:";
+const _CURRENT_REQUEST_LABEL = "Current user request:";
+const _REPLAY_CLOSE_TAG = "</conversation_context>";
+
+// A third scaffold block, emitted by the host itself rather than the provider
+// adapter, and placed after the request label so it survives that split. Unlike
+// the metadata headers it is not fenced JSON — it is a run of numbered history
+// lines — so the fence-based strip cannot see it.
+const _HISTORY_BLOCK_LABEL =
+  "Conversation context (untrusted, chronological, selected for current message):";
+const _HISTORY_LINE_RE = /^#\d+\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/;
+
+/** Parse the fenced JSON block following one of the host's prompt labels. */
+export function parseLabeledJsonBlock(promptText, label) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const at = text.indexOf(label);
+  if (at < 0) return null;
+  const fence = text.indexOf("```json", at);
+  if (fence < 0) return null;
+  const start = text.indexOf("\n", fence);
+  if (start < 0) return null;
+  const end = text.indexOf("```", start + 1);
+  if (end < 0) return null;
+  try {
+    return JSON.parse(text.slice(start + 1, end).trim());
+  } catch {
+    return null;
+  }
+}
+
+/** The host's structured conversation-info object for the current turn, or null. */
+export function parseConversationInfo(promptText) {
+  return parseLabeledJsonBlock(promptText, _CONV_INFO_LABEL);
+}
+
+/** Structured provenance for the current turn, with no prompt text attached. */
+export function currentTurnProvenance(promptText, sessionKey = "") {
+  const info = parseConversationInfo(promptText);
+  if (!info || typeof info !== "object" || Array.isArray(info)) return {};
+
+  const clean = (value) => {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    return /[\x00-\x1f\x7f]/.test(text) ? "" : text;
+  };
+  const result = {};
+  const put = (name, value) => {
+    const text = clean(value);
+    if (text) result[name] = text;
+  };
+
+  const sender = info.sender && typeof info.sender === "object"
+    ? info.sender
+    : {};
+  const senderName = typeof info.sender === "string"
+    ? info.sender
+    : sender.name || sender.display_name || sender.label || sender.username;
+  put(
+    "sender_name",
+    senderName,
+  );
+  put("source_message_id", info.message_id);
+  put("reply_target_message_id", info.reply_to_id);
+  put("origin_channel_label", info.group_channel);
+
+  const chatId = clean(info.chat_id);
+  const channelMatch = /^(?:channel|group):(.+)$/.exec(chatId);
+  if (channelMatch) put("origin_channel_id", channelMatch[1]);
+
+  const senderId = clean(sender.id || info.sender_id);
+  const platformMatch = /^(?:sk:)?agent:[^:]+:([^:]+):(?:channel|group|guild|direct|dm):.+$/.exec(
+    clean(sessionKey),
+  );
+  const platform = clean(platformMatch?.[1] ?? "").toLowerCase();
+  if (senderId && platform && /^[a-z0-9._-]+$/.test(platform)) {
+    put("sender_actor_id", `actor:${platform}:${senderId}`);
+  }
+  return result;
+}
+
+/** The nearest replied-to message body supplied by the host, or an empty string. */
+export function replyTargetBody(promptText) {
+  const target = parseLabeledJsonBlock(promptText, _REPLY_TARGET_LABEL);
+  if (typeof target?.body === "string" && target.body.trim()) {
+    return target.body.trim();
+  }
+
+  const chain = parseLabeledJsonBlock(promptText, _REPLY_CHAIN_LABEL);
+  if (Array.isArray(chain)) {
+    const nearest = chain.find(
+      (entry) => typeof entry?.body === "string" && entry.body.trim(),
+    );
+    if (nearest) return nearest.body.trim();
+  }
+  return "";
+}
+
+/** The actual user-typed body: the current-turn text with the host's labeled
+ *  untrusted-metadata blocks removed. */
+export function currentMessageBody(promptText) {
+  let text = typeof promptText === "string" ? promptText : "";
+  for (const label of _CURRENT_TURN_LABELS) {
+    const at = text.indexOf(label);
+    if (at < 0) continue;
+    const fenceStart = text.indexOf("```", at);
+    if (fenceStart < 0) continue;
+    const fenceEnd = text.indexOf("```", fenceStart + 3);
+    if (fenceEnd < 0) continue;
+    text = text.slice(0, at) + text.slice(fenceEnd + 3);
+  }
+  return text.trim();
+}
+
+/**
+ * Drop the host's numbered chat-history block, keeping the text around it.
+ *
+ * Only the unbroken run of numbered lines after the label is removed, so the
+ * user's own message — which follows that run and is not numbered — survives.
+ */
+export function stripHistoryBlock(text) {
+  const at = text.indexOf(_HISTORY_BLOCK_LABEL);
+  if (at < 0) return text;
+  const before = text.slice(0, at);
+  const lines = text.slice(at + _HISTORY_BLOCK_LABEL.length).split("\n");
+  let i = 0;
+  while (i < lines.length && (!lines[i].trim() || _HISTORY_LINE_RE.test(lines[i].trim()))) {
+    i += 1;
+  }
+  return `${before}\n${lines.slice(i).join("\n")}`.trim();
+}
+
+/**
+ * The turn as the user actually wrote it, with the host's assembled-context
+ * replay and labeled metadata blocks removed.
+ *
+ * The adapter emits the replay first and the real message last, after
+ * _CURRENT_REQUEST_LABEL. The split anchors on the END of the replay container
+ * rather than its header, because replayed turns can themselves contain the
+ * request label — a quoted mention of it, or a previously stored turn that was
+ * polluted before this stripping existed. Anchoring on the header and taking
+ * the first match would split inside the replay and keep the rest of it.
+ *
+ * The outermost close is the last one, so nesting cannot fool it.
+ *
+ * Fails open. If the replay is present but no anchor is found, the host format
+ * has changed, and returning the text unchanged costs fidelity on one turn
+ * where dropping it would cost the turn.
+ */
+export function currentTurnBody(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
+  if (replayAt >= 0) {
+    const closeAt = text.lastIndexOf(_REPLAY_CLOSE_TAG);
+    const searchFrom = closeAt >= 0 ? closeAt + _REPLAY_CLOSE_TAG.length : replayAt;
+    const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, searchFrom);
+    if (labelAt >= 0) {
+      return stripHistoryBlock(
+        currentMessageBody(text.slice(labelAt + _CURRENT_REQUEST_LABEL.length)),
+      );
+    }
+  }
+  return stripHistoryBlock(currentMessageBody(text));
+}
+
+/**
+ * The leading labelled metadata blocks, verbatim, or an empty string.
+ *
+ * Only blocks ahead of the host's replay are taken. Blocks inside the replay
+ * describe older turns, not this one.
+ */
+export function leadingEnvelope(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
+  const limit = replayAt >= 0 ? replayAt : text.length;
+  let end = 0;
+  for (;;) {
+    let next = -1;
+    for (const label of _CURRENT_TURN_LABELS) {
+      const at = text.indexOf(label, end);
+      if (at >= 0 && at < limit && (next < 0 || at < next)) next = at;
+    }
+    if (next < 0) break;
+    const fence = text.indexOf("```", next);
+    if (fence < 0 || fence >= limit) break;
+    const fenceEnd = text.indexOf("```", fence + 3);
+    if (fenceEnd < 0 || fenceEnd >= limit) break;
+    end = fenceEnd + 3;
+  }
+  return end > 0 ? text.slice(0, end) : "";
+}
+
+/**
+ * What this turn should be sent to the cloud as.
+ *
+ * Every host wrapper is removed here. Provenance travels separately through
+ * currentTurnProvenance(), so this value is only the content that should be
+ * hashed, embedded, retrieved, and shown as the user's message.
+ */
+export function currentTurnForIngest(promptText) {
+  return currentTurnBody(promptText);
+}
+
+/** True when a body is only a bot mention (or empty) — no request of its own. */
+function isBareMentionOrEmpty(body) {
+  const stripped = (typeof body === "string" ? body : "")
+    .replace(/<@!?\d+>/g, " ")   // raw Discord mention
+    .replace(/@[\w.\-]+/g, " ")   // resolved @Name mention
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped.length === 0;
+}
+
+/** True when the current turn is a native reply (structured signal). */
+export function hasReplyContext(promptText) {
+  const info = parseConversationInfo(promptText);
+  if (!info) return false;
+  return info.has_reply_context === true
+    || (typeof info.reply_to_id === "string" && info.reply_to_id.trim().length > 0);
+}
+
+/**
+ * Whether VC should keep its hands off the current turn.
+ *
+ * True only for the proven failure shape: the turn is a reply AND the typed
+ * body is nothing but a mention, so the real request lives in the reply
+ * target. An inline question, a reply that also types a real question, and an
+ * ordinary non-reply message all return false and are enriched normally.
+ *
+ * The body must be derived with the wrapper-aware helper. The host wraps the
+ * turn before this plugin sees it, so testing the metadata-stripped text alone
+ * left the quoted replay in the body, which never looks like a bare mention.
+ * That silently disabled this whole path on every real reply-only turn.
+ */
+export function isReplyOnlyInvocation(promptText) {
+  if (!hasReplyContext(promptText)) return false;
+  return isBareMentionOrEmpty(currentTurnBody(promptText));
+}
+
+/**
+ * An explicit model instruction for the ambiguous "reply + bare mention" form.
+ * JSON encoding keeps the user-supplied request visibly delimited without
+ * inventing an XML/Markdown delimiter that the request itself could close.
+ */
+export function buildReplyOnlyDirective(promptText) {
+  if (!isReplyOnlyInvocation(promptText)) return "";
+  const targetBody = replyTargetBody(promptText);
+  if (!targetBody) return "";
+  return [
+    "The current user invoked you by replying to a message with only your mention.",
+    "Treat the replied-to message below as the current user request and answer it directly.",
+    "Do not greet the user or ask what they need merely because the new message is only a mention.",
+    `Replied-to request: ${JSON.stringify(targetBody)}`,
+  ].join("\n");
+}
+
+/**
+ * Resolve the directive across repeated prompt-build passes for one message.
+ *
+ * The Codex Discord harness builds the prompt twice. The first pass's
+ * prependContext is folded into the second pass, which means the second prompt
+ * no longer looks like a bare mention and buildReplyOnlyDirective() returns an
+ * empty string. Cache by the host-generated message id so the same directive
+ * is returned on every build of that message, without leaking into the next
+ * Discord turn.
+ */
+export function resolveReplyOnlyDirective(promptText, sessionId = "", now = Date.now()) {
+  for (const [key, entry] of _replyOnlyDirectiveCache) {
+    if (entry.expiresAt <= now) _replyOnlyDirectiveCache.delete(key);
+  }
+
+  const info = parseConversationInfo(promptText);
+  const messageId = typeof info?.message_id === "string"
+    ? info.message_id.trim()
+    : "";
+  const key = messageId ? `${sessionId}:${messageId}` : "";
+  const fresh = buildReplyOnlyDirective(promptText);
+
+  if (fresh) {
+    if (key) {
+      _replyOnlyDirectiveCache.set(key, {
+        directive: fresh,
+        expiresAt: now + _REPLY_ONLY_DIRECTIVE_TTL_MS,
+      });
+    }
+    return fresh;
+  }
+
+  if (!key) return "";
+  return _replyOnlyDirectiveCache.get(key)?.directive ?? "";
+}
+
+/** Test-only state reset; harmless if called by external diagnostics. */
+export function clearReplyOnlyDirectiveCache() {
+  _replyOnlyDirectiveCache.clear();
+}
+
+/**
+ * Whether VC's prepared body is unusable for a reply turn.
+ *
+ * A reply's real request lives in the current turn, so on a reply turn a
+ * malformed prepared body (no usable messages to install) must not be pushed
+ * over the host's native, reply-bearing prompt. Non-reply turns keep their
+ * existing tolerance for VC returning system-only enrichment.
+ */
+export function preparedBodyUnusableForReply(promptText, body) {
+  if (!hasReplyContext(promptText)) return false;
+  if (!body || typeof body !== "object") return true;
+  return !Array.isArray(body.messages) || body.messages.length === 0;
+}
+
+// ── Speaker labeling for multi-party chats ──────────────────────────────
+// In a group chat the model is handed every prior human turn as a bare
+// `user` message: OpenClaw strips senderName before the prompt hook runs
+// (verified — a history entry arrives as {role, content, timestamp,
+// __openclaw}). Distinct people therefore collapse into one anonymous
+// speaker, and the agent reads whatever the last human said as the words of
+// whoever is speaking now. The session JSONL is the one surface that still
+// carries `senderName`, so identity is recovered from there and stamped
+// into the message text, which is the only channel the model actually reads.
+//
+// The current inbound message is already present in the JSONL when this hook
+// runs, so a message is labeled on its FIRST pass and keeps that exact text
+// on every later pass. That matters beyond tidiness: the memory layer
+// content-hashes each message to recognize it again, so a message that
+// changed shape between turns would be stored twice.
+
+const SPEAKER_JSONL_TAIL_BYTES = 512 * 1024;
+
+/** Plain text of a message body, whichever content shape it uses. */
+function speakerMessageText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b?.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/** A copy of `msg` whose leading text block is replaced with `text`. */
+function withSpeakerText(msg, text) {
+  if (typeof msg.content === "string") return { ...msg, content: text };
+  if (Array.isArray(msg.content)) {
+    const content = msg.content.slice();
+    const i = content.findIndex((b) => b?.type === "text");
+    if (i >= 0) content[i] = { ...content[i], text };
+    else content.unshift({ type: "text", text });
+    return { ...msg, content };
+  }
+  return msg;
+}
+
+/**
+ * Map a session's user-message text to the name of whoever wrote it.
+ *
+ * Reads only the tail of the JSONL so a long session cannot turn every turn
+ * into a full-file scan; a message older than that window simply goes
+ * unlabeled. Text that two different people have written verbatim is dropped
+ * from the map entirely: leaving such a message unlabeled is honest, whereas
+ * guessing between two speakers would invent exactly the misattribution this
+ * whole mechanism exists to prevent.
+ */
+export function readSpeakerNames(sessionKey, sessionId, log) {
+  try {
+    const agentId = (sessionKey ?? "").split(":")[1];
+    if (!agentId) return null;
+    const jsonlPath = join(
+      homedir(), ".openclaw", "agents", agentId, "sessions", `${sessionId}.jsonl`,
+    );
+    if (!existsSync(jsonlPath)) return null;
+
+    const size = statSync(jsonlPath).size;
+    const start = Math.max(0, size - SPEAKER_JSONL_TAIL_BYTES);
+    const fd = openSync(jsonlPath, "r");
+    let raw;
+    try {
+      const buf = Buffer.allocUnsafe(size - start);
+      readSync(fd, buf, 0, buf.length, start);
+      raw = buf.toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+    // A mid-file start almost certainly lands inside a line; drop the partial.
+    const lines = raw.split("\n").filter(Boolean);
+    if (start > 0) lines.shift();
+
+    const byText = new Map();
+    const ambiguous = new Set();
+    for (const line of lines) {
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const msg = entry?.message ?? entry;
+      if (msg?.role !== "user") continue;
+      const name = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
+      if (!name) continue;
+      const text = speakerMessageText(msg.content).trim();
+      if (!text) continue;
+      const seen = byText.get(text);
+      if (seen && seen !== name) {
+        ambiguous.add(text);
+        continue;
+      }
+      byText.set(text, name);
+    }
+    for (const text of ambiguous) byText.delete(text);
+    return byText.size > 0 ? byText : null;
+  } catch (err) {
+    log?.info?.(`[vc] speaker-name read failed: ${err}`);
+    return null;
+  }
+}
+
+/**
+ * Prefix each user message with the name of whoever wrote it.
+ *
+ * Returns a new array; the caller's message objects are not mutated. A
+ * conversation with fewer than two known speakers is left exactly as it was,
+ * so one-on-one chats send a byte-identical payload. Already-labeled text is
+ * left alone, which makes repeat passes over the same history a no-op.
+ */
+export function labelSpeakers(messages, names, log) {
+  if (!names || new Set(names.values()).size < 2) return messages;
+  let labeled = 0;
+  const out = messages.map((msg) => {
+    if (msg?.role !== "user") return msg;
+    const text = speakerMessageText(msg.content);
+    const name = names.get(text.trim());
+    if (!name || text.startsWith(`${name}: `)) return msg;
+    labeled++;
+    return withSpeakerText(msg, `${name}: ${text}`);
+  });
+  if (labeled) {
+    log?.info?.(
+      `[vc] speaker-labeled ${labeled} message(s) across ` +
+      `${new Set(names.values()).size} speakers`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -219,9 +725,17 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * Pure function; exported for unit testing.
  * Returns { convId, isStable, fallbackReason? }.
  */
-export function deriveConvIdentity(sessionKey, sessionId) {
+export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
   if (typeof sessionKey !== "string" || sessionKey.length === 0) {
     return { convId: sessionId, isStable: false, fallbackReason: "missing_session_key" };
+  }
+  // Conversation grouping: a member session key adopts its group key's stable
+  // identity so multiple sessions share one VC conversation. The index only
+  // contains entries validated by buildConversationGroupIndex (both sides
+  // derive stable), so remapping here cannot stabilize an ephemeral scope.
+  const groupKey = resolveConversationGroup(sessionKey, groupIndex);
+  if (groupKey) {
+    return { convId: `sk:${groupKey}`, isStable: true };
   }
   const parts = sessionKey.split(":");
   if (parts[0] !== "agent" || !parts[1]) {
@@ -235,7 +749,8 @@ export function deriveConvIdentity(sessionKey, sessionId) {
       ["direct", "group", "slash"].includes(scope[1]) && scope[2]) {
     return stable(sessionKey);
   }
-  if (scope.length === 3 && scope[0] === "discord" && scope[1] === "channel" && scope[2]) {
+  if (scope.length === 3 && scope[0] === "discord" &&
+      ["channel", "guild", "direct", "group"].includes(scope[1]) && scope[2]) {
     return stable(sessionKey);
   }
   if (scope[0] === "cron" && scope[1]) {
@@ -256,6 +771,142 @@ export function deriveConvIdentity(sessionKey, sessionId) {
     return { convId: sessionId, isStable: false };
   }
   return { convId: sessionId, isStable: false, fallbackReason: "unparseable_session_key" };
+}
+
+/** Resolve exact members before any certified terminal wildcard. */
+export function resolveConversationGroup(sessionKey, groupIndex) {
+  if (!groupIndex || typeof sessionKey !== "string") return undefined;
+  const exact = groupIndex.get(sessionKey);
+  if (exact) return exact;
+  for (const [member, groupKey] of groupIndex.entries()) {
+    if (member.endsWith("*")) {
+      const prefix = member.slice(0, -1);
+      const tail = sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : "";
+      // OpenClaw emits both channels and threads as one terminal id under the
+      // `discord:channel:<id>` scope. Refuse an empty or multi-segment tail so
+      // a future unknown scope shape is never silently stabilized.
+      if (tail && !tail.includes(":")) return groupKey;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Derive the only Discord wildcard mappings that OpenClaw's own routing
+ * config proves safe. A binding must name an account whose group policy is an
+ * allowlist with exactly one explicit guild. That makes the terminal
+ * `discord:channel:*` pattern equivalent to every channel/thread reachable by
+ * that agent/account, while structurally excluding direct and group DMs.
+ */
+export function buildCertifiedConversationGroupWildcards(ocConfig, log) {
+  const certified = new Map();
+  const conflicted = new Set();
+  const bindings = Array.isArray(ocConfig?.bindings) ? ocConfig.bindings : [];
+  const accounts = ocConfig?.channels?.discord?.accounts;
+  if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) {
+    return certified;
+  }
+
+  for (const binding of bindings) {
+    const agentId = binding?.agentId;
+    const match = binding?.match;
+    const accountId = match?.accountId;
+    if (match?.channel !== "discord" || typeof agentId !== "string" || !agentId ||
+        typeof accountId !== "string" || !accountId) {
+      continue;
+    }
+    const account = accounts[accountId];
+    const guilds = account?.guilds;
+    if (account?.groupPolicy !== "allowlist" || !guilds ||
+        typeof guilds !== "object" || Array.isArray(guilds)) {
+      continue;
+    }
+    const guildIds = Object.keys(guilds).filter((guildId) => guildId && guildId !== "*");
+    if (guildIds.length !== 1 || Object.hasOwn(guilds, "*")) continue;
+
+    const member = `agent:${agentId}:discord:channel:*`;
+    const groupKey = `agent:${agentId}:discord:guild:${guildIds[0]}`;
+    const existing = certified.get(member);
+    if (existing && existing !== groupKey) {
+      certified.delete(member);
+      conflicted.add(member);
+      log?.warn?.(
+        `[vc] conversationGroups: ${JSON.stringify(member)} spans multiple Discord guild bindings — wildcard disabled`,
+      );
+      continue;
+    }
+    if (!conflicted.has(member)) certified.set(member, groupKey);
+  }
+  return certified;
+}
+
+/**
+ * Build the member->group index for the conversationGroups config.
+ *
+ * Config shape: { "<groupSessionKey>": ["<memberSessionKey>", ...], ... }.
+ * Every member session key adopts the group key's stable conversation id, so
+ * all grouped sessions read and write one VC conversation.
+ *
+ * Both sides must derive stable on their own: grouping can widen a stable
+ * scope but must never stabilize an ephemeral one (cron/subagent/explicit),
+ * which would bleed disposable traffic into a durable conversation. Invalid
+ * groups and members are skipped with a warning; a member claimed by two
+ * groups keeps its first assignment.
+ *
+ * A member may instead be a terminal wildcard only when certifiedWildcards
+ * proves that exact pattern and target from OpenClaw's account binding. This
+ * deliberately supports Discord `channel:*` only; arbitrary globs are never
+ * interpreted.
+ *
+ * Pure given (config, logger, options); exported for unit testing.
+ */
+export function buildConversationGroupIndex(groupsCfg, log, options = {}) {
+  const index = new Map();
+  const certifiedWildcards = options.certifiedWildcards instanceof Map
+    ? options.certifiedWildcards
+    : new Map();
+  if (groupsCfg === undefined || groupsCfg === null) return index;
+  if (typeof groupsCfg !== "object" || Array.isArray(groupsCfg)) {
+    log?.warn?.("[vc] conversationGroups: expected an object of groupKey -> member[] — config ignored");
+    return index;
+  }
+  for (const [groupKey, members] of Object.entries(groupsCfg)) {
+    if (!deriveConvIdentity(groupKey, "probe").isStable) {
+      log?.warn?.(`[vc] conversationGroups: group key ${JSON.stringify(groupKey)} does not derive a stable identity — group ignored`);
+      continue;
+    }
+    if (!Array.isArray(members)) {
+      log?.warn?.(`[vc] conversationGroups: members of ${JSON.stringify(groupKey)} must be an array — group ignored`);
+      continue;
+    }
+    for (const member of members) {
+      if (typeof member !== "string") {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} of ${JSON.stringify(groupKey)} does not derive a stable identity — member ignored`);
+        continue;
+      }
+      if (member.includes("*")) {
+        const terminalOnly = member.endsWith("*") && member.indexOf("*") === member.length - 1;
+        const certifiedTarget = terminalOnly ? certifiedWildcards.get(member) : undefined;
+        if (certifiedTarget !== groupKey) {
+          log?.warn?.(
+            `[vc] conversationGroups: wildcard member ${JSON.stringify(member)} is not certified for ${JSON.stringify(groupKey)} — member ignored`,
+          );
+          continue;
+        }
+      } else if (!deriveConvIdentity(member, "probe").isStable) {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} of ${JSON.stringify(groupKey)} does not derive a stable identity — member ignored`);
+        continue;
+      }
+      if (member === groupKey) continue;
+      const existing = index.get(member);
+      if (existing && existing !== groupKey) {
+        log?.warn?.(`[vc] conversationGroups: member ${JSON.stringify(member)} already grouped under ${JSON.stringify(existing)} — keeping first assignment`);
+        continue;
+      }
+      index.set(member, groupKey);
+    }
+  }
+  return index;
 }
 
 /**
@@ -371,7 +1022,51 @@ export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 150
   return res.json();
 }
 
-// vcGet removed — tool definitions are now hardcoded, no bootstrap network call needed.
+export async function vcGet(baseUrl, path, vcKey, convId, timeoutMs = 8000, log = null) {
+  const url = buildUrl(baseUrl, path, vcKey, convId);
+  const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(timeoutMs) });
+  if (log) log.info?.(`[vc:wire] GET ${path} — HTTP ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`VC API ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// Per-conversation tool-definition cache. The server binds a request-local
+// speaker enum into eligible tool schemas from the conversation's current
+// roster snapshot; hardcoded definitions remain the fail-open baseline
+// whenever the fetch is stale, failing, or the feature is disabled.
+const toolDefsCache = new Map(); // convId -> { byName: Map, fetchedAt }
+const TOOL_DEFS_TTL_MS = 60_000;
+const toolDefsInflight = new Set();
+
+export function maybeRefreshToolDefs(baseUrl, vcKey, convId, log = null) {
+  if (!convId) return;
+  const entry = toolDefsCache.get(convId);
+  if (entry && Date.now() - entry.fetchedAt < TOOL_DEFS_TTL_MS) return;
+  if (toolDefsInflight.has(convId)) return;
+  toolDefsInflight.add(convId);
+  vcGet(baseUrl, "/api/v1/tools/definitions", vcKey, convId, 8000, null)
+    .then((resp) => {
+      const byName = new Map();
+      for (const tdef of resp?.tools ?? []) {
+        if (tdef?.name) byName.set(tdef.name, tdef);
+      }
+      toolDefsCache.set(convId, { byName, fetchedAt: Date.now() });
+    })
+    .catch((err) => {
+      const prior = toolDefsCache.get(convId)?.byName ?? new Map();
+      toolDefsCache.set(convId, { byName: prior, fetchedAt: Date.now() });
+      log?.info?.(`[vc] tool definitions refresh failed for ${convId}: ${err.message}`);
+    })
+    .finally(() => toolDefsInflight.delete(convId));
+}
+
+export function cachedToolDef(convId, name) {
+  return toolDefsCache.get(convId)?.byName?.get(name);
+}
+
 
 export default {
   id: "virtual-context",
@@ -383,6 +1078,7 @@ export default {
   register(api) {
     const log = api.logger ?? console;
     const cfg = api.pluginConfig ?? {};
+    const ocConfig = api.config ?? {};
     const vcKey = cfg.vcKey || "";
     const baseUrl = cfg.baseUrl || "https://api.virtual-context.com";
     const providerFilter = Array.isArray(cfg.providers) && cfg.providers.length > 0
@@ -401,10 +1097,23 @@ export default {
     // In stable mode, count ephemeral fallbacks for scopes that SHOULD be stable
     // (missing/unparseable sessionKey). Intentional ephemeral scopes (subagent,
     // explicit) never warn. In session mode derivation is bypassed entirely.
+    // Conversation grouping (stable mode only): validated member->group index.
+    const certifiedWildcards = stableMode
+      ? buildCertifiedConversationGroupWildcards(ocConfig, log)
+      : new Map();
+    const groupIndex = stableMode
+      ? buildConversationGroupIndex(
+          cfg.conversationGroups, log, { certifiedWildcards },
+        )
+      : new Map();
+    if (!stableMode && cfg.conversationGroups !== undefined) {
+      log.warn?.("[vc] WARNING: conversationGroups requires convIdentity=\"stable\" — config ignored");
+    }
+
     let fallbackWarnCount = 0;
     function selectConvId(sessionKey, sessionId) {
       if (!stableMode) return { convId: sessionId, isStable: false };
-      const identity = deriveConvIdentity(sessionKey, sessionId);
+      const identity = deriveConvIdentity(sessionKey, sessionId, groupIndex);
       if (identity.fallbackReason === "missing_session_key" || identity.fallbackReason === "unparseable_session_key") {
         fallbackWarnCount++;
         (log.warn ?? log.info)?.(
@@ -422,10 +1131,9 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.3 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     // ── Config compatibility checks ──
-    const ocConfig = api.config ?? {};
     const defaults = ocConfig.agents?.defaults ?? {};
 
     const pruningMode = defaults.contextPruning?.mode;
@@ -448,7 +1156,7 @@ export default {
     // Update these when the VC tool catalogue changes and release a new plugin version.
     const vcTools = [
       { name: "vc_expand_topic", description: "Load the full original conversation text for a topic. Use when a topic summary covers the area you need \u2014 expanding reveals the complete conversation including details the summary may have compressed. Also use after vc_find_quote returns snippets \u2014 expand the matching tag to read surrounding context before answering. For specific facts when you don't know which topic holds them, use vc_find_quote first to locate them.", input_schema: { type: "object", properties: { tag: { type: "string", description: "Topic tag from the context-topics list to expand." }, depth: { type: "string", enum: ["segments", "full"], description: "Target depth: 'segments' for individual summaries, 'full' for original conversation text." }, collapse_tags: { type: "array", items: { type: "string" }, description: "Optional list of topic tags to collapse back to summary depth before expanding. Frees context budget in the same round-trip instead of requiring a separate tool call." } }, required: ["tag"] } },
-      { name: "vc_find_quote", description: "Search the full original conversation text and truncated tool outputs for a specific word, phrase, or detail. Use this when you see '... N bytes truncated \u2014 call vc_find_quote(query) ...' in a tool result, or when the user asks about a specific fact \u2014 a name, number, dosage, recommendation, date, or decision \u2014 especially when no topic summary mentions it or you don't know which topic it falls under. This bypasses tags entirely and searches raw text, so it finds content even when it's filed under an unexpected topic. Returns short excerpts \u2014 use vc_expand_topic on a matching tag if you need more context.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for. Use the most specific and distinctive terms." } }, required: ["query"] } },
+      { name: "vc_find_quote", description: "Search the full original conversation text and truncated tool outputs for a specific word, phrase, or detail. Use this when you see '... N bytes truncated \u2014 call vc_find_quote(query) ...' in a tool result, or when the user asks about a specific fact \u2014 a name, number, dosage, recommendation, date, or decision \u2014 especially when no topic summary mentions it or you don't know which topic it falls under. This bypasses tags entirely and searches raw text, so it finds content even when it's filed under an unexpected topic. Returns short excerpts \u2014 use vc_expand_topic on a matching tag if you need more context.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for. Use the most specific and distinctive terms." }, channel: { type: "string", description: "Optional source-channel scope for conversations that span multiple channels (e.g. a Discord server). Pass the channel name ('#vasttest') or id when the user asks what was said in a specific channel. Omit for normal searches." } }, required: ["query"] } },
       { name: "vc_recall_all", description: "Load summaries of ALL stored conversation topics at once. Use when the user asks for a broad overview, wants to know everything discussed, needs a full summary, or asks a vague question that spans multiple topics. Returns all tag summaries within the token budget. After reviewing, use vc_expand_topic on specific tags if you need more detail.", input_schema: { type: "object", properties: {} } },
       { name: "vc_query_facts", description: "Query extracted facts with structured filters. Essential for questions about events, experiences, trips, activities, or anything the user has done \u2014 each fact has a date, location, and status. Also use for counting, listing, or filtering questions like 'how many X have I done', 'what projects am I leading'. Returns matching facts with count.", input_schema: { type: "object", properties: { subject: { type: "string", description: "Who the fact is about. Usually 'user'." }, verb: { type: "string", description: "Action verb to search for (e.g. 'led', 'built', 'prefers'). Automatically expanded to include similar verbs." }, object_contains: { type: "string", description: "Keyword to match in the object field." }, status: { type: "string", enum: ["active", "completed", "planned", "abandoned", "recurring"], description: "Temporal status filter. Omit for counting queries to get all statuses at once." }, fact_type: { type: "string", enum: ["personal", "experience", "world"], description: "Filter by fact type. Omit to get all types." } } } },
       { name: "vc_remember_when", description: "Best tool for time-based questions. Retrieves conversations and facts from a specific date range. Use FIRST when the question mentions a time period ('past three months', 'last week', 'in March', 'between June and July'). Returns both conversation excerpts and structured facts within the window.", input_schema: { type: "object", properties: { query: { type: "string", description: "Topic/fact query to search for within a time window." }, time_range: { type: "object", properties: { kind: { type: "string", enum: ["relative", "between_dates"] }, preset: { type: "string", enum: ["last_7_days", "last_30_days", "last_90_days", "last_week", "last_month", "this_week", "this_month"] }, start: { type: "string", description: "YYYY-MM-DD" }, end: { type: "string", description: "YYYY-MM-DD" } }, required: ["kind"] }, max_results: { type: "integer", description: "Maximum results to return (default 5)." } }, required: ["query", "time_range"] } },
@@ -457,10 +1165,15 @@ export default {
     ];
 
     for (const def of vcTools) {
-      api.registerTool((ctx) => ({
+      api.registerTool((ctx) => {
+        const factorySession = ctx?.sessionId ?? "unknown";
+        const factoryIdentity = selectConvId(ctx?.sessionKey ?? "", factorySession);
+        maybeRefreshToolDefs(baseUrl, vcKey, factoryIdentity.convId, log);
+        const fetched = cachedToolDef(factoryIdentity.convId, def.name);
+        return {
         name: def.name,
-        description: def.description,
-        parameters: def.input_schema,
+        description: fetched?.description ?? def.description,
+        parameters: fetched?.input_schema ?? def.input_schema,
         async execute(toolCallId, params) {
           const sessionId = ctx?.sessionId ?? "unknown";
           const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
@@ -488,9 +1201,10 @@ export default {
             };
           }
         },
-      }), { names: [def.name] });
+      };
+      }, { names: [def.name] });
     }
-    log.info?.(`[vc] registered ${vcTools.length} tools (hardcoded)`);
+    log.info?.(`[vc] registered ${vcTools.length} tools (dynamic schemas, hardcoded fallback)`);
 
     // ── Native slash commands (/vcstatus, /vcmerge, /vclabel, /vcattach, /vcreingest) ──
     // Use api.registerCommand so each channel (Telegram, Discord, etc.) auto-registers
@@ -634,6 +1348,44 @@ export default {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
       const promptText = (event.prompt ?? "").trim();
+      const turnProvenance = currentTurnProvenance(event.prompt, sessionKey);
+
+      // This must run before VC prepare and on EVERY prompt-build pass. The
+      // Codex Discord harness rebuilds the prompt after the first hook result;
+      // if only the first pass is guarded, the second pass replaces it with VC
+      // context and the bare @Vast mention becomes authoritative again.
+      const replyOnlyDirective = resolveReplyOnlyDirective(
+        event.prompt,
+        sessionId,
+      );
+      if (replyOnlyDirective) {
+        // Enrichment is skipped for this turn, but the turn still has to be
+        // recorded. Prepare never runs on this path, so unless the user half
+        // is captured here the completed-turn ingest arrives unpaired and the
+        // whole turn — the answer included — is discarded as a fragment.
+        // Only the earliest prompt-build pass carries the untouched body;
+        // later passes fold the host's assembled context into the prompt.
+        //
+        // Keyed by the host message id so a later pass of THIS message keeps the
+        // earlier body, while a value left behind by a previous turn is replaced.
+        // Without that distinction a stale entry — from a turn that exited early
+        // via a VC command, the provider filter, or an empty answer — would be
+        // sent as this turn's user half.
+        const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
+        if (!pendingUserTurn.has(sessionId) || pendingUserTurnMessage.get(sessionId) !== replyOnlyId) {
+          const replyOnlyBody = currentTurnForIngest(event.prompt);
+          if (replyOnlyBody) {
+            pendingUserTurn.set(sessionId, replyOnlyBody);
+            pendingUserTurnProvenance.set(sessionId, turnProvenance);
+            pendingUserTurnMessage.set(sessionId, replyOnlyId);
+          }
+        }
+        log.warn?.(
+          `[vc] reply-only invocation — enforcing replied-to request on this ` +
+          `prompt-build pass (VC enrichment skipped). session=${sessionId}`
+        );
+        return { prependContext: replyOnlyDirective };
+      }
 
       // Handle VCREINGEST locally — resets the ingest tracker for this session.
       // Next prepare call will re-read the full JSONL and send all messages to the cloud.
@@ -685,11 +1437,20 @@ export default {
       // event.prompt is the current user message. Append it so the cloud sees the
       // full conversation including the current turn — needed for VC command detection
       // and accurate context preparation.
+      //
+      // Derived once here and reused for every append below, so the payload,
+      // the speaker labels, and the user half carried to agent_end all describe
+      // the same text. Deriving it twice would let those disagree and hash the
+      // same logical turn two different ways.
+      // If nothing survives, the prompt contained no admissible user content.
+      // Never fall back to the raw host wrapper: that is the pollution path
+      // this boundary exists to close.
+      const currentBody = currentTurnForIngest(event.prompt);
       let messagesWithCurrentTurn = [...event.messages];
-      if (event.prompt) {
+      if (currentBody) {
         messagesWithCurrentTurn.push({
           role: "user",
-          content: [{ type: "text", text: event.prompt }],
+          content: [{ type: "text", text: currentBody }],
         });
       }
 
@@ -704,10 +1465,10 @@ export default {
         if (fullMessages && fullMessages.length > messagesWithCurrentTurn.length) {
           log.info?.(`[vc] initial ingest — sending ${fullMessages.length} JSONL messages (was ${messagesWithCurrentTurn.length} windowed)`);
           messagesWithCurrentTurn = [...fullMessages];
-          if (event.prompt) {
+          if (currentBody) {
             messagesWithCurrentTurn.push({
               role: "user",
-              content: [{ type: "text", text: event.prompt }],
+              content: [{ type: "text", text: currentBody }],
             });
           }
           isInitialIngest = true;
@@ -718,9 +1479,32 @@ export default {
         }
       }
 
+      // Stamp who said what, before the payload leaves. This is applied to the
+      // messages the cloud stores AND to the ones that come back as the model's
+      // prompt, so the two never disagree about a message's text.
+      const speakerNames = readSpeakerNames(sessionKey, sessionId, log);
+      messagesWithCurrentTurn = labelSpeakers(
+        messagesWithCurrentTurn, speakerNames, log,
+      );
+
+      // Carry this turn's user text to agent_end so the pair can be rebuilt if
+      // the cloud loses the half it recorded here.
+      for (let i = messagesWithCurrentTurn.length - 1; i >= 0; i--) {
+        const m = messagesWithCurrentTurn[i];
+        if (m?.role !== "user") continue;
+        const text = speakerMessageText(m.content);
+        if (text) {
+          pendingUserTurn.set(sessionId, text);
+          pendingUserTurnProvenance.set(sessionId, turnProvenance);
+          pendingUserTurnMessage.set(sessionId, parseConversationInfo(event.prompt)?.message_id ?? "");
+        }
+        break;
+      }
+
       const prepareBody = {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
+        ...(currentBody ? turnProvenance : {}),
       };
       // Conversation identity: stable scopes get the sk: id; the predecessor
       // forward-link hint goes on prepare ONLY, and only when the selected
@@ -782,6 +1566,17 @@ export default {
       }
 
       if (!body) return;
+
+      // Defensive fail-open: on any reply turn, if VC's prepared body is
+      // malformed (no usable messages), do not push it over the host's native
+      // reply-bearing prompt. Losing enrichment beats losing the request.
+      if (preparedBodyUnusableForReply(event.prompt, body)) {
+        log.warn?.(
+          `[vc] reply turn with malformed prepared body — leaving the native ` +
+          `turn unchanged. session=${sessionId}`
+        );
+        return;
+      }
 
       // Hoist any leading role:"system" entry in body.messages into body.system,
       // so the existing systemPrompt-override path below routes it to the model.
@@ -887,9 +1682,19 @@ export default {
       log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
       if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
+      const userMessage = pendingUserTurn.get(sessionId);
+      const userProvenance = pendingUserTurnProvenance.get(sessionId) ?? {};
+      pendingUserTurn.delete(sessionId);
+      pendingUserTurnProvenance.delete(sessionId);
+      pendingUserTurnMessage.delete(sessionId);
+
       try {
         const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
           assistant_message: assistantMessage,
+          // Repairs the pair when the cloud lost the user half it recorded at
+          // prepare; ignored when it still has it.
+          ...(userMessage ? { user_message: userMessage } : {}),
+          ...userProvenance,
         }, 15000, log);
         log.info?.(
           `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
