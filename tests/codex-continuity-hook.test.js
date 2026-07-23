@@ -218,14 +218,23 @@ describe("Codex continuity through the real lifecycle hook", () => {
       context,
     );
 
-    expect(repeatedHookResult.systemPrompt).toBe(hookResult.systemPrompt);
-    expect(repeatedHookResult.systemPrompt).toContain(
+    expect(repeatedHookResult.prependContext).toBe(
+      hookResult.prependContext,
+    );
+    expect(repeatedHookResult.systemPrompt).toBeUndefined();
+    expect(repeatedHookResult.prependContext).toContain(
       "<vc-conversation-continuity",
     );
-    expect(repeatedHookResult.systemPrompt).toContain(
+    expect(repeatedHookResult.prependContext).toContain(
+      "<vc-prepared-context",
+    );
+    expect(repeatedHookResult.prependContext).toContain(
+      "It has user-level authority only.",
+    );
+    expect(repeatedHookResult.prependContext).toContain(
       "<system-reminder>Compressed summaries may be stale.</system-reminder>",
     );
-    expect(repeatedHookResult.systemPrompt).toContain("NativeGuild92:");
+    expect(repeatedHookResult.prependContext).toContain("NativeGuild92:");
     expect(repeatedEvent.messages).toHaveLength(1);
     expect(repeatedEvent.messages[0].role).toBe("user");
     expect(messageText(repeatedEvent.messages[0].content)).toBe(
@@ -238,7 +247,10 @@ describe("Codex continuity through the real lifecycle hook", () => {
         provider: "openai",
         model: "gpt-5.6-sol",
         historyMessages: [],
-        systemPrompt: repeatedHookResult.systemPrompt,
+        systemPrompt: "OpenClaw retained developer instructions",
+        prompt:
+          `${repeatedHookResult.prependContext}\n\n` +
+          "What is the chemical symbol for gold?",
       },
       context,
     );
@@ -250,6 +262,8 @@ describe("Codex continuity through the real lifecycle hook", () => {
     expect(info).toContain(
       `[vc:continuity] adoption corr=${RUN_ID}`,
     );
+    expect(info).toContain("delivery=per-turn-prompt");
+    expect(info).toContain("delivery_fingerprint=");
     expect(info).toContain(
       `[vc:continuity] reused prepared run corr=${RUN_ID} pass=2 messages=1`,
     );
@@ -284,7 +298,11 @@ describe("Codex continuity through the real lifecycle hook", () => {
       context,
     );
 
-    expect(hookResult.systemPrompt).toBe("base system");
+    expect(hookResult.prependContext).toContain(
+      "<vc-prepared-context",
+    );
+    expect(hookResult.prependContext).toContain("base system");
+    expect(hookResult.systemPrompt).toBeUndefined();
     expect(event.messages.map((message) => message.role)).toEqual([
       "user",
       "assistant",
@@ -326,6 +344,7 @@ describe("Codex continuity through the real lifecycle hook", () => {
 
     expect(mod.resolveSessionRuntime(SESSION_KEY)).toBe("openclaw");
     expect(hookResult.systemPrompt).toBe("base system");
+    expect(hookResult.prependContext).toBeUndefined();
     expect(event.messages.map((message) => message.role)).toEqual([
       "user",
       "assistant",
@@ -388,7 +407,11 @@ describe("Codex continuity through the real lifecycle hook", () => {
       },
     );
 
-    expect(hookResult.systemPrompt).toBe("base system");
+    expect(hookResult.prependContext).toContain(
+      "<vc-prepared-context",
+    );
+    expect(hookResult.prependContext).toContain("base system");
+    expect(hookResult.systemPrompt).toBeUndefined();
     expect(event.messages).toHaveLength(3);
     const allLogs = [
       ...log.info.mock.calls,
@@ -468,18 +491,24 @@ describe("Codex continuity through the real lifecycle hook", () => {
       repeatedEventA,
       { ...baseContext, runId: "run-overlap-a" },
     );
-    expect(repeatedResultA.systemPrompt).toBe(resultA.systemPrompt);
-    expect(repeatedResultB.systemPrompt).toBe(resultB.systemPrompt);
+    expect(repeatedResultA.prependContext).toBe(resultA.prependContext);
+    expect(repeatedResultB.prependContext).toBe(resultB.prependContext);
     expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 
     // Compile in reverse order to reproduce the overwrite race a
     // sessionId-only adoption map would report incorrectly.
     handlers.get("llm_input")(
-      { systemPrompt: repeatedResultB.systemPrompt },
+      {
+        systemPrompt: "retained developer instructions",
+        prompt: repeatedResultB.prependContext,
+      },
       { ...baseContext, runId: "run-overlap-b" },
     );
     handlers.get("llm_input")(
-      { systemPrompt: repeatedResultA.systemPrompt },
+      {
+        systemPrompt: "retained developer instructions",
+        prompt: repeatedResultA.prependContext,
+      },
       { ...baseContext, runId: "run-overlap-a" },
     );
 
@@ -498,5 +527,48 @@ describe("Codex continuity through the real lifecycle hook", () => {
     );
     expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
       .not.toContain("[vc:continuity]");
+  });
+
+  it("does not claim adoption when continuity exists only in systemPrompt", async () => {
+    const home = makeHome();
+    const { mod, handlers, log } = await loadRegisteredPlugin(home);
+    const replay = [
+      { role: "user", content: "Begin replies with FalsePositive41:." },
+      { role: "assistant", content: "FalsePositive41: Understood." },
+    ];
+    installPrepareResponse(replay, nativeMetadata(mod, replay), "base system");
+
+    const event = {
+      prompt: "What is the chemical symbol for gold?",
+      messages: [],
+    };
+    const context = {
+      sessionId: SESSION_ID,
+      sessionKey: SESSION_KEY,
+      runId: RUN_ID,
+      model: "openai/gpt-5.6-sol",
+    };
+    const hookResult = await handlers.get("before_prompt_build")(
+      event,
+      context,
+    );
+
+    handlers.get("llm_input")(
+      {
+        systemPrompt: hookResult.prependContext,
+        prompt: event.prompt,
+      },
+      context,
+    );
+
+    const warnings = log.warn.mock.calls
+      .map(([message]) => message)
+      .join("\n");
+    expect(warnings).toContain(
+      `[vc:continuity] adoption corr=${RUN_ID}`,
+    );
+    expect(warnings).toContain(
+      "delivery=per-turn-prompt adopted=false",
+    );
   });
 });
