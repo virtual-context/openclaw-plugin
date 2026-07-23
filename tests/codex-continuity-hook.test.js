@@ -31,7 +31,7 @@ afterEach(() => {
   }
 });
 
-function makeHome(runtime = "codex") {
+function makeHome(runtime = "codex", { sessionRuntime = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), "vc-codex-hook-test-"));
   mkdirSync(
     join(home, ".openclaw", "extensions", "virtual-context"),
@@ -51,7 +51,23 @@ function makeHome(runtime = "codex") {
       [SESSION_KEY]: {
         modelProvider: "openai",
         model: "gpt-5.6-sol",
-        agentRuntime: { id: runtime },
+        ...(sessionRuntime ? { agentRuntime: { id: runtime } } : {}),
+      },
+    }),
+  );
+  writeFileSync(
+    join(home, ".openclaw", "openclaw.json"),
+    JSON.stringify({
+      agents: {
+        list: [{
+          id: "vast",
+          model: { primary: "openai/gpt-5.6-sol" },
+          models: {
+            "openai/gpt-5.6-sol": {
+              agentRuntime: { id: runtime },
+            },
+          },
+        }],
       },
     }),
   );
@@ -173,6 +189,11 @@ describe("Codex continuity through the real lifecycle hook", () => {
     );
 
     expect(mod.resolveSessionRuntime(SESSION_KEY)).toBe("codex");
+    expect(mod.resolveSessionRuntimeDetails(SESSION_KEY)).toEqual({
+      id: "codex",
+      source: "openclaw-config-model",
+      model: "openai/gpt-5.6-sol",
+    });
 
     const event = {
       prompt: "What is the chemical symbol for gold?",
@@ -188,26 +209,36 @@ describe("Codex continuity through the real lifecycle hook", () => {
       event,
       context,
     );
+    const repeatedEvent = {
+      prompt: event.prompt,
+      messages: JSON.parse(JSON.stringify(event.messages)),
+    };
+    const repeatedHookResult = await handlers.get("before_prompt_build")(
+      repeatedEvent,
+      context,
+    );
 
-    expect(hookResult.systemPrompt).toContain(
+    expect(repeatedHookResult.systemPrompt).toBe(hookResult.systemPrompt);
+    expect(repeatedHookResult.systemPrompt).toContain(
       "<vc-conversation-continuity",
     );
-    expect(hookResult.systemPrompt).toContain(
+    expect(repeatedHookResult.systemPrompt).toContain(
       "<system-reminder>Compressed summaries may be stale.</system-reminder>",
     );
-    expect(hookResult.systemPrompt).toContain("NativeGuild92:");
-    expect(event.messages).toHaveLength(1);
-    expect(event.messages[0].role).toBe("user");
-    expect(messageText(event.messages[0].content)).toBe(
+    expect(repeatedHookResult.systemPrompt).toContain("NativeGuild92:");
+    expect(repeatedEvent.messages).toHaveLength(1);
+    expect(repeatedEvent.messages[0].role).toBe("user");
+    expect(messageText(repeatedEvent.messages[0].content)).toBe(
       "What is the chemical symbol for gold?",
     );
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 
     handlers.get("llm_input")(
       {
         provider: "openai",
         model: "gpt-5.6-sol",
         historyMessages: [],
-        systemPrompt: hookResult.systemPrompt,
+        systemPrompt: repeatedHookResult.systemPrompt,
       },
       context,
     );
@@ -218,6 +249,9 @@ describe("Codex continuity through the real lifecycle hook", () => {
     );
     expect(info).toContain(
       `[vc:continuity] adoption corr=${RUN_ID}`,
+    );
+    expect(info).toContain(
+      `[vc:continuity] reused prepared run corr=${RUN_ID} pass=2 messages=1`,
     );
     expect(info).toContain("adopted=true");
     expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
@@ -302,6 +336,33 @@ describe("Codex continuity through the real lifecycle hook", () => {
       ...log.warn.mock.calls,
     ].map(([message]) => message).join("\n");
     expect(allLogs).not.toContain("[vc:continuity]");
+  });
+
+  it("does not borrow the primary runtime for a different current model", async () => {
+    const home = makeHome();
+    const sessionDir = join(
+      home,
+      ".openclaw",
+      "agents",
+      "vast",
+      "sessions",
+    );
+    writeFileSync(
+      join(sessionDir, "sessions.json"),
+      JSON.stringify({
+        [SESSION_KEY]: {
+          modelProvider: "moonshot",
+          model: "kimi-k2.6",
+        },
+      }),
+    );
+    const { mod } = await loadRegisteredPlugin(home);
+
+    expect(mod.resolveSessionRuntimeDetails(SESSION_KEY)).toEqual({
+      id: null,
+      source: "model-runtime-unmapped",
+      model: "moonshot/kimi-k2.6",
+    });
   });
 
   it("does not emit continuity telemetry without a core declaration", async () => {
@@ -391,15 +452,34 @@ describe("Codex continuity through the real lifecycle hook", () => {
       eventB,
       { ...baseContext, runId: "run-overlap-b" },
     );
+    const repeatedEventB = {
+      prompt: eventB.prompt,
+      messages: JSON.parse(JSON.stringify(eventB.messages)),
+    };
+    const repeatedEventA = {
+      prompt: eventA.prompt,
+      messages: JSON.parse(JSON.stringify(eventA.messages)),
+    };
+    const repeatedResultB = await handlers.get("before_prompt_build")(
+      repeatedEventB,
+      { ...baseContext, runId: "run-overlap-b" },
+    );
+    const repeatedResultA = await handlers.get("before_prompt_build")(
+      repeatedEventA,
+      { ...baseContext, runId: "run-overlap-a" },
+    );
+    expect(repeatedResultA.systemPrompt).toBe(resultA.systemPrompt);
+    expect(repeatedResultB.systemPrompt).toBe(resultB.systemPrompt);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 
     // Compile in reverse order to reproduce the overwrite race a
     // sessionId-only adoption map would report incorrectly.
     handlers.get("llm_input")(
-      { systemPrompt: resultB.systemPrompt },
+      { systemPrompt: repeatedResultB.systemPrompt },
       { ...baseContext, runId: "run-overlap-b" },
     );
     handlers.get("llm_input")(
-      { systemPrompt: resultA.systemPrompt },
+      { systemPrompt: repeatedResultA.systemPrompt },
       { ...baseContext, runId: "run-overlap-a" },
     );
 
@@ -409,6 +489,12 @@ describe("Codex continuity through the real lifecycle hook", () => {
     );
     expect(info).toMatch(
       /adoption corr=run-overlap-b .*adopted=true/,
+    );
+    expect(info).toContain(
+      "reused prepared run corr=run-overlap-a pass=2 messages=1",
+    );
+    expect(info).toContain(
+      "reused prepared run corr=run-overlap-b pass=2 messages=1",
     );
     expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
       .not.toContain("[vc:continuity]");

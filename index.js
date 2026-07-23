@@ -67,6 +67,17 @@ const filterPassState = new Map();
 // llm_input. This is observability only; it never influences a request.
 const continuityAdoptionState = new Map();
 const MAX_PENDING_CONTINUITY_RUNS_PER_SESSION = 8;
+// sessionId -> runId -> the exact successful Codex projection returned by the
+// first before_prompt_build pass. OpenClaw's native Codex Discord path invokes
+// the hook twice for one run. Reusing the first result keeps the second pass
+// from feeding VC's own prepared messages back into prepare, duplicating the
+// current user turn, and overwriting the attested continuity system block.
+//
+// Only successful, hash-attested continuity projections are cached, and only
+// when the host supplies an explicit runId. This never interprets content or
+// changes the legacy path for ordinary/non-Codex prepares.
+const preparedContinuityRunState = new Map();
+const MAX_PREPARED_CONTINUITY_RUNS_PER_SESSION = 8;
 
 function rememberContinuityAdoption(sessionId, runId, expected) {
   let byRun = continuityAdoptionState.get(sessionId);
@@ -100,6 +111,33 @@ function forgetContinuityAdoption(sessionId, runId = null) {
   }
   byRun.delete(runId);
   if (byRun.size === 0) continuityAdoptionState.delete(sessionId);
+}
+
+function rememberPreparedContinuityRun(sessionId, runId, prepared) {
+  let byRun = preparedContinuityRunState.get(sessionId);
+  if (!byRun) {
+    byRun = new Map();
+    preparedContinuityRunState.set(sessionId, byRun);
+  }
+  byRun.set(runId, prepared);
+  while (byRun.size > MAX_PREPARED_CONTINUITY_RUNS_PER_SESSION) {
+    byRun.delete(byRun.keys().next().value);
+  }
+}
+
+function findPreparedContinuityRun(sessionId, runId) {
+  return preparedContinuityRunState.get(sessionId)?.get(runId) ?? null;
+}
+
+function forgetPreparedContinuityRun(sessionId, runId = null) {
+  const byRun = preparedContinuityRunState.get(sessionId);
+  if (!byRun) return;
+  if (runId === null) {
+    preparedContinuityRunState.delete(sessionId);
+    return;
+  }
+  byRun.delete(runId);
+  if (byRun.size === 0) preparedContinuityRunState.delete(sessionId);
 }
 
 // ── Host runtime suppression marker (lazy) ──
@@ -404,6 +442,23 @@ export function leadingEnvelope(promptText) {
  */
 export function currentTurnForIngest(promptText) {
   return currentTurnBody(promptText);
+}
+
+function preparedContinuityTurnKey(promptText) {
+  const info = parseConversationInfo(promptText);
+  const messageId = typeof info?.message_id === "string"
+    ? info.message_id.trim()
+    : "";
+  if (messageId) return `message:${messageId}`;
+  const body = currentTurnForIngest(promptText);
+  if (!body) return "";
+  return `body:${
+    createHash("sha256").update(body, "utf-8").digest("hex")
+  }`;
+}
+
+function clonePreparedMessages(messages) {
+  return JSON.parse(JSON.stringify(messages));
 }
 
 /** True when a body is only a bot mention (or empty) — no request of its own. */
@@ -719,29 +774,164 @@ function resolveSessionModel(sessionKey) {
   }
 }
 
-/**
- * Resolve the selected native agent runtime for a session.
- *
- * OpenClaw's prompt hook does not currently expose this field directly, but
- * the session store entry does. Unknown/missing state fails to the legacy
- * native-message path; only an explicit ``codex`` value activates the bridge.
- */
-export function resolveSessionRuntime(sessionKey) {
+let _runtimeConfigCache = null;
+
+function readOpenClawRuntimeConfig() {
   try {
-    const parts = sessionKey?.split(":");
-    if (!parts || parts.length < 2) return null;
-    const agentId = parts[1];
+    const configPath = join(homedir(), ".openclaw", "openclaw.json");
+    const stat = statSync(configPath);
+    if (
+      _runtimeConfigCache?.path === configPath
+      && _runtimeConfigCache.mtimeMs === stat.mtimeMs
+      && _runtimeConfigCache.size === stat.size
+    ) {
+      return _runtimeConfigCache.config;
+    }
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    _runtimeConfigCache = {
+      path: configPath,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      config,
+    };
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedProviderModel(provider, model) {
+  const rawModel = typeof model === "string" ? model.trim() : "";
+  if (!rawModel) return null;
+  if (rawModel.includes("/")) return rawModel.toLowerCase();
+  const rawProvider = typeof provider === "string" ? provider.trim() : "";
+  return rawProvider ? `${rawProvider}/${rawModel}`.toLowerCase() : null;
+}
+
+function matchingAgent(config, agentId) {
+  const agents = config?.agents?.list;
+  if (!Array.isArray(agents)) return null;
+  return agents.find((agent) => agent?.id === agentId) ?? null;
+}
+
+function configuredRuntimeForModel(config, agentId, modelRef) {
+  const agent = matchingAgent(config, agentId);
+  if (!agent || !modelRef || !agent.models || typeof agent.models !== "object") {
+    return null;
+  }
+  const modelKey = Object.keys(agent.models).find(
+    (key) => key.toLowerCase() === modelRef,
+  );
+  const runtime = modelKey
+    ? agent.models[modelKey]?.agentRuntime?.id
+    : null;
+  if (typeof runtime !== "string" || !runtime.trim()) return null;
+  return runtime.trim().toLowerCase();
+}
+
+/**
+ * Resolve the selected native agent runtime and explain the authoritative
+ * source used.
+ *
+ * Production OpenClaw session rows record provider/model but do not
+ * necessarily copy the model's agentRuntime onto every session. The selected
+ * runtime then lives in the matching agent model entry in openclaw.json.
+ * Resolve that exact model mapping without inferring from prompt text or
+ * assuming any model uses Codex.
+ */
+export function resolveSessionRuntimeDetails(
+  sessionKey,
+  { model: hookModel = null, config: hookConfig = null } = {},
+) {
+  const parts = sessionKey?.split(":");
+  if (!parts || parts.length < 2) {
+    return { id: null, source: "invalid-session-key", model: null };
+  }
+  const agentId = parts[1];
+
+  let sessionEntry = null;
+  try {
     const storePath = join(
       homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json",
     );
     const store = JSON.parse(readFileSync(storePath, "utf-8"));
-    const runtime = store[sessionKey]?.agentRuntime?.id;
-    return typeof runtime === "string" && runtime.trim()
-      ? runtime.trim().toLowerCase()
-      : null;
+    sessionEntry = store[sessionKey] ?? null;
   } catch {
-    return null;
+    // A new session may not have reached the store yet. The hook model and
+    // agent configuration can still resolve it safely.
   }
+
+  const sessionRuntime = sessionEntry?.agentRuntime?.id;
+  if (typeof sessionRuntime === "string" && sessionRuntime.trim()) {
+    return {
+      id: sessionRuntime.trim().toLowerCase(),
+      source: "session-entry",
+      model: normalizedProviderModel(
+        sessionEntry?.modelProvider,
+        sessionEntry?.model,
+      ),
+    };
+  }
+
+  const sessionModel = normalizedProviderModel(
+    sessionEntry?.modelProvider,
+    sessionEntry?.model,
+  );
+  const modelRef = sessionModel ?? normalizedProviderModel(
+    sessionEntry?.modelProvider,
+    hookModel,
+  );
+  const configs = [];
+  if (hookConfig && typeof hookConfig === "object") {
+    configs.push({ config: hookConfig, source: "hook-config" });
+  }
+  const diskConfig = readOpenClawRuntimeConfig();
+  if (diskConfig && diskConfig !== hookConfig) {
+    configs.push({ config: diskConfig, source: "openclaw-config" });
+  }
+
+  if (modelRef) {
+    for (const candidate of configs) {
+      const runtime = configuredRuntimeForModel(
+        candidate.config,
+        agentId,
+        modelRef,
+      );
+      if (runtime) {
+        return {
+          id: runtime,
+          source: `${candidate.source}-model`,
+          model: modelRef,
+        };
+      }
+    }
+    return { id: null, source: "model-runtime-unmapped", model: modelRef };
+  }
+
+  // Only fall back to the configured primary when no concrete current model
+  // exists. If a session names a different model whose runtime is unmapped,
+  // borrowing the primary's runtime could project onto the wrong host lane.
+  for (const candidate of configs) {
+    const agent = matchingAgent(candidate.config, agentId);
+    const primary = normalizedProviderModel(null, agent?.model?.primary);
+    const runtime = configuredRuntimeForModel(
+      candidate.config,
+      agentId,
+      primary,
+    );
+    if (runtime) {
+      return {
+        id: runtime,
+        source: `${candidate.source}-primary`,
+        model: primary,
+      };
+    }
+  }
+  return { id: null, source: "runtime-unresolved", model: null };
+}
+
+export function resolveSessionRuntime(sessionKey, options = {}) {
+  return resolveSessionRuntimeDetails(sessionKey, options).id;
 }
 
 /**
@@ -1636,14 +1826,12 @@ export default {
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
-      const correlationId = ctx?.runId ?? sessionId;
-      const runtimeId = String(
-        ctx?.agentRuntime?.id
-          ?? ctx?.runtime?.id
-          ?? resolveSessionRuntime(sessionKey)
-          ?? "",
-      ).toLowerCase();
+      const explicitRunId = typeof ctx?.runId === "string" && ctx.runId.trim()
+        ? ctx.runId.trim()
+        : null;
+      const correlationId = explicitRunId ?? sessionId;
       const promptText = (event.prompt ?? "").trim();
+      const continuityTurnKey = preparedContinuityTurnKey(event.prompt);
       const turnProvenance = currentTurnProvenance(event.prompt, sessionKey);
 
       // This must run before VC prepare and on EVERY prompt-build pass. The
@@ -1692,6 +1880,42 @@ export default {
         return { prependContext: `Respond with ONLY the following text, exactly as shown. No commentary, no additions:\n\nSession ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
       }
 
+      // The native Codex Discord path invokes this hook twice for one run.
+      // A successful first projection is already the complete prepared result;
+      // feeding its messages back through prepare duplicates the current user
+      // turn and lets a metadata-empty second response erase the continuity
+      // system block. Reuse only the attested result for this explicit run and
+      // exact current turn.
+      const preparedRun = explicitRunId
+        ? findPreparedContinuityRun(sessionId, explicitRunId)
+        : null;
+      if (preparedRun) {
+        if (
+          preparedRun.sessionKey === sessionKey
+          && preparedRun.turnKey
+          && preparedRun.turnKey === continuityTurnKey
+        ) {
+          if (Array.isArray(event.messages)) {
+            event.messages.length = 0;
+            event.messages.push(
+              ...clonePreparedMessages(preparedRun.messages),
+            );
+          }
+          preparedRun.reuseCount += 1;
+          log.info?.(
+            `[vc:continuity] reused prepared run corr=${explicitRunId} ` +
+            `pass=${preparedRun.reuseCount + 1} ` +
+            `messages=${preparedRun.messages.length}`
+          );
+          return { ...preparedRun.hookResult };
+        }
+        forgetPreparedContinuityRun(sessionId, explicitRunId);
+        log.warn?.(
+          `[vc:continuity] refused prepared-run reuse corr=${explicitRunId} ` +
+          `reason=turn_identity_mismatch`
+        );
+      }
+
       // VC commands (VCSTATUS, VCLABEL, etc.) must always reach prepare regardless
       // of provider filter. The provider filter uses the *configured* model from
       // sessions.json, but model fallback happens later — so the filter may see
@@ -1726,6 +1950,25 @@ export default {
       if (isVcCommand) {
         log.info?.(`[vc] VC command detected in prompt — bypassing provider filter`);
       }
+
+      const contextRuntime = ctx?.agentRuntime?.id ?? ctx?.runtime?.id;
+      const runtime = typeof contextRuntime === "string" && contextRuntime.trim()
+        ? {
+            id: contextRuntime.trim().toLowerCase(),
+            source: "hook-context",
+            model: typeof ctx?.model === "string"
+              ? ctx.model.toLowerCase()
+              : null,
+          }
+        : resolveSessionRuntimeDetails(sessionKey, {
+            model: ctx?.model,
+            config: api?.config,
+          });
+      const runtimeId = runtime.id ?? "";
+      log.info?.(
+        `[vc:runtime] corr=${correlationId} runtime=${runtimeId || "unresolved"} ` +
+        `source=${runtime.source} model=${runtime.model ?? "unknown"}`
+      );
 
       log.info?.(`[vc] prepare — session=${sessionId} messages=${event?.messages?.length ?? 0}`);
 
@@ -1918,15 +2161,25 @@ export default {
           `[vc:continuity] projection rejected corr=${correlationId} ` +
           `runtime=${runtimeId} reason=${continuity.reason}`
         );
+      } else if (
+        !runtimeId
+        && meta?.recent_conversation_native
+      ) {
+        log.warn?.(
+          `[vc:continuity] projection unavailable corr=${correlationId} ` +
+          `runtime=unresolved source=${runtime.source} model=${runtime.model ?? "unknown"}`
+        );
       }
 
       // Replace messages in-place with the enriched payload's messages
+      let installedMessages = null;
       if (Array.isArray(body.messages) && Array.isArray(event.messages)) {
         const normalizedMessages = normalizePreparedMessagesForOpenClaw(
           body.messages,
         );
         event.messages.length = 0;
         event.messages.push(...normalizedMessages);
+        installedMessages = clonePreparedMessages(normalizedMessages);
         log.info?.(`[vc] replaced messages — ${normalizedMessages.length} from prepared body`);
       }
 
@@ -1934,21 +2187,44 @@ export default {
       // NOTE: This replaces the ENTIRE system prompt. VC manages the full
       // payload in order to fully compress it.
       const system = body.system;
+      let hookResult;
       if (typeof system === "string" && system.length > 0) {
         log.info?.(`[vc] system prompt override — ${system.length} chars`);
-        return { systemPrompt: system };
-      }
-      // Anthropic format: system can be an array of content blocks
-      if (Array.isArray(system) && system.length > 0) {
+        hookResult = { systemPrompt: system };
+      } else if (Array.isArray(system) && system.length > 0) {
+        // Anthropic format: system can be an array of content blocks.
         const text = system
           .filter((b) => b.type === "text")
           .map((b) => b.text)
           .join("\n");
         if (text.length > 0) {
           log.info?.(`[vc] system prompt override — ${text.length} chars (from blocks)`);
-          return { systemPrompt: text };
+          hookResult = { systemPrompt: text };
         }
       }
+
+      if (
+        continuity.applied
+        && explicitRunId
+        && continuityTurnKey
+        && installedMessages
+        && hookResult?.systemPrompt
+      ) {
+        rememberPreparedContinuityRun(sessionId, explicitRunId, {
+          sessionKey,
+          turnKey: continuityTurnKey,
+          messages: installedMessages,
+          hookResult: { ...hookResult },
+          reuseCount: 0,
+        });
+      } else if (continuity.applied && !explicitRunId) {
+        log.warn?.(
+          `[vc:continuity] projected without explicit runId; ` +
+          `duplicate-pass reuse is unavailable session=${sessionId}`
+        );
+      }
+
+      return hookResult;
     });
 
     // ── llm_input: observability ──
@@ -1974,6 +2250,10 @@ export default {
         else log.warn?.(message);
         forgetContinuityAdoption(sessionId, found.key);
       }
+      forgetPreparedContinuityRun(
+        sessionId,
+        ctx?.runId === undefined ? null : ctx.runId,
+      );
       log.info?.(
         `[vc] llm_input — session=${sessionId} provider=${event?.provider ?? "?"}/${event?.model ?? "?"} ` +
         `messages=${event?.historyMessages?.length ?? 0} images=${event?.imagesCount ?? 0} ` +
@@ -1987,6 +2267,10 @@ export default {
       const sessionId = ctx?.sessionId ?? "unknown";
       const sessionKey = ctx?.sessionKey ?? "";
       forgetContinuityAdoption(
+        sessionId,
+        ctx?.runId === undefined ? null : ctx.runId,
+      );
+      forgetPreparedContinuityRun(
         sessionId,
         ctx?.runId === undefined ? null : ctx.runId,
       );
