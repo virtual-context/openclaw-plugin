@@ -16,11 +16,9 @@ const WILDCARD = "agent:vast:discord:channel:*";
 const CONV = `sk:${GROUP_KEY}`;
 
 const originalFetch = globalThis.fetch;
-const originalWebSocket = globalThis.WebSocket;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  globalThis.WebSocket = originalWebSocket;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -35,7 +33,6 @@ function openClawConfig() {
       discord: {
         accounts: {
           vast: {
-            token: "test-discord-token",
             groupPolicy: "allowlist",
             guilds: {
               [GUILD]: {
@@ -75,7 +72,6 @@ function messageContext() {
 
 function registerObservationPlugin() {
   const handlers = new Map();
-  const services = new Map();
   const logger = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -90,100 +86,14 @@ function registerObservationPlugin() {
       conversationGroups: { [GROUP_KEY]: [WILDCARD] },
       observeGuildMessages: true,
       observeBotUserId: BOT,
-      observeDiscordAccountId: "vast",
       observeFallbackDelayMs: 60000,
     },
     config: openClawConfig(),
     registerTool: vi.fn(),
-    registerService: vi.fn((service) => services.set(service.id, service)),
     on: vi.fn((name, handler) => handlers.set(name, handler)),
   };
   plugin.register(api);
-  return { handlers, logger, services };
-}
-
-class FakeGatewaySocket {
-  static instances = [];
-
-  constructor(url) {
-    this.url = url;
-    this.readyState = 1;
-    this.sent = [];
-    this.listeners = new Map();
-    FakeGatewaySocket.instances.push(this);
-  }
-
-  addEventListener(name, handler) {
-    const listeners = this.listeners.get(name) ?? [];
-    listeners.push(handler);
-    this.listeners.set(name, listeners);
-  }
-
-  send(body) {
-    this.sent.push(JSON.parse(body));
-  }
-
-  close(code = 1000) {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    this.emit("close", { code });
-  }
-
-  emit(name, event) {
-    for (const handler of this.listeners.get(name) ?? []) handler(event);
-  }
-
-  gateway(payload) {
-    this.emit("message", { data: JSON.stringify(payload) });
-  }
-}
-
-function gatewayMessage({
-  id = MESSAGE,
-  content = "NuncaBob should read Ancillary Justice.",
-  timestamp = "2026-07-23T20:28:00.000Z",
-} = {}) {
-  return {
-    id,
-    guild_id: GUILD,
-    channel_id: CHANNEL,
-    content,
-    timestamp,
-    author: {
-      id: SENDER,
-      username: "optics",
-      global_name: "Optics",
-      bot: false,
-    },
-    member: { nick: "Optics" },
-  };
-}
-
-function readyGateway(socket) {
-  socket.gateway({
-    op: 10,
-    d: { heartbeat_interval: 1_000_000 },
-  });
-  socket.gateway({
-    op: 0,
-    s: 1,
-    t: "READY",
-    d: {
-      user: { id: BOT },
-      session_id: "session-1",
-      resume_gateway_url: "wss://resume.discord.gg",
-    },
-  });
-  socket.gateway({
-    op: 0,
-    s: 2,
-    t: "GUILD_CREATE",
-    d: {
-      id: GUILD,
-      channels: [{ id: CHANNEL, name: "vasttest" }],
-      threads: [],
-    },
-  });
+  return { handlers, logger };
 }
 
 describe("guild observation transport boundary", () => {
@@ -243,9 +153,6 @@ describe("guild observation transport boundary", () => {
 
   it("posts an ambient message once and skips explicit/reply invocations", async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-23T20:28:30.000Z"));
-    FakeGatewaySocket.instances = [];
-    globalThis.WebSocket = FakeGatewaySocket;
     const fetchSpy = vi.fn(async () => new Response(JSON.stringify({
       conversation_id: CONV,
       status: "observed",
@@ -256,17 +163,16 @@ describe("guild observation transport boundary", () => {
       headers: { "Content-Type": "application/json" },
     }));
     globalThis.fetch = fetchSpy;
-    const { handlers, services } = registerObservationPlugin();
-    const service = services.get("virtual-context-discord-observer");
-    service.start();
-    const socket = FakeGatewaySocket.instances[0];
-    readyGateway(socket);
+    const { handlers } = registerObservationPlugin();
 
-    socket.gateway({
-      op: 0,
-      s: 3,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage(),
+    handlers.get("message_received")(receivedEvent(), messageContext());
+    handlers.get("before_dispatch")({
+      body: receivedEvent().content,
+      senderId: SENDER,
+      timestamp: receivedEvent().timestamp,
+    }, {
+      ...messageContext(),
+      senderId: SENDER,
     });
     expect(fetchSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(60000);
@@ -282,132 +188,25 @@ describe("guild observation transport boundary", () => {
       sender_id: SENDER,
     });
 
-    const invokedId = "1529000000000000002";
-    socket.gateway({
-      op: 0,
-      s: 4,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage({
-        id: invokedId,
-        content: "reply-only invocation",
-      }),
-    });
-    handlers.get("message_received")({
-      ...receivedEvent("reply-only invocation"),
-      runId: "run-invoked",
-      metadata: {
-        ...receivedEvent().metadata,
-        messageId: invokedId,
-      },
-    }, messageContext());
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-    const lateId = "1529000000000000003";
-    handlers.get("message_received")({
-      ...receivedEvent("late ordering invocation"),
-      runId: "run-late",
-      metadata: {
-        ...receivedEvent().metadata,
-        messageId: lateId,
-      },
-    }, messageContext());
-    socket.gateway({
-      op: 0,
-      s: 5,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage({
-        id: lateId,
-        content: "late ordering invocation",
-      }),
-    });
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-    const beforeDispatchId = "1529000000000000004";
-    socket.gateway({
-      op: 0,
-      s: 6,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage({
-        id: beforeDispatchId,
-        content: "host dispatch proof",
-      }),
-    });
-    handlers.get("before_dispatch")({
-      body: "host dispatch proof",
-      messageId: beforeDispatchId,
-      senderId: SENDER,
-    }, {
-      ...messageContext(),
-      accountId: "vast",
-      messageId: beforeDispatchId,
-      senderId: SENDER,
-    });
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-    socket.gateway({
-      op: 0,
-      s: 7,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage({
-        id: "1529000000000000005",
-        content: "stale replay",
-        timestamp: "2020-01-01T00:00:00.000Z",
-      }),
-    });
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-    socket.gateway({
-      op: 0,
-      s: 8,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage({
-        id: "1529000000000000006",
-        content: "stop lifecycle pending",
-      }),
-    });
-    service.stop();
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not treat a runless message_received event as dispatch proof", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-23T20:28:30.000Z"));
-    FakeGatewaySocket.instances = [];
-    globalThis.WebSocket = FakeGatewaySocket;
-    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({
-      conversation_id: CONV,
-      status: "observed",
-      merge_mode: "observation_append",
-      canonical_turn_id: "canonical-2",
-    }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
-    globalThis.fetch = fetchSpy;
-    const { handlers, services } = registerObservationPlugin();
-    const service = services.get("virtual-context-discord-observer");
-    service.start();
-    const socket = FakeGatewaySocket.instances[0];
-    readyGateway(socket);
-    socket.gateway({
-      op: 0,
-      s: 3,
-      t: "MESSAGE_CREATE",
-      d: gatewayMessage(),
-    });
-
     handlers.get("message_received")(
-      receivedEvent(),
+      receivedEvent(`<@${BOT}> explicit`),
       messageContext(),
     );
+    handlers.get("message_received")(
+      receivedEvent("reply-only invocation"),
+      messageContext(),
+    );
+    handlers.get("before_dispatch")({
+      body: "reply-only invocation",
+      senderId: SENDER,
+      timestamp: receivedEvent().timestamp,
+    }, {
+      ...messageContext(),
+      senderId: SENDER,
+      replyToSender: "Vast",
+    });
     await vi.advanceTimersByTimeAsync(60000);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    service.stop();
   });
 
   it("delivers sequentially, retries once, and refuses overflow", async () => {

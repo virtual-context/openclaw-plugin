@@ -18,11 +18,9 @@ const DISCORD_CHANNEL_KEY =
 
 const createdHomes = [];
 const originalFetch = globalThis.fetch;
-const originalWebSocket = globalThis.WebSocket;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  globalThis.WebSocket = originalWebSocket;
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.resetModules();
@@ -105,7 +103,6 @@ async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
 
   const mod = await import("../index.js");
   const handlers = new Map();
-  const services = new Map();
   const toolFactories = [];
   const log = {
     info: vi.fn(),
@@ -121,12 +118,11 @@ async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
     },
     config: openClawConfig,
     registerTool: vi.fn((factory) => toolFactories.push(factory)),
-    registerService: vi.fn((service) => services.set(service.id, service)),
     on: vi.fn((name, handler) => handlers.set(name, handler)),
   };
 
   mod.default.register(api);
-  return { handlers, services, toolFactories, log };
+  return { handlers, toolFactories, log };
 }
 
 function prepareEvent(prompt = "hello") {
@@ -147,7 +143,6 @@ function discordOpenClawConfig() {
       discord: {
         accounts: {
           vast: {
-            token: "test-discord-token",
             groupPolicy: "allowlist",
             guilds: {
               [DISCORD_GUILD]: {
@@ -159,38 +154,6 @@ function discordOpenClawConfig() {
       },
     },
   };
-}
-
-class FakeGatewaySocket {
-  static instances = [];
-
-  constructor() {
-    this.readyState = 1;
-    this.listeners = new Map();
-    FakeGatewaySocket.instances.push(this);
-  }
-
-  addEventListener(name, handler) {
-    const listeners = this.listeners.get(name) ?? [];
-    listeners.push(handler);
-    this.listeners.set(name, listeners);
-  }
-
-  send() {}
-
-  close(code = 1000) {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    for (const handler of this.listeners.get("close") ?? []) {
-      handler({ code });
-    }
-  }
-
-  gateway(payload) {
-    for (const handler of this.listeners.get("message") ?? []) {
-      handler({ data: JSON.stringify(payload) });
-    }
-  }
 }
 
 function discordPrompt(content) {
@@ -212,56 +175,44 @@ function discordPrompt(content) {
 describe("convIdentity hook routing", () => {
   it("lets prompt-build veto an invocation before ambient delivery", async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-23T20:28:30.000Z"));
-    FakeGatewaySocket.instances = [];
-    globalThis.WebSocket = FakeGatewaySocket;
     const home = makeHome();
     const fetchSpy = installFetch();
-    const { handlers, services, log } = await registerPlugin(home, {
+    const { handlers, log } = await registerPlugin(home, {
       convIdentity: "stable",
       conversationGroups: {
         [DISCORD_GROUP_KEY]: ["agent:vast:discord:channel:*"],
       },
       observeGuildMessages: true,
       observeBotUserId: DISCORD_BOT,
-      observeDiscordAccountId: "vast",
       observeFallbackDelayMs: 1000,
     }, discordOpenClawConfig());
     const content = "Vast what do you think about amber herons";
-    const service = services.get("virtual-context-discord-observer");
-    service.start();
-    const socket = FakeGatewaySocket.instances[0];
-    socket.gateway({
-      op: 10,
-      d: { heartbeat_interval: 1_000_000 },
-    });
-    socket.gateway({
-      op: 0,
-      s: 1,
-      t: "READY",
-      d: {
-        user: { id: DISCORD_BOT },
-        session_id: "session-1",
-        resume_gateway_url: "wss://resume.discord.gg",
+    const messageContext = {
+      channelId: "discord",
+      accountId: "vast",
+      conversationId: DISCORD_CHANNEL,
+    };
+
+    handlers.get("message_received")({
+      content,
+      timestamp: 1784808000000,
+      metadata: {
+        guildId: DISCORD_GUILD,
+        channelName: "vasttest",
+        messageId: DISCORD_MESSAGE,
+        senderId: DISCORD_SENDER,
+        senderName: "Optics",
+        originatingTo: `channel:${DISCORD_CHANNEL}`,
       },
-    });
-    socket.gateway({
-      op: 0,
-      s: 2,
-      t: "MESSAGE_CREATE",
-      d: {
-        id: DISCORD_MESSAGE,
-        guild_id: DISCORD_GUILD,
-        channel_id: DISCORD_CHANNEL,
-        content,
-        timestamp: "2026-07-23T20:28:00.000Z",
-        author: {
-          id: DISCORD_SENDER,
-          username: "optics",
-          global_name: "Optics",
-          bot: false,
-        },
-      },
+    }, messageContext);
+    handlers.get("before_dispatch")({
+      body: content,
+      messageId: DISCORD_MESSAGE,
+      senderId: DISCORD_SENDER,
+    }, {
+      ...messageContext,
+      messageId: DISCORD_MESSAGE,
+      senderId: DISCORD_SENDER,
     });
 
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -280,7 +231,6 @@ describe("convIdentity hook routing", () => {
     expect(urls.filter((url) => url.includes("/context/prepare"))).toHaveLength(1);
     expect(log.info.mock.calls.map(([message]) => message).join("\n"))
       .toContain("cancelled by prompt invocation");
-    service.stop();
   });
 
   it("stable mode routes prepare, ingest, and tools through the selected conv id", async () => {

@@ -34,10 +34,6 @@ import {
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
-  createDiscordGatewayObserver,
-  gatewayMessageToPluginEvent,
-} from "./discord-observer.js";
 
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
@@ -1815,9 +1811,6 @@ export default {
     const debug = cfg.debug === true;
     const observeGuildMessages = cfg.observeGuildMessages === true;
     const observeBotUserId = normalizeDiscordSnowflake(cfg.observeBotUserId);
-    const observeDiscordAccountId = String(
-      cfg.observeDiscordAccountId ?? "vast",
-    ).trim();
 
     // Conversation identity mode. Defensive even with schema validation: anything
     // other than the literal "stable" behaves as "session" (exact legacy behavior)
@@ -1883,49 +1876,12 @@ export default {
       );
       guildObservationEnabled = false;
     }
-    const discordObserverToken = String(
-      ocConfig.channels?.discord?.accounts?.[observeDiscordAccountId]?.token
-        ?? "",
-    ).trim();
-    if (guildObservationEnabled && !observeDiscordAccountId) {
-      log.warn?.(
-        "[vc] observeGuildMessages requires observeDiscordAccountId — observation ingress disabled",
-      );
-      guildObservationEnabled = false;
-    }
-    if (guildObservationEnabled && !discordObserverToken) {
-      log.warn?.(
-        `[vc] observeGuildMessages could not resolve in-memory token for Discord account ${JSON.stringify(observeDiscordAccountId)} — observation ingress disabled`,
-      );
-      guildObservationEnabled = false;
-    }
-    if (
-      guildObservationEnabled
-      && typeof api.registerService !== "function"
-    ) {
-      log.warn?.(
-        "[vc] observeGuildMessages requires OpenClaw registerService — observation ingress disabled",
-      );
-      guildObservationEnabled = false;
-    }
-    if (
-      guildObservationEnabled
-      && typeof globalThis.WebSocket !== "function"
-    ) {
-      log.warn?.(
-        "[vc] observeGuildMessages requires a native WebSocket runtime — observation ingress disabled",
-      );
-      guildObservationEnabled = false;
-    }
 
-    log.info?.(`[vc] register() v5.5 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} guildObservations=${guildObservationEnabled ? "on ingress=discord-gateway" : "off"} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.4 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} guildObservations=${guildObservationEnabled ? "on" : "off"} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     const pendingGuildObservations = new Map();
-    const recentlyDispatchedGuildMessages = new Map();
-    const recentDispatchTtlMs = 15 * 60 * 1000;
-    const replayMaxAgeMs = 2 * 60 * 1000;
     const observationFallbackDelayMs = Math.max(
-      5000,
+      1000,
       Math.min(60000, Number(cfg.observeFallbackDelayMs) || 10000),
     );
     const observationQueue = guildObservationEnabled
@@ -1963,7 +1919,7 @@ export default {
 
     function findPendingGuildObservation(event, ctx) {
       const directId = normalizeDiscordSnowflake(
-        event?.metadata?.messageId ?? event?.messageId ?? ctx?.messageId,
+        event?.messageId ?? ctx?.messageId,
       );
       if (directId) {
         const direct = pendingGuildObservations.get(directId);
@@ -1980,7 +1936,6 @@ export default {
         event?.senderId ?? ctx?.senderId,
       );
       const channelId = normalizeDiscordSnowflake(ctx?.conversationId);
-      if (!body || !senderId || !channelId) return null;
       const now = Date.now();
       let newest = null;
       for (const [messageId, pending] of pendingGuildObservations) {
@@ -2007,178 +1962,73 @@ export default {
       return newest;
     }
 
-    function pruneRecentGuildDispatches() {
-      const cutoff = Date.now() - recentDispatchTtlMs;
-      for (const [messageId, dispatchedAt] of (
-        recentlyDispatchedGuildMessages
-      )) {
-        if (dispatchedAt >= cutoff) break;
-        recentlyDispatchedGuildMessages.delete(messageId);
-      }
-    }
-
-    function rememberDispatchedGuildMessage(messageId) {
-      const cleanId = normalizeDiscordSnowflake(messageId);
-      if (!cleanId) return "";
-      pruneRecentGuildDispatches();
-      recentlyDispatchedGuildMessages.delete(cleanId);
-      recentlyDispatchedGuildMessages.set(cleanId, Date.now());
-      return cleanId;
-    }
-
-    function wasRecentlyDispatchedGuildMessage(messageId) {
-      const cleanId = normalizeDiscordSnowflake(messageId);
-      if (!cleanId) return false;
-      pruneRecentGuildDispatches();
-      return recentlyDispatchedGuildMessages.has(cleanId);
-    }
-
-    function stageGuildObservation(observation) {
-      if (!observation || !observationQueue) return false;
-      let observedAt = Date.parse(String(observation.body?.timestamp ?? ""));
-      if (!Number.isFinite(observedAt)) {
-        try {
-          observedAt = Number(
-            (BigInt(observation.messageId) >> 22n) + 1420070400000n,
-          );
-        } catch {
-          observedAt = Number.NaN;
-        }
-      }
-      if (
-        Number.isFinite(observedAt)
-        && Date.now() - observedAt > replayMaxAgeMs
-      ) {
-        log.info?.(
-          `[vc] guild observation skipped stale Gateway replay message=${observation.messageId}`,
-        );
-        return false;
-      }
-      if (wasRecentlyDispatchedGuildMessage(observation.messageId)) {
-        if (debug) {
-          log.info?.(
-            `[vc:debug] guild observation skipped recent dispatch message=${observation.messageId}`,
-          );
-        }
-        return false;
-      }
-      const prior = forgetPendingGuildObservation(observation.messageId);
-      if (prior && debug) {
-        log.info?.(
-          `[vc:debug] replaced pending guild observation message=${observation.messageId}`,
-        );
-      }
-      const timer = setTimeout(() => {
-        const pending = pendingGuildObservations.get(observation.messageId);
-        if (!pending) return;
-        pendingGuildObservations.delete(observation.messageId);
-        observationQueue.enqueue(pending.observation);
-      }, observationFallbackDelayMs);
-      pendingGuildObservations.set(observation.messageId, {
-        observation,
-        timer,
-        cachedAt: Date.now(),
-      });
-      if (debug) {
-        log.info?.(
-          `[vc:debug] staged guild observation message=${observation.messageId}`,
-        );
-      }
-      return true;
-    }
-
-    function cancelDispatchedGuildObservation(event, ctx, seam) {
-      const directId = normalizeDiscordSnowflake(
-        event?.metadata?.messageId
-          ?? event?.messageId
-          ?? ctx?.messageId,
-      );
-      if (directId) rememberDispatchedGuildMessage(directId);
-      const pending = findPendingGuildObservation(event, ctx);
-      if (!pending) return null;
-      rememberDispatchedGuildMessage(pending.messageId);
-      const cancelled = forgetPendingGuildObservation(pending.messageId);
-      if (cancelled) {
-        log.info?.(
-          `[vc] guild observation cancelled by ${seam} ` +
-          `message=${cancelled.messageId}`,
-        );
-      }
-      return cancelled;
-    }
-
     if (guildObservationEnabled) {
-      let discordGatewayObserver = null;
-      let discordGatewayObserverRunning = false;
-      api.registerService({
-        id: "virtual-context-discord-observer",
-        start() {
-          if (discordGatewayObserver) return;
-          discordGatewayObserver = createDiscordGatewayObserver({
-            token: discordObserverToken,
-            botUserId: observeBotUserId,
-            log,
-            onMessageCreate(message, gatewayMetadata) {
-              if (!discordGatewayObserverRunning) return;
-              const normalized = gatewayMessageToPluginEvent(message, {
-                botUserId: observeBotUserId,
-                channelLabel: gatewayMetadata?.channelLabel,
-              });
-              if (!normalized) return;
-              const observation = buildGuildObservation(
-                normalized.event,
-                normalized.ctx,
-                {
-                  conversationGroups: cfg.conversationGroups,
-                  groupIndex,
-                  observeBotUserId,
-                },
-              );
-              stageGuildObservation(observation);
-            },
-          });
-          discordGatewayObserverRunning = true;
-          try {
-            discordGatewayObserver.start();
-          } catch (error) {
-            discordGatewayObserverRunning = false;
-            discordGatewayObserver = null;
-            throw error;
-          }
-        },
-        stop() {
-          discordGatewayObserverRunning = false;
-          discordGatewayObserver?.stop();
-          discordGatewayObserver = null;
-          for (const messageId of [...pendingGuildObservations.keys()]) {
-            forgetPendingGuildObservation(messageId);
-          }
-          recentlyDispatchedGuildMessages.clear();
-        },
-      });
-
-      // OpenClaw emits message_received only after the Discord mention/
-      // participation gate.  Its presence therefore proves this message is
-      // on the normal dispatch + prepare/ingest path when a runId is attached.
-      // Requiring that run-scoped proof also remains safe if a future host
-      // version emits a broader pre-dispatch message_received event.
       api.on("message_received", (event, ctx) => {
-        if (String(ctx?.channelId ?? "").toLowerCase() !== "discord") return;
-        if (!String(event?.runId ?? ctx?.runId ?? "").trim()) return;
-        cancelDispatchedGuildObservation(event, ctx, "message_received");
-      });
-
-      // This second cancellation seam covers reply-only and future host
-      // invocation shapes even if message_received metadata is incomplete.
-      api.on("before_dispatch", (event, ctx) => {
-        if (String(ctx?.channelId ?? "").toLowerCase() !== "discord") return;
-        if (
-          ctx?.accountId
-          && String(ctx.accountId) !== observeDiscordAccountId
-        ) {
+        const observation = buildGuildObservation(event, ctx, {
+          conversationGroups: cfg.conversationGroups,
+          groupIndex,
+          observeBotUserId,
+        });
+        if (!observation) return;
+        if (isExplicitVcInvocation(event?.content, ctx, cfg)) {
+          log.info?.(
+            `[vc] guild observation skipped explicit transport invocation message=${observation.messageId}`,
+          );
           return;
         }
-        cancelDispatchedGuildObservation(event, ctx, "before_dispatch");
+        const prior = forgetPendingGuildObservation(observation.messageId);
+        if (prior && debug) {
+          log.info?.(
+            `[vc:debug] replaced pending guild observation message=${observation.messageId}`,
+          );
+        }
+        const timer = setTimeout(() => {
+          const pending = pendingGuildObservations.get(observation.messageId);
+          if (!pending) return;
+          pendingGuildObservations.delete(observation.messageId);
+          observationQueue.enqueue(pending.observation);
+        }, observationFallbackDelayMs);
+        pendingGuildObservations.set(observation.messageId, {
+          observation,
+          timer,
+          cachedAt: Date.now(),
+        });
+      });
+
+      // before_dispatch carries reply-to identity that message_received does
+      // not. It is the primary transport decision seam: ordinary guild chat
+      // remains pending for timer delivery, while messages that invoke Vast
+      // are cancelled. Keeping ordinary chat pending gives
+      // before_prompt_build the final veto before any network write for host
+      // invocation shapes this plugin does not know about.
+      api.on("before_dispatch", (event, ctx) => {
+        const pending = findPendingGuildObservation(event, ctx);
+        if (!pending) return;
+        const observation = pending.observation;
+        const text = String(event?.body ?? event?.content ?? "");
+        if (isExplicitVcInvocation(text, ctx, cfg)) {
+          forgetPendingGuildObservation(pending.messageId);
+          log.info?.(
+            `[vc] guild observation cancelled by dispatch invocation message=${observation.messageId}`,
+          );
+          return;
+        }
+        if (ctx?.replyToId) {
+          observation.body.reply_target_message_id =
+            normalizeDiscordSnowflake(ctx.replyToId);
+        }
+        if (ctx?.replyToSender) {
+          observation.body.reply_sender_name = String(ctx.replyToSender).trim();
+        }
+        if (ctx?.replyToBody) {
+          observation.body.reply_target_body = String(ctx.replyToBody).trim();
+        }
+        if (pending.matchedBy === "content" && debug) {
+          log.info?.(
+            `[vc:debug] guild observation dispatch metadata matched by content ` +
+            `message=${observation.messageId}`,
+          );
+        }
       });
     }
 
@@ -2401,7 +2251,6 @@ export default {
       // the normal prepare/ingest pair and must not also land as ambient.
       const promptMessageId = parseConversationInfo(event?.prompt)?.message_id;
       if (promptMessageId) {
-        rememberDispatchedGuildMessage(promptMessageId);
         const cancelled = forgetPendingGuildObservation(promptMessageId);
         if (cancelled) {
           log.info?.(
