@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.4.0",
+  "version": "5.5.0",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {
@@ -56,11 +56,16 @@
       "observeGuildMessages": {
         "type": "boolean",
         "default": false,
-        "description": "Admit non-invoking Discord guild messages into their certified conversationGroup as user-only VC observations. DMs are always excluded. Disabled by default."
+        "description": "Admit non-dispatched Discord guild messages into their certified conversationGroup as user-only VC observations through a receive-only Discord Gateway session. DMs are always excluded. This does not invoke the agent or read OpenClaw transcripts. Disabled by default."
       },
       "observeBotUserId": {
         "type": "string",
-        "description": "Discord user id of the OpenClaw bot. Required when observeGuildMessages is enabled so bot invocations and bot-authored messages fail closed."
+        "description": "Discord user id of the OpenClaw bot. Required when observeGuildMessages is enabled; the observer verifies this identity at Gateway READY and rejects bot-authored messages."
+      },
+      "observeDiscordAccountId": {
+        "type": "string",
+        "default": "vast",
+        "description": "OpenClaw Discord account whose already-resolved in-memory bot token is used for the receive-only observation Gateway session. The token is never logged or read from conversation files."
       },
       "observeQueueMax": {
         "type": "integer",
@@ -71,10 +76,10 @@
       },
       "observeFallbackDelayMs": {
         "type": "integer",
-        "minimum": 1000,
+        "minimum": 5000,
         "maximum": 60000,
         "default": 10000,
-        "description": "Fallback delay before an observation is delivered if OpenClaw does not emit before_dispatch. Actual Vast invocations cancel the pending observation first."
+        "description": "Delay before a Gateway message is delivered as an observation. Any message OpenClaw actually dispatches cancels the pending observation first, independent of content semantics."
       }
     },
     "additionalProperties": false
