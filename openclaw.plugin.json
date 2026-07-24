@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.4.0",
+  "version": "5.4.1",
   "kind": "lifecycle",
   "main": "./index.js",
   "activation": {
@@ -52,29 +52,6 @@
           }
         },
         "description": "Map of group session key -> member session keys. Every member shares the group key's stable VC conversation. Requires convIdentity=\"stable\". Exact stable keys are supported; a terminal agent:<agent>:discord:channel:* wildcard is accepted only when OpenClaw binds that agent to an allowlisted Discord account with exactly one explicit guild, and the group key names that guild. Discord DMs and group DMs remain separate."
-      },
-      "observeGuildMessages": {
-        "type": "boolean",
-        "default": false,
-        "description": "Admit non-invoking Discord guild messages into their certified conversationGroup as user-only VC observations. DMs are always excluded. Disabled by default."
-      },
-      "observeBotUserId": {
-        "type": "string",
-        "description": "Discord user id of the OpenClaw bot. Required when observeGuildMessages is enabled so bot invocations and bot-authored messages fail closed."
-      },
-      "observeQueueMax": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 2000,
-        "default": 200,
-        "description": "Maximum queued guild observations awaiting cloud delivery."
-      },
-      "observeFallbackDelayMs": {
-        "type": "integer",
-        "minimum": 1000,
-        "maximum": 60000,
-        "default": 10000,
-        "description": "Fallback delay before an observation is delivered if OpenClaw does not emit before_dispatch. Actual Vast invocations cancel the pending observation first."
       }
     },
     "additionalProperties": false

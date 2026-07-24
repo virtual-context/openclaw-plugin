@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +10,6 @@ const STABLE_KEY = "agent:a:telegram:direct:42";
 const STABLE_CONV_QS = "sk%3Aagent%3Aa%3Atelegram%3Adirect%3A42";
 const DISCORD_GUILD = "1524917037191925871";
 const DISCORD_CHANNEL = "1524946242499514418";
-const DISCORD_BOT = "1485681229608259666";
 const DISCORD_SENDER = "387316537012518913";
 const DISCORD_MESSAGE = "1529000000000000001";
 const DISCORD_GROUP_KEY = `agent:vast:discord:guild:${DISCORD_GUILD}`;
@@ -94,6 +94,62 @@ function installFetch() {
   return fetchSpy;
 }
 
+function continuityHash(role, content) {
+  return createHash("sha256")
+    .update(`${role}\0${content}`, "utf-8")
+    .digest("hex");
+}
+
+function installContinuityFetch(prefixes) {
+  let prepareIndex = 0;
+  const fetchSpy = vi.fn(async (url, options = {}) => {
+    const request = JSON.parse(options.body ?? "{}");
+    if (!String(url).includes("/api/v1/context/prepare")) {
+      return new Response(
+        JSON.stringify({ conversation_id: "conv", status: "ok" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    const prefix = prefixes[prepareIndex++];
+    const prior = [
+      {
+        role: "user",
+        content:
+          `@Vast Keep replies concise and begin with “${prefix}:”.`,
+      },
+      { role: "assistant", content: `${prefix}: Understood.` },
+    ];
+    const active = request.messages.at(-1);
+    const payload = {
+      conversation_id: `sk:${DISCORD_GROUP_KEY}`,
+      body: {
+        messages: [
+          {
+            role: "system",
+            content:
+              "<system-reminder>VC actor cards and summaries</system-reminder>",
+          },
+          ...prior,
+          active,
+        ],
+      },
+      metadata: {
+        recent_conversation_native: {
+          message_count: prior.length,
+          message_hashes: prior.map((message) =>
+            continuityHash(message.role, message.content)),
+        },
+      },
+    };
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  globalThis.fetch = fetchSpy;
+  return fetchSpy;
+}
+
 async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
   vi.resetModules();
   vi.doMock("node:os", async () => {
@@ -135,6 +191,15 @@ function ctx(sessionId, sessionKey = STABLE_KEY) {
 
 function discordOpenClawConfig() {
   return {
+    agents: {
+      list: [{
+        id: "vast",
+        model: { primary: "openai/gpt-5.6-sol" },
+        models: {
+          "openai/gpt-5.6-sol": { agentRuntime: { id: "codex" } },
+        },
+      }],
+    },
     bindings: [{
       agentId: "vast",
       match: { channel: "discord", accountId: "vast" },
@@ -173,64 +238,57 @@ function discordPrompt(content) {
 }
 
 describe("convIdentity hook routing", () => {
-  it("lets prompt-build veto an invocation before ambient delivery", async () => {
-    vi.useFakeTimers();
+  it("delivers and verifies Codex continuity on cold and warm turns", async () => {
     const home = makeHome();
-    const fetchSpy = installFetch();
-    const { handlers, log } = await registerPlugin(home, {
-      convIdentity: "stable",
-      conversationGroups: {
-        [DISCORD_GROUP_KEY]: ["agent:vast:discord:channel:*"],
+    installContinuityFetch(["ColdBridge", "WarmBridge"]);
+    const { handlers, log } = await registerPlugin(
+      home,
+      {
+        convIdentity: "stable",
+        conversationGroups: {
+          [DISCORD_GROUP_KEY]: ["agent:vast:discord:channel:*"],
+        },
       },
-      observeGuildMessages: true,
-      observeBotUserId: DISCORD_BOT,
-      observeFallbackDelayMs: 1000,
-    }, discordOpenClawConfig());
-    const content = "Vast what do you think about amber herons";
-    const messageContext = {
-      channelId: "discord",
-      accountId: "vast",
-      conversationId: DISCORD_CHANNEL,
-    };
+      discordOpenClawConfig(),
+    );
+    expect(handlers.has("message_received")).toBe(false);
+    expect(handlers.has("before_dispatch")).toBe(false);
 
-    handlers.get("message_received")({
-      content,
-      timestamp: 1784808000000,
-      metadata: {
-        guildId: DISCORD_GUILD,
-        channelName: "vasttest",
-        messageId: DISCORD_MESSAGE,
-        senderId: DISCORD_SENDER,
-        senderName: "Optics",
-        originatingTo: `channel:${DISCORD_CHANNEL}`,
-      },
-    }, messageContext);
-    handlers.get("before_dispatch")({
-      body: content,
-      messageId: DISCORD_MESSAGE,
-      senderId: DISCORD_SENDER,
-    }, {
-      ...messageContext,
-      messageId: DISCORD_MESSAGE,
-      senderId: DISCORD_SENDER,
-    });
+    for (const [index, prefix] of ["ColdBridge", "WarmBridge"].entries()) {
+      const runCtx = {
+        ...ctx(SID1, DISCORD_CHANNEL_KEY),
+        model: "openai/gpt-5.6-sol",
+        runId: `run-${index + 1}`,
+      };
+      const event = prepareEvent(
+        discordPrompt(`@Vast Probe ${index + 1}`),
+      );
+      const result = await handlers.get("before_prompt_build")(event, runCtx);
 
-    expect(fetchSpy).not.toHaveBeenCalled();
-    await handlers.get("before_prompt_build")({
-      prompt: discordPrompt(content),
-      messages: [],
-    }, {
-      sessionId: SID1,
-      sessionKey: DISCORD_CHANNEL_KEY,
-      model: "openai-codex/gpt-5.5",
-    });
-    await vi.advanceTimersByTimeAsync(1000);
+      expect(result).toHaveProperty("prependContext");
+      expect(result).not.toHaveProperty("systemPrompt");
+      expect(result.prependContext).toContain("<vc-prepared-context");
+      expect(result.prependContext).toContain("<vc-conversation-continuity");
+      expect(result.prependContext).toContain(`${prefix}:`);
+      expect(event.messages).toHaveLength(1);
 
-    const urls = fetchSpy.mock.calls.map(([url]) => String(url));
-    expect(urls.filter((url) => url.includes("/context/observe"))).toEqual([]);
-    expect(urls.filter((url) => url.includes("/context/prepare"))).toHaveLength(1);
-    expect(log.info.mock.calls.map(([message]) => message).join("\n"))
-      .toContain("cancelled by prompt invocation");
+      handlers.get("llm_input")({
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        prompt: [
+          "OpenClaw runtime context for this turn:",
+          result.prependContext,
+          discordPrompt(`@Vast Probe ${index + 1}`),
+        ].join("\n\n"),
+        historyMessages: event.messages,
+      }, runCtx);
+    }
+
+    const messages = log.info.mock.calls.map(([message]) => message).join("\n");
+    expect(messages).toContain("groupedSessions=1");
+    expect(messages).toContain("runtime=codex");
+    expect(messages).toContain("lane=per-turn-prompt");
+    expect(messages.match(/adopted=true/g)).toHaveLength(2);
   });
 
   it("stable mode routes prepare, ingest, and tools through the selected conv id", async () => {
