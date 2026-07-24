@@ -7,12 +7,21 @@ const SID1 = "11111111-2222-4333-8444-555555555555";
 const SID2 = "22222222-3333-4444-8555-666666666666";
 const STABLE_KEY = "agent:a:telegram:direct:42";
 const STABLE_CONV_QS = "sk%3Aagent%3Aa%3Atelegram%3Adirect%3A42";
+const DISCORD_GUILD = "1524917037191925871";
+const DISCORD_CHANNEL = "1524946242499514418";
+const DISCORD_BOT = "1485681229608259666";
+const DISCORD_SENDER = "387316537012518913";
+const DISCORD_MESSAGE = "1529000000000000001";
+const DISCORD_GROUP_KEY = `agent:vast:discord:guild:${DISCORD_GUILD}`;
+const DISCORD_CHANNEL_KEY =
+  `agent:vast:discord:channel:${DISCORD_CHANNEL}`;
 
 const createdHomes = [];
 const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.resetModules();
   vi.doUnmock("node:os");
@@ -85,7 +94,7 @@ function installFetch() {
   return fetchSpy;
 }
 
-async function registerPlugin(home, pluginConfig = {}) {
+async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
   vi.resetModules();
   vi.doMock("node:os", async () => {
     const actual = await vi.importActual("node:os");
@@ -107,7 +116,7 @@ async function registerPlugin(home, pluginConfig = {}) {
       baseUrl: "https://api.example.com",
       ...pluginConfig,
     },
-    config: {},
+    config: openClawConfig,
     registerTool: vi.fn((factory) => toolFactories.push(factory)),
     on: vi.fn((name, handler) => handlers.set(name, handler)),
   };
@@ -124,7 +133,106 @@ function ctx(sessionId, sessionKey = STABLE_KEY) {
   return { sessionId, sessionKey, model: "openai-codex/gpt-5.5" };
 }
 
+function discordOpenClawConfig() {
+  return {
+    bindings: [{
+      agentId: "vast",
+      match: { channel: "discord", accountId: "vast" },
+    }],
+    channels: {
+      discord: {
+        accounts: {
+          vast: {
+            groupPolicy: "allowlist",
+            guilds: {
+              [DISCORD_GUILD]: {
+                channels: { "*": { enabled: true } },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function discordPrompt(content) {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      message_id: DISCORD_MESSAGE,
+      chat_id: `channel:${DISCORD_CHANNEL}`,
+      sender: { id: DISCORD_SENDER, name: "Optics" },
+      group_channel: "vasttest",
+    }, null, 2),
+    "```",
+    "",
+    content,
+  ].join("\n");
+}
+
 describe("convIdentity hook routing", () => {
+  it("lets prompt-build veto an invocation before ambient delivery", async () => {
+    vi.useFakeTimers();
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      convIdentity: "stable",
+      conversationGroups: {
+        [DISCORD_GROUP_KEY]: ["agent:vast:discord:channel:*"],
+      },
+      observeGuildMessages: true,
+      observeBotUserId: DISCORD_BOT,
+      observeFallbackDelayMs: 1000,
+    }, discordOpenClawConfig());
+    const content = "Vast what do you think about amber herons";
+    const messageContext = {
+      channelId: "discord",
+      accountId: "vast",
+      conversationId: DISCORD_CHANNEL,
+    };
+
+    handlers.get("message_received")({
+      content,
+      timestamp: 1784808000000,
+      metadata: {
+        guildId: DISCORD_GUILD,
+        channelName: "vasttest",
+        messageId: DISCORD_MESSAGE,
+        senderId: DISCORD_SENDER,
+        senderName: "Optics",
+        originatingTo: `channel:${DISCORD_CHANNEL}`,
+      },
+    }, messageContext);
+    handlers.get("before_dispatch")({
+      body: content,
+      messageId: DISCORD_MESSAGE,
+      senderId: DISCORD_SENDER,
+    }, {
+      ...messageContext,
+      messageId: DISCORD_MESSAGE,
+      senderId: DISCORD_SENDER,
+    });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    await handlers.get("before_prompt_build")({
+      prompt: discordPrompt(content),
+      messages: [],
+    }, {
+      sessionId: SID1,
+      sessionKey: DISCORD_CHANNEL_KEY,
+      model: "openai-codex/gpt-5.5",
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+    expect(urls.filter((url) => url.includes("/context/observe"))).toEqual([]);
+    expect(urls.filter((url) => url.includes("/context/prepare"))).toHaveLength(1);
+    expect(log.info.mock.calls.map(([message]) => message).join("\n"))
+      .toContain("cancelled by prompt invocation");
+  });
+
   it("stable mode routes prepare, ingest, and tools through the selected conv id", async () => {
     const home = makeHome();
     const fetchSpy = installFetch();

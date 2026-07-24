@@ -12,7 +12,13 @@
  * `predecessor` param after `vcconv`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { deriveConvIdentity, buildUrl, vcPost } from "../index.js";
+import {
+  deriveConvIdentity,
+  buildCertifiedConversationGroupWildcards,
+  buildConversationGroupIndex,
+  buildUrl,
+  vcPost,
+} from "../index.js";
 
 const SID = "11111111-2222-4333-8444-555555555555";
 
@@ -22,6 +28,9 @@ describe("deriveConvIdentity — stable scopes", () => {
     "agent:bastkid-dedicated:telegram:group:-5156869263",
     "agent:bastkid-dedicated:telegram:slash:8049932331",
     "agent:bastkid-dedicated:discord:channel:1485708353660260422",
+    "agent:vast:discord:guild:1524917037191925871",
+    "agent:vast:discord:direct:387316537012518913",
+    "agent:vast:discord:group:1524946242499514418",
     "agent:bastkid-dedicated:main",
   ];
   for (const key of stable) {
@@ -91,6 +100,8 @@ describe("deriveConvIdentity — fallbacks that must be warned on", () => {
       "agent:bastkid-dedicated:Telegram:direct:42",
       "agent:bastkid-dedicated:telegram:Direct:42",
       "agent:bastkid-dedicated:discord:Channel:42",
+      "agent:vast:discord:Guild:42",
+      "agent:vast:discord:Direct:42",
       "agent:bastkid-dedicated:Cron:job",
       "agent:bastkid-dedicated:cron:job:Run:run",
       "agent:bastkid-dedicated:Subagent:spawn",
@@ -111,6 +122,155 @@ describe("deriveConvIdentity — fallbacks that must be warned on", () => {
       .toBe("unparseable_session_key");
     expect(deriveConvIdentity("agent::main", SID).fallbackReason)
       .toBe("unparseable_session_key");
+  });
+});
+
+describe("conversationGroups — member->group identity remap", () => {
+  const GUILD = "agent:vast:discord:guild:1524917037191925871";
+  const GENERAL = "agent:vast:discord:channel:1524917037787250834";
+  const VASTTEST = "agent:vast:discord:channel:1524946242499514418";
+  const cfg = { [GUILD]: [GENERAL, VASTTEST] };
+
+  it("members adopt the group key's stable conversation id", () => {
+    const index = buildConversationGroupIndex(cfg);
+    for (const member of [GENERAL, VASTTEST]) {
+      expect(deriveConvIdentity(member, SID, index)).toEqual({
+        convId: `sk:${GUILD}`, isStable: true,
+      });
+    }
+  });
+
+  it("non-members and the group key itself derive normally", () => {
+    const index = buildConversationGroupIndex(cfg);
+    const other = "agent:vast:discord:channel:999";
+    expect(deriveConvIdentity(other, SID, index).convId).toBe(`sk:${other}`);
+    expect(deriveConvIdentity(GUILD, SID, index).convId).toBe(`sk:${GUILD}`);
+  });
+
+  it("without an index the derivation is unchanged", () => {
+    expect(deriveConvIdentity(GENERAL, SID)).toEqual({ convId: `sk:${GENERAL}`, isStable: true });
+  });
+
+  it("rejects ephemeral member keys — grouping must never stabilize them", () => {
+    const warn = vi.fn();
+    const index = buildConversationGroupIndex(
+      { [GUILD]: [`agent:vast:explicit:${SID}`, GENERAL] }, { warn },
+    );
+    expect(index.size).toBe(1);
+    expect(index.get(GENERAL)).toBe(GUILD);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(deriveConvIdentity(`agent:vast:explicit:${SID}`, SID, index))
+      .toEqual({ convId: SID, isStable: false });
+  });
+
+  it("rejects a non-stable group key wholesale", () => {
+    const warn = vi.fn();
+    const index = buildConversationGroupIndex({ "agent:vast:subagent:abc": [GENERAL] }, { warn });
+    expect(index.size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("first group wins when a member is claimed twice", () => {
+    const warn = vi.fn();
+    const G2 = "agent:vast:discord:guild:222";
+    const index = buildConversationGroupIndex({ [GUILD]: [GENERAL], [G2]: [GENERAL] }, { warn });
+    expect(index.get(GENERAL)).toBe(GUILD);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("tolerates absent or malformed config", () => {
+    expect(buildConversationGroupIndex(undefined).size).toBe(0);
+    expect(buildConversationGroupIndex(null).size).toBe(0);
+    expect(buildConversationGroupIndex("nope").size).toBe(0);
+    expect(buildConversationGroupIndex({ [GUILD]: "not-an-array" }).size).toBe(0);
+  });
+
+  describe("certified Discord channel wildcard", () => {
+    const wildcard = "agent:vast:discord:channel:*";
+    const openClawConfig = {
+      bindings: [{
+        agentId: "vast",
+        match: { channel: "discord", accountId: "vast" },
+      }],
+      channels: {
+        discord: {
+          accounts: {
+            vast: {
+              groupPolicy: "allowlist",
+              guilds: { "1524917037191925871": { channels: { "*": { enabled: true } } } },
+            },
+          },
+        },
+      },
+    };
+
+    it("maps every server channel and thread while excluding every DM shape", () => {
+      const certifiedWildcards = buildCertifiedConversationGroupWildcards(openClawConfig);
+      const index = buildConversationGroupIndex(
+        { [GUILD]: [wildcard] }, undefined, { certifiedWildcards },
+      );
+
+      for (const key of [
+        GENERAL,
+        "agent:vast:discord:channel:thread-1527999",
+      ]) {
+        expect(deriveConvIdentity(key, SID, index)).toEqual({
+          convId: `sk:${GUILD}`, isStable: true,
+        });
+      }
+      for (const key of [
+        "agent:vast:discord:direct:387316537012518913",
+        "agent:vast:discord:group:1524946242499514418",
+        "agent:other:discord:channel:1524917037787250834",
+        "agent:vast:discord:channel:",
+        "agent:vast:discord:channel:parent:thread:child",
+      ]) {
+        expect(deriveConvIdentity(key, SID, index).convId).not.toBe(`sk:${GUILD}`);
+      }
+    });
+
+    it("refuses uncertified, non-terminal, and multi-star wildcards", () => {
+      const warn = vi.fn();
+      const certifiedWildcards = buildCertifiedConversationGroupWildcards(openClawConfig);
+      const index = buildConversationGroupIndex({
+        [GUILD]: [
+          "agent:vast:discord:channel:15*",
+          "agent:vast:discord:*:*",
+          "agent:other:discord:channel:*",
+        ],
+      }, { warn }, { certifiedWildcards });
+
+      expect(index.size).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(3);
+    });
+
+    it("requires one explicitly allowlisted guild and a matching target", () => {
+      const multipleGuilds = structuredClone(openClawConfig);
+      multipleGuilds.channels.discord.accounts.vast.guilds["222"] = {};
+      expect(buildCertifiedConversationGroupWildcards(multipleGuilds).size).toBe(0);
+
+      const notAllowlisted = structuredClone(openClawConfig);
+      notAllowlisted.channels.discord.accounts.vast.groupPolicy = "open";
+      expect(buildCertifiedConversationGroupWildcards(notAllowlisted).size).toBe(0);
+
+      const certifiedWildcards = buildCertifiedConversationGroupWildcards(openClawConfig);
+      const wrongGuild = "agent:vast:discord:guild:222";
+      expect(buildConversationGroupIndex(
+        { [wrongGuild]: [wildcard] }, undefined, { certifiedWildcards },
+      ).size).toBe(0);
+    });
+
+    it("lets an explicit mapping override a matching wildcard", () => {
+      const certifiedWildcards = buildCertifiedConversationGroupWildcards(openClawConfig);
+      const otherGuild = "agent:vast:discord:guild:222";
+      const index = buildConversationGroupIndex({
+        [GUILD]: [wildcard],
+        [otherGuild]: [GENERAL],
+      }, undefined, { certifiedWildcards });
+
+      expect(deriveConvIdentity(GENERAL, SID, index).convId).toBe(`sk:${otherGuild}`);
+      expect(deriveConvIdentity(VASTTEST, SID, index).convId).toBe(`sk:${GUILD}`);
+    });
   });
 });
 
