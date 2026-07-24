@@ -3,33 +3,18 @@
 // → host runtime conversion (transformTransportMessages + convertResponsesMessages)
 // → POST to model API → capture response and verdict.
 //
-// Saved-cloud-body replay is read-only. Live prepare modes admit their input to
-// VC canonical storage, so they are hard-fenced to an explicit disposable
-// conversation under probe:full-stack:*.
+// Read-only: does not touch any agent JSONL, does not enqueue any channel reply,
+// does not create persistent state.
 
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { argv, env, exit } from "node:process";
 import { hoistSystemPreamble } from "../index.js";
 import { createRequire } from "node:module";
 
-// transformTransportMessages is exported (as `_`) from the host runtime bundle.
-// OpenClaw content-hashes this filename, so resolve it at runtime instead of
-// pinning a hash that changes whenever OpenClaw is upgraded.
+// transformTransportMessages is exported (as `_`) from the host runtime bundle
 const require = createRequire(import.meta.url);
-const openclawDist = "/usr/lib/node_modules/openclaw/dist";
-const transportBundleName = readdirSync(openclawDist).find((name) =>
-  /^openai-transport-stream-[A-Za-z0-9_-]+\.js$/.test(name)
-);
-if (!transportBundleName) {
-  throw new Error(`OpenClaw transport bundle not found under ${openclawDist}`);
-}
-const transportBundle = require(`${openclawDist}/${transportBundleName}`);
-const transformTransportMessages = Object.values(transportBundle).find(
-  (value) => typeof value === "function" && value.name === "transformTransportMessages"
-);
-if (typeof transformTransportMessages !== "function") {
-  throw new Error(`OpenClaw transport bundle ${transportBundleName} does not export transformTransportMessages`);
-}
+const transportBundle = require("/usr/lib/node_modules/openclaw/dist/openai-transport-stream-BkI6rJ3U.js");
+const transformTransportMessages = transportBundle._;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI parser
@@ -65,17 +50,17 @@ function printHelp() {
   console.log(`Usage: node full-stack-probe.mjs [INPUT-MODE] [OPTIONS]
 
 Input modes (exactly one):
-  --probe "<text>"               Synthesize one isolated user turn. Requires an
-                                 explicit disposable --conv.
+  --probe "<text>"               Synthesize a user turn; load history from
+                                 conv's local JSONL (--conv required to
+                                 resolve the agent's sessions/<conv>.jsonl).
   --saved-cloud-body <path>      Replay a captured cloud prepare response.
                                  Skips the cloud call entirely.
   --saved-telegram-turn <path>   Replay an openclaw JSONL session file as
-                                 prepare input admitted only to disposable --conv.
+                                 the prepare input messages.
 
 Options:
-  --conv <conversation-id>       Required for every live cloud mode and must match
-                                 probe:full-stack:<safe-id>. Real/user conversation
-                                 IDs and stable sk: owners are rejected.
+  --conv <session-id>            Required for --probe (and used to vcconv on cloud).
+                                 Default: db12d44d-afd8-43d3-a881-3a8c53e9e8b5 (perfume conv).
   --model <id>                   Model id for the LLM POST. Default: gpt-5.5.
   --api-key <key>                Override the OpenAI API key. Default: read from
                                  /root/.openclaw/agents/bastkid-dedicated/agent/auth-profiles.json
@@ -119,15 +104,6 @@ function readOpenclawConfig() {
     vcKey: cfg.plugins?.entries?.["virtual-context"]?.config?.vcKey,
     baseUrl: cfg.plugins?.entries?.["virtual-context"]?.config?.baseUrl || "https://api.virtual-context.com",
   };
-}
-
-function assertDisposableConversation(conv) {
-  if (typeof conv !== "string" || !/^probe:full-stack:[A-Za-z0-9._-]{6,128}$/.test(conv)) {
-    throw new Error(
-      "Live prepare is mutating: pass an explicit disposable " +
-      "--conv probe:full-stack:<safe-id>. Real/user conversation IDs are refused."
-    );
-  }
 }
 
 async function callCloudPrepare(inputMessages, sessionId, verbose) {
@@ -475,16 +451,16 @@ async function acquireCloudBody(args) {
     const rj = JSON.parse(readFileSync(args.savedCloudBody, "utf-8"));
     return { rj, prepareElapsedMs: null, source: `saved:${args.savedCloudBody}` };
   }
-  const conv = args.conv;
-  assertDisposableConversation(conv);
+  const conv = args.conv || "db12d44d-afd8-43d3-a881-3a8c53e9e8b5";
   // resolve input messages
   let inputMessages;
   if (args.savedTelegramTurn) {
     inputMessages = loadJsonlMessages(args.savedTelegramTurn);
   } else if (args.probe) {
-    inputMessages = [
-      { role: "user", content: [{ type: "text", text: args.probe }], timestamp: Date.now() },
-    ];
+    // Load conv history from local JSONL, append the probe user turn
+    const jsonlPath = `/root/.openclaw/agents/bastkid-dedicated/sessions/${conv}.jsonl`;
+    inputMessages = loadJsonlMessages(jsonlPath);
+    inputMessages.push({ role: "user", content: [{ type: "text", text: args.probe }], timestamp: Date.now() });
   } else {
     throw new Error("Provide --probe, --saved-cloud-body, or --saved-telegram-turn");
   }
