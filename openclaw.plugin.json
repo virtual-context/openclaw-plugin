@@ -2,8 +2,8 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.3.0",
-  "kind": "lifecycle",
+  "version": "5.4.6",
+  "kind": "context-engine",
   "main": "./index.js",
   "activation": {
     "onCapabilities": [
@@ -33,6 +33,39 @@
       "debug": {
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."
+      },
+      "modelCallCapture": {
+        "type": "object",
+        "description": "Optional bounded, local capture of complete OpenClaw llm_input/llm_output hook payloads. Captures contain conversation content and are written mode 0600.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "directory": {
+            "type": "string",
+            "description": "Capture directory. Default: ~/.openclaw/logs/virtual-context/model-calls"
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1048576,
+            "default": 536870912,
+            "description": "Maximum total compressed bytes retained."
+          },
+          "maxFiles": {
+            "type": "integer",
+            "minimum": 2,
+            "default": 2000,
+            "description": "Maximum number of capture files retained."
+          },
+          "maxAgeHours": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 168,
+            "description": "Maximum capture age in hours."
+          }
+        },
+        "additionalProperties": false
       },
       "convIdentity": {
         "type": "string",
