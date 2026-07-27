@@ -2925,27 +2925,90 @@ export default {
 
       const allMessages = event?.messages ?? [];
 
-      // Extract the last assistant message text
-      let assistantMessage = "";
+      // Extract the reply text for this turn.
+      //
+      // The turn's final assistant entry is not always the one carrying the
+      // reply: when the reply is delivered through a tool the last entry is
+      // that tool call, which holds no text block. Scanning back to the most
+      // recent assistant entry that actually has text recovers it. The scan
+      // stops at the turn boundary so a turn that produced no text of its own
+      // can never adopt the previous turn's reply and store a wrong pairing.
+      let turnStart = 0;
       for (let i = allMessages.length - 1; i >= 0; i--) {
-        const msg = allMessages[i];
-        if (msg?.role === "assistant") {
-          const content = msg.content;
-          if (typeof content === "string") {
-            assistantMessage = content;
-          } else if (Array.isArray(content)) {
-            assistantMessage = content
-              .filter((b) => b.type === "text")
-              .map((b) => b.text)
-              .join("\n");
-          }
+        if (allMessages[i]?.role === "user") {
+          turnStart = i + 1;
           break;
         }
       }
 
-      if (!assistantMessage) return;
+      const contentBlocks = (msg) =>
+        Array.isArray(msg?.content) ? msg.content : [];
+      const messageText = (msg) => {
+        if (typeof msg?.content === "string") return msg.content;
+        return contentBlocks(msg)
+          .filter((b) => b?.type === "text")
+          .map((b) => b?.text ?? "")
+          .join("\n");
+      };
+      // Text handed to a delivery tool is the reply the user actually saw, so
+      // it stands in when the turn produced no text block of its own.
+      const deliveredText = (msg) =>
+        contentBlocks(msg)
+          .filter((b) => b?.type === "toolCall" || b?.type === "tool_use")
+          .map((b) => ({
+            name: b?.name ?? b?.toolName,
+            args: b?.arguments ?? b?.input ?? {},
+          }))
+          .filter(
+            ({ name, args }) =>
+              (name === "message" && args?.action === "send") ||
+              name === "sessions_yield",
+          )
+          .map(({ args }) => args?.message)
+          .filter((t) => typeof t === "string" && t.trim().length > 0)
+          .join("\n");
+
+      let assistantMessage = "";
+      for (let i = allMessages.length - 1; i >= turnStart; i--) {
+        if (allMessages[i]?.role !== "assistant") continue;
+        const text = messageText(allMessages[i]);
+        if (text.trim().length > 0) {
+          assistantMessage = text;
+          break;
+        }
+      }
+      if (!assistantMessage) {
+        for (let i = allMessages.length - 1; i >= turnStart; i--) {
+          if (allMessages[i]?.role !== "assistant") continue;
+          const text = deliveredText(allMessages[i]);
+          if (text.trim().length > 0) {
+            assistantMessage = text;
+            break;
+          }
+        }
+      }
 
       const identity = selectConvId(sessionKey, sessionId);
+
+      if (!assistantMessage) {
+        // A turn that reaches here stored nothing. Report it: silence here is
+        // indistinguishable from a healthy turn and hides the loss entirely.
+        pendingUserTurn.delete(sessionId);
+        pendingUserTurnProvenance.delete(sessionId);
+        pendingUserTurnMessage.delete(sessionId);
+        const assistantEntries = allMessages
+          .slice(turnStart)
+          .filter((m) => m?.role === "assistant");
+        const lastBlocks = contentBlocks(allMessages[allMessages.length - 1])
+          .map((b) => b?.type ?? "?");
+        log.warn?.(
+          `[vc] ingest SKIPPED — no reply text in turn; session=${sessionId} ` +
+            `conv=${identity.convId} assistantEntries=${assistantEntries.length} ` +
+            `lastBlocks=${JSON.stringify(lastBlocks)}`,
+        );
+        return;
+      }
+
       log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
       if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
