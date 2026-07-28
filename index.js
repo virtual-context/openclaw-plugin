@@ -2898,143 +2898,200 @@ export default {
     // ── agent_end: ingest the completed turn ──
     // NETWORK: POST /api/v1/context/ingest — sends assistant reply text to cloud for tagging.
     api.on("agent_end", async (event, ctx) => {
+      // Obtained before the guard below because the release itself is keyed by
+      // it; nothing can be cleaned up if this throws.
       const sessionId = hookSessionIdentity(ctx);
-      const sessionKey = ctx?.sessionKey ?? "";
-      forgetCurrentContextSpeaker(sessionId);
-      forgetContinuityAdoption(
-        sessionId,
-        ctx?.runId === undefined ? null : ctx.runId,
-      );
-      forgetPreparedContinuityRun(
-        sessionId,
-        ctx?.runId === undefined ? null : ctx.runId,
-      );
 
-      // Skip ingest for VC command turns — command was fully handled by prepare
-      if (vcCommandSessions.has(sessionId)) {
-        log.info?.(`[vc] skipping ingest — VC command turn`);
-        vcCommandSessions.delete(sessionId);
-        return;
-      }
-
-      // Same provider filter as prepare
-      if (providerFilter) {
-        const currentModel = resolveSessionModel(sessionKey);
-        if (currentModel && !providerFilter.has(currentModel)) return;
-      }
-
-      const allMessages = event?.messages ?? [];
-
-      // Extract the reply text for this turn.
-      //
-      // The turn's final assistant entry is not always the one carrying the
-      // reply: when the reply is delivered through a tool the last entry is
-      // that tool call, which holds no text block. Scanning back to the most
-      // recent assistant entry that actually has text recovers it. The scan
-      // stops at the turn boundary so a turn that produced no text of its own
-      // can never adopt the previous turn's reply and store a wrong pairing.
-      let turnStart = 0;
-      for (let i = allMessages.length - 1; i >= 0; i--) {
-        if (allMessages[i]?.role === "user") {
-          turnStart = i + 1;
-          break;
-        }
-      }
-
-      const contentBlocks = (msg) =>
-        Array.isArray(msg?.content) ? msg.content : [];
-      const messageText = (msg) => {
-        if (typeof msg?.content === "string") return msg.content;
-        return contentBlocks(msg)
-          .filter((b) => b?.type === "text")
-          .map((b) => b?.text ?? "")
-          .join("\n");
-      };
-      // Text handed to a delivery tool is the reply the user actually saw, so
-      // it stands in when the turn produced no text block of its own.
-      const deliveredText = (msg) =>
-        contentBlocks(msg)
-          .filter((b) => b?.type === "toolCall" || b?.type === "tool_use")
-          .map((b) => ({
-            name: b?.name ?? b?.toolName,
-            args: b?.arguments ?? b?.input ?? {},
-          }))
-          .filter(
-            ({ name, args }) =>
-              (name === "message" && args?.action === "send") ||
-              name === "sessions_yield",
-          )
-          .map(({ args }) => args?.message)
-          .filter((t) => typeof t === "string" && t.trim().length > 0)
-          .join("\n");
-
-      let assistantMessage = "";
-      for (let i = allMessages.length - 1; i >= turnStart; i--) {
-        if (allMessages[i]?.role !== "assistant") continue;
-        const text = messageText(allMessages[i]);
-        if (text.trim().length > 0) {
-          assistantMessage = text;
-          break;
-        }
-      }
-      if (!assistantMessage) {
-        for (let i = allMessages.length - 1; i >= turnStart; i--) {
-          if (allMessages[i]?.role !== "assistant") continue;
-          const text = deliveredText(allMessages[i]);
-          if (text.trim().length > 0) {
-            assistantMessage = text;
-            break;
-          }
-        }
-      }
-
-      const identity = selectConvId(sessionKey, sessionId);
-
-      if (!assistantMessage) {
-        // A turn that reaches here stored nothing. Report it: silence here is
-        // indistinguishable from a healthy turn and hides the loss entirely.
+      // The user half is captured at prompt-build and consumed by a completed
+      // ingest. Every exit from this hook has to release it, or it outlives the
+      // turn it belongs to and can be attached to a later reply.
+      const releasePendingTurn = () => {
         pendingUserTurn.delete(sessionId);
         pendingUserTurnProvenance.delete(sessionId);
         pendingUserTurnMessage.delete(sessionId);
-        const assistantEntries = allMessages
-          .slice(turnStart)
-          .filter((m) => m?.role === "assistant");
-        const lastBlocks = contentBlocks(allMessages[allMessages.length - 1])
-          .map((b) => b?.type ?? "?");
-        log.warn?.(
-          `[vc] ingest SKIPPED — no reply text in turn; session=${sessionId} ` +
-            `conv=${identity.convId} assistantEntries=${assistantEntries.length} ` +
-            `lastBlocks=${JSON.stringify(lastBlocks)}`,
-        );
-        return;
-      }
-
-      log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
-      if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
-
-      const userMessage = pendingUserTurn.get(sessionId);
-      const userProvenance = pendingUserTurnProvenance.get(sessionId) ?? {};
-      pendingUserTurn.delete(sessionId);
-      pendingUserTurnProvenance.delete(sessionId);
-      pendingUserTurnMessage.delete(sessionId);
+      };
 
       try {
-        const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
-          assistant_message: assistantMessage,
-          // Repairs the pair when the cloud lost the user half it recorded at
-          // prepare; ignored when it still has it.
-          ...(userMessage ? { user_message: userMessage } : {}),
-          ...userProvenance,
-        }, 15000, log);
-        log.info?.(
-          `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
-          `status=${ingestResult.status ?? "?"} ` +
-          `compaction=${ingestResult.compaction_triggered ?? false}`
+        const sessionKey = ctx?.sessionKey ?? "";
+        forgetCurrentContextSpeaker(sessionId);
+        forgetContinuityAdoption(
+          sessionId,
+          ctx?.runId === undefined ? null : ctx.runId,
         );
-        if (debug) log.info?.(`[vc:debug] ingest response: ${JSON.stringify(ingestResult).slice(0, 500)}`);
-      } catch (err) {
-        log.error?.(`[vc] ingest failed: ${err}`);
-        if (debug) log.error?.(`[vc:debug] ingest error detail: ${err.stack ?? err}`);
+        forgetPreparedContinuityRun(
+          sessionId,
+          ctx?.runId === undefined ? null : ctx.runId,
+        );
+        // Skip ingest for VC command turns — command was fully handled by prepare
+        if (vcCommandSessions.has(sessionId)) {
+          log.info?.(`[vc] skipping ingest — VC command turn`);
+          vcCommandSessions.delete(sessionId);
+          releasePendingTurn();
+          return;
+        }
+
+        // Same provider filter as prepare
+        if (providerFilter) {
+          const currentModel = resolveSessionModel(sessionKey);
+          if (currentModel && !providerFilter.has(currentModel)) {
+            releasePendingTurn();
+            return;
+          }
+        }
+
+        // Read the payload once: a getter could return a different value on a
+        // second read. A non-array payload would otherwise throw past both the
+        // warning and the pending-turn release below.
+        const rawMessages = event?.messages;
+        const allMessages = Array.isArray(rawMessages) ? rawMessages : [];
+
+        // Extract the reply text for this turn.
+        //
+        // The turn's final assistant entry is not always the one carrying the
+        // reply: when the reply is delivered through a tool the last entry is
+        // that tool call, which holds no text block. Scanning back to the most
+        // recent assistant entry that carries content recovers it.
+        //
+        // The scan is bounded to the trailing run of assistant and tool entries.
+        // Any other role ends the run, so a reply separated from this turn by a
+        // user entry cannot be adopted and stored against it. When the
+        // host passes only this turn's assistant entries the run is the whole
+        // list, which is the same thing. Two turns held in one list with no entry
+        // between them are indistinguishable here, and nothing else the hook
+        // receives associates an individual entry with a turn.
+        const contentBlocks = (msg) =>
+          Array.isArray(msg?.content) ? msg.content : [];
+        let turnStart = 0;
+        let assistantMessage = "";
+        try {
+          const TURN_ENTRY_ROLES = new Set(["assistant", "toolResult", "tool"]);
+          turnStart = allMessages.length;
+          while (
+            turnStart > 0 &&
+            TURN_ENTRY_ROLES.has(allMessages[turnStart - 1]?.role)
+          ) {
+            turnStart--;
+          }
+
+          const messageText = (msg) => {
+            if (typeof msg?.content === "string") return msg.content;
+            return contentBlocks(msg)
+              .filter((b) => b?.type === "text")
+              .map((b) => {
+              const t = b?.text;
+              if (typeof t === "string") return t;
+              // Coerce the primitives the previous implementation coerced;
+              // symbols and objects would throw or stringify uselessly.
+              if (
+                typeof t === "number" ||
+                typeof t === "boolean" ||
+                typeof t === "bigint"
+              ) {
+                return String(t);
+              }
+              return "";
+            })
+              .join("\n");
+          };
+          // Text handed to a delivery tool is the reply the user actually saw, so
+          // it stands in when the entry carries no text block of its own.
+          const deliveredText = (msg) =>
+            contentBlocks(msg)
+              .filter((b) => b?.type === "toolCall" || b?.type === "tool_use")
+              .map((b) => ({
+                name: b?.name ?? b?.toolName,
+                args: b?.arguments ?? b?.input ?? {},
+              }))
+              .filter(
+                ({ name, args }) =>
+                  (name === "message" && args?.action === "send") ||
+                  name === "sessions_yield",
+              )
+              .map(({ args }) => args?.message)
+              .filter((t) => typeof t === "string" && t.trim().length > 0)
+              .join("\n");
+
+          // The newest entry carrying content wins, whether that content is a text
+          // block or the text handed to a delivery tool, so an earlier entry in the
+          // same turn cannot outrank the reply that was actually delivered.
+          for (let i = allMessages.length - 1; i >= turnStart; i--) {
+            const msg = allMessages[i];
+            if (msg?.role !== "assistant") continue;
+            // Delivery text wins inside a single entry: when an entry holds
+            // both, the text block is the model narrating and the delivered
+            // payload is the reply the user actually received.
+            const delivered = deliveredText(msg);
+            if (delivered.trim().length > 0) {
+              assistantMessage = delivered;
+              break;
+            }
+            const text = messageText(msg);
+            if (text.trim().length > 0) {
+              assistantMessage = text;
+              break;
+            }
+          }
+
+        } catch (err) {
+          // Extraction must never strand the pending user turn: it would be
+          // attached to a later reply.
+          releasePendingTurn();
+          log.error?.(
+            `[vc] ingest SKIPPED — reply extraction failed; session=${sessionId}: ${err}`,
+          );
+          return;
+        }
+
+        const identity = selectConvId(sessionKey, sessionId);
+
+        if (!assistantMessage) {
+          // A turn that reaches here stored nothing. Report it: silence here is
+          // indistinguishable from a healthy turn and hides the loss entirely.
+          releasePendingTurn();
+          const assistantEntries = allMessages
+            .slice(turnStart)
+            .filter((m) => m?.role === "assistant");
+          const lastBlocks = contentBlocks(allMessages[allMessages.length - 1])
+            .map((b) => b?.type ?? "?");
+          log.warn?.(
+            `[vc] ingest SKIPPED — no reply text in turn; ` +
+              `session=${sessionId} conv=${identity.convId} ` +
+              `entries=${allMessages.length} turnStart=${turnStart} ` +
+              `assistantEntries=${assistantEntries.length} ` +
+              `lastBlocks=${safePromptJson(lastBlocks)}`,
+          );
+          return;
+        }
+
+        log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
+        if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
+
+        const userMessage = pendingUserTurn.get(sessionId);
+        const userProvenance = pendingUserTurnProvenance.get(sessionId) ?? {};
+        releasePendingTurn();
+
+        try {
+          const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
+            assistant_message: assistantMessage,
+            // Repairs the pair when the cloud lost the user half it recorded at
+            // prepare; ignored when it still has it.
+            ...(userMessage ? { user_message: userMessage } : {}),
+            ...userProvenance,
+          }, 15000, log);
+          log.info?.(
+            `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
+            `status=${ingestResult.status ?? "?"} ` +
+            `compaction=${ingestResult.compaction_triggered ?? false}`
+          );
+          if (debug) log.info?.(`[vc:debug] ingest response: ${JSON.stringify(ingestResult).slice(0, 500)}`);
+        } catch (err) {
+          log.error?.(`[vc] ingest failed: ${err}`);
+          if (debug) log.error?.(`[vc:debug] ingest error detail: ${err.stack ?? err}`);
+        }
+      } finally {
+        // No exit may strand the pending user turn: it would be attached
+        // to a later reply.
+        releasePendingTurn();
       }
     });
 
