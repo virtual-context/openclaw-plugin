@@ -744,6 +744,21 @@ function currentSpeakerPromptHash(prompt) {
     : "";
 }
 
+// Heartbeat turns are machine-generated monitoring polls. They are excluded
+// from Virtual Context entirely - no prepare, no ingest - so they never become
+// canonical turns, tags or segments.
+//
+// Tested positively against the trigger the runtime supplies: the host builds
+// the hook context with a conditional spread, so the key is ABSENT rather than
+// falsy for other triggers, and inferring "heartbeat" from a missing key would
+// silently exclude real turns. Only this exact value is excluded; cron and
+// cli_budget runs are real work and keep their memory.
+const VC_EXCLUDED_TRIGGER = "heartbeat";
+
+function isExcludedTrigger(ctx) {
+  return ctx?.trigger === VC_EXCLUDED_TRIGGER;
+}
+
 function hookSessionIdentity(ctx) {
   return ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
 }
@@ -2217,6 +2232,11 @@ export default {
     // messageToolOnly mode (group/channel chats by default), and the user sees
     // nothing.
     api.on("before_agent_reply", async (event, ctx) => {
+      // Guarded first, before speaker state, command detection, tracker resets
+      // or any network call: a heartbeat whose text happened to match the VC
+      // command prefix would otherwise reach the service and could reset the
+      // local ingest tracker.
+      if (isExcludedTrigger(ctx)) return;
       const sessionId = hookSessionIdentity(ctx);
       // This hook fires once at the start of each invoked turn, before context
       // engine assembly. Clear any aborted/unfinished prior-turn handoff.
@@ -2291,6 +2311,12 @@ export default {
     api.on("before_prompt_build", async (event, ctx) => {
       const sessionId = hookSessionIdentity(ctx);
       const sessionKey = ctx?.sessionKey ?? "";
+      if (isExcludedTrigger(ctx)) {
+        log.info?.(
+          `[vc] skipping prepare — ${VC_EXCLUDED_TRIGGER} turn; session=${sessionId}`,
+        );
+        return;
+      }
       const explicitRunId = typeof ctx?.runId === "string" && ctx.runId.trim()
         ? ctx.runId.trim()
         : null;
@@ -2922,6 +2948,15 @@ export default {
           sessionId,
           ctx?.runId === undefined ? null : ctx.runId,
         );
+        // Heartbeat turns never reached prepare, so there is no pending user
+        // half to release and nothing to store.
+        if (isExcludedTrigger(ctx)) {
+          log.info?.(
+            `[vc] skipping ingest — ${VC_EXCLUDED_TRIGGER} turn; session=${sessionId}`,
+          );
+          return;
+        }
+
         // Skip ingest for VC command turns — command was fully handled by prepare
         if (vcCommandSessions.has(sessionId)) {
           log.info?.(`[vc] skipping ingest — VC command turn`);
