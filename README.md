@@ -101,7 +101,9 @@ This plugin is transparent about what it accesses. Here is the full list:
 **What it does NOT do:**
 - Does not write local payload files unless `modelCallCapture.enabled` is explicitly set to `true`
 - Does not read files outside the session store; opt-in captures are written only to the configured capture directory
-- Does not send data to any endpoint other than your configured `baseUrl`
+- Sends context data only to your configured `baseUrl`; when Discord omits a
+  native reply quotation, it may read that exact same-channel message from the
+  Discord API using the already-configured bot account
 - Does not store credentials or API keys beyond what is in your `openclaw.json` config
 
 ## Getting a vcKey
@@ -116,6 +118,17 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 - [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
 
 ## Changelog
+
+### 5.4.7
+
+- **Run-bound current speaker and native reply target**: group turns now join
+  OpenClaw's channel-owned `runId`, message id, sender snowflake, and reply id
+  before attribution. Host-generated reaction notices can no longer break the
+  current-speaker handoff. When Discord omits the quoted reply body, the plugin
+  verifies the current message's same-channel native reference and restores a
+  bounded, explicitly untrusted target quotation; conflicting, forwarded,
+  cross-channel, or post-reply-edited targets fail closed. Reply content travels
+  in a separate provenance lane and is never concatenated into requester text.
 
 ### 5.4.6
 

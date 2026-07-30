@@ -251,7 +251,9 @@ describe("convIdentity hook routing", () => {
       },
       discordOpenClawConfig(),
     );
-    expect(handlers.has("message_received")).toBe(false);
+    // The observer retains only a bounded per-run routing snapshot; it does
+    // not prepare, ingest, or update actor cards for uninvoked messages.
+    expect(handlers.has("message_received")).toBe(true);
     expect(handlers.has("before_dispatch")).toBe(false);
 
     for (const [index, prefix] of ["ColdBridge", "WarmBridge"].entries()) {
