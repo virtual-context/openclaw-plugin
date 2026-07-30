@@ -5,8 +5,11 @@ import { join } from "node:path";
 
 const SESSION_ID = "56ec9929-ee2e-4657-8e20-079f98a702e8";
 const RUN_ID = "c08c9e71-550b-4a90-8f9b-fc7cb11db6a5";
+const OTHER_SESSION_ID = "bf99cdb3-8b6c-43d5-8b1f-87703f076ed8";
+const OTHER_RUN_ID = "d902f88b-0596-4393-9858-862275472bbc";
 const CHANNEL_ID = "1529892355141013684";
 const SESSION_KEY = `agent:vast:discord:channel:${CHANNEL_ID}`;
+const OTHER_SESSION_KEY = `agent:bast:discord:channel:${CHANNEL_ID}`;
 const CURRENT_MESSAGE_ID = "1532432883887767746";
 const TARGET_MESSAGE_ID = "1532423627536863272";
 const CURRENT_SENDER_ID = "940968368398270464";
@@ -44,13 +47,20 @@ function textOf(content) {
     : "";
 }
 
-function installFetch({ targetEditedTimestamp = null } = {}) {
+function installFetch({
+  targetEditedTimestamp = null,
+  expectedDiscordTokens = ["Bot vast-discord-token"],
+} = {}) {
   const calls = [];
+  let discordCallIndex = 0;
   globalThis.fetch = vi.fn(async (url, options = {}) => {
     const href = String(url);
     calls.push({ href, options });
     if (href.startsWith("https://discord.com/api/")) {
-      expect(options.headers.Authorization).toBe("Bot discord-test-token");
+      expect(options.headers.Authorization).toBe(
+        expectedDiscordTokens[discordCallIndex],
+      );
+      discordCallIndex += 1;
       return new Response(JSON.stringify({
         id: CURRENT_MESSAGE_ID,
         channel_id: CHANNEL_ID,
@@ -106,7 +116,10 @@ async function registerPlugin(home) {
     config: {
       channels: {
         discord: {
-          accounts: { vast: { token: "discord-test-token" } },
+          accounts: {
+            vast: { token: "vast-discord-token" },
+            default: { token: "default-discord-token" },
+          },
         },
       },
     },
@@ -117,13 +130,16 @@ async function registerPlugin(home) {
   return { handlers, log };
 }
 
-function prompt(replyTargetId = TARGET_MESSAGE_ID) {
+function prompt(
+  replyTargetId = TARGET_MESSAGE_ID,
+  currentMessageId = CURRENT_MESSAGE_ID,
+) {
   return [
     "Conversation info (untrusted metadata):",
     "```json",
     JSON.stringify({
       chat_id: `channel:${CHANNEL_ID}`,
-      message_id: CURRENT_MESSAGE_ID,
+      message_id: currentMessageId,
       reply_to_id: replyTargetId,
       sender: { id: CURRENT_SENDER_ID, name: "Send Nudes" },
       group_channel: "gear",
@@ -148,36 +164,41 @@ function prompt(replyTargetId = TARGET_MESSAGE_ID) {
   ].join("\n");
 }
 
-function messageHookEvent() {
+function messageHookEvent(sessionKey = SESSION_KEY) {
   return {
     from: `discord:${CURRENT_SENDER_ID}`,
     content: CURRENT_BODY,
     messageId: CURRENT_MESSAGE_ID,
     senderId: CURRENT_SENDER_ID,
     replyToId: TARGET_MESSAGE_ID,
-    sessionKey: SESSION_KEY,
-    runId: RUN_ID,
+    sessionKey,
   };
 }
 
-function messageHookContext() {
+function messageHookContext(
+  sessionKey = SESSION_KEY,
+  accountId = "vast",
+) {
   return {
     channelId: "discord",
-    accountId: "vast",
+    accountId,
     conversationId: `channel:${CHANNEL_ID}`,
     messageId: CURRENT_MESSAGE_ID,
     senderId: CURRENT_SENDER_ID,
     replyToId: TARGET_MESSAGE_ID,
-    sessionKey: SESSION_KEY,
-    runId: RUN_ID,
+    sessionKey,
   };
 }
 
-function agentContext() {
+function agentContext({
+  sessionId = SESSION_ID,
+  sessionKey = SESSION_KEY,
+  runId = RUN_ID,
+} = {}) {
   return {
-    sessionId: SESSION_ID,
-    sessionKey: SESSION_KEY,
-    runId: RUN_ID,
+    sessionId,
+    sessionKey,
+    runId,
     senderId: CURRENT_SENDER_ID,
     channelId: CHANNEL_ID,
     messageProvider: "discord",
@@ -190,7 +211,7 @@ function agentContext() {
 }
 
 describe("current Discord sender and reply target", () => {
-  it("survives reaction preambles and links the exact native reply target", async () => {
+  it("joins a production-shaped runless inbound hook by message id", async () => {
     const home = makeHome();
     const calls = installFetch();
     const { handlers } = await registerPlugin(home);
@@ -226,6 +247,127 @@ describe("current Discord sender and reply target", () => {
     });
     expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
       .toHaveLength(1);
+  });
+
+  it("uses the invoked body instead of a host-added local media prefix", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers } = await registerPlugin(home);
+
+    handlers.get("message_received")(messageHookEvent(), messageHookContext());
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+    const mediaPrompt = prompt().replace(
+      CURRENT_BODY,
+      `[media attached: /root/.openclaw/media/inbound/example.jpg]\n${CURRENT_BODY}`,
+    );
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: mediaPrompt, messages: [] },
+      agentContext(),
+    );
+
+    expect(result.prependContext).toContain("<current-reply-target");
+    const prepareCall = calls.find((call) => call.href.includes("/context/prepare"));
+    const prepare = JSON.parse(prepareCall.options.body);
+    expect(textOf(prepare.messages.at(-1).content)).toBe(CURRENT_BODY);
+    expect(textOf(prepare.messages.at(-1).content)).not.toContain("/root/");
+  });
+
+  it("does not reuse one message snapshot for a different prompt run", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers } = await registerPlugin(home);
+
+    handlers.get("message_received")(messageHookEvent(), messageHookContext());
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+    const first = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext(),
+    );
+    const second = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext({ runId: "different-prompt-run" }),
+    );
+
+    expect(first.prependContext).toContain("<current-reply-target");
+    expect(second?.prependContext ?? "").not.toContain("<current-reply-target");
+    expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
+      .toHaveLength(1);
+  });
+
+  it("does not join when the prompt names a different current message", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers } = await registerPlugin(home);
+
+    handlers.get("message_received")(messageHookEvent(), messageHookContext());
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: prompt(TARGET_MESSAGE_ID, "1532432883887767999"), messages: [] },
+      agentContext(),
+    );
+
+    expect(result?.prependContext ?? "").not.toContain("<current-reply-target");
+    expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
+      .toHaveLength(0);
+  });
+
+  it("keeps the same Discord message independent across two agent routes", async () => {
+    const home = makeHome();
+    const calls = installFetch({
+      expectedDiscordTokens: [
+        "Bot vast-discord-token",
+        "Bot default-discord-token",
+      ],
+    });
+    const { handlers } = await registerPlugin(home);
+
+    handlers.get("message_received")(
+      messageHookEvent(),
+      messageHookContext(),
+    );
+    handlers.get("message_received")(
+      messageHookEvent(OTHER_SESSION_KEY),
+      messageHookContext(OTHER_SESSION_KEY, "default"),
+    );
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext({
+        sessionId: OTHER_SESSION_ID,
+        sessionKey: OTHER_SESSION_KEY,
+        runId: OTHER_RUN_ID,
+      }),
+    );
+
+    const vastResult = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext(),
+    );
+    const bastResult = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext({
+        sessionId: OTHER_SESSION_ID,
+        sessionKey: OTHER_SESSION_KEY,
+        runId: OTHER_RUN_ID,
+      }),
+    );
+
+    expect(vastResult.prependContext).toContain("<current-reply-target");
+    expect(bastResult.prependContext).toContain("<current-reply-target");
+    expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
+      .toHaveLength(2);
   });
 
   it("fails closed when prompt reply metadata disagrees with the channel event", async () => {

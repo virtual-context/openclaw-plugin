@@ -81,15 +81,24 @@ const currentContextSpeakerBySession = new Map();
 const MAX_CURRENT_CONTEXT_SPEAKERS = 256;
 const CURRENT_CONTEXT_SPEAKER_TTL_MS = 5 * 60_000;
 
-// runId -> channel-owned metadata for one inbound turn. OpenClaw's
-// message_received hook is the only lifecycle surface that carries the exact
-// inbound message id, sender id, reply id, and per-turn run id together. Keep
-// only a bounded, short-lived routing snapshot. The current body is initially
-// represented only by a hash; a bounded native reply quotation may be retained.
-// before_agent_reply marks the matching entry as the invoked turn and supplies
-// its already-cleaned body; before_prompt_build then requires every available
-// id to agree before using the snapshot for attribution.
-const inboundTurnByRun = new Map();
+// full session route + platform + messageId -> channel-owned metadata for one
+// inbound turn. One Discord snowflake can legitimately be observed by more
+// than one configured bot/agent route, so message id alone is not a process-
+// global key.
+// OpenClaw's message_received hook carries the exact inbound message, sender,
+// and native-reply ids, but production does NOT assign that hook a runId. The
+// later before_prompt_build hook does carry a runId and repeats the current
+// source message id in its host-owned Conversation info. Join those two
+// lifecycle surfaces by the platform message id, then bind the successful join
+// to the prompt run for cleanup and replay protection.
+//
+// Keep only a bounded, short-lived routing snapshot. The current body is
+// initially represented only by a hash; a bounded native reply quotation may
+// be retained. before_agent_reply marks the matching entry as the invoked turn
+// and supplies its already-cleaned body; before_prompt_build then requires the
+// session, channel, sender actor, and source message id to agree before use.
+const inboundTurnByMessage = new Map();
+const inboundTurnMessageByRun = new Map();
 const MAX_INBOUND_TURNS = 512;
 const INBOUND_TURN_TTL_MS = 5 * 60_000;
 
@@ -775,25 +784,37 @@ function boundedReplyBody(value) {
 }
 
 function pruneInboundTurns(now = Date.now()) {
-  for (const [runId, entry] of inboundTurnByRun) {
+  for (const [messageKey, entry] of inboundTurnByMessage) {
     if (now - entry.capturedAt > INBOUND_TURN_TTL_MS) {
-      inboundTurnByRun.delete(runId);
+      inboundTurnByMessage.delete(messageKey);
+      if (entry.promptRunId) inboundTurnMessageByRun.delete(entry.promptRunId);
     }
   }
-  while (inboundTurnByRun.size > MAX_INBOUND_TURNS) {
-    const evictable = [...inboundTurnByRun.entries()].find(
-      ([, entry]) => !entry.sessionId,
+  while (inboundTurnByMessage.size > MAX_INBOUND_TURNS) {
+    const evictable = [...inboundTurnByMessage.entries()].find(
+      ([, entry]) => !entry.sessionId && !entry.promptRunId,
     );
     // Claimed entries are active agent turns. Never evict one merely because
     // unrelated inbound traffic filled the observer cache; agent_end or TTL
     // owns their cleanup.
     if (!evictable) break;
-    inboundTurnByRun.delete(evictable[0]);
+    inboundTurnByMessage.delete(evictable[0]);
   }
 }
 
+function inboundTurnMessageKey(sessionKey, platform, messageId) {
+  const cleanSessionKey = cleanInboundField(sessionKey, 1024);
+  const cleanPlatform = cleanInboundField(platform, 64).toLowerCase();
+  const cleanMessageId = cleanInboundField(messageId);
+  return cleanSessionKey && cleanPlatform && cleanMessageId
+    ? `${cleanSessionKey}\0${cleanPlatform}\0${cleanMessageId}`
+    : "";
+}
+
 /**
- * Capture one channel-owned inbound routing envelope by its per-turn run id.
+ * Capture one channel-owned inbound routing envelope by its platform message
+ * id. A run id is deliberately not required: production OpenClaw does not
+ * expose one on message_received.
  *
  * The current message itself is represented only by a hash. A bounded native
  * reply quotation may be retained because it is precisely the context this
@@ -801,18 +822,18 @@ function pruneInboundTurns(now = Date.now()) {
  */
 export function rememberInboundTurn(event, ctx, now = Date.now()) {
   pruneInboundTurns(now);
-  const runId = cleanInboundField(event?.runId ?? ctx?.runId);
   const sessionKey = cleanInboundField(event?.sessionKey ?? ctx?.sessionKey, 1024);
   const platform = groupConversationPlatform(sessionKey);
   const hookChannel = cleanInboundField(ctx?.channelId, 64).toLowerCase();
   const messageId = cleanInboundField(event?.messageId ?? ctx?.messageId);
   const senderId = cleanInboundField(event?.senderId ?? ctx?.senderId);
+  const messageKey = inboundTurnMessageKey(sessionKey, platform, messageId);
   if (
-    !runId
-    || !sessionKey
+    !sessionKey
     || !messageId
     || !senderId
     || !platform
+    || !messageKey
     || (hookChannel && hookChannel !== platform)
   ) return false;
 
@@ -821,7 +842,6 @@ export function rememberInboundTurn(event, ctx, now = Date.now()) {
   );
   const bodyHash = currentSpeakerPromptHash(event?.content);
   const candidate = {
-    runId,
     sessionKey,
     platform,
     messageId,
@@ -838,26 +858,31 @@ export function rememberInboundTurn(event, ctx, now = Date.now()) {
     bodyHash,
     sessionId: "",
     invokedBody: "",
+    promptRunId: "",
     capturedAt: now,
   };
 
-  const existing = inboundTurnByRun.get(runId);
+  const existing = inboundTurnByMessage.get(messageKey);
   if (existing && (
     existing.sessionKey !== candidate.sessionKey
     || existing.messageId !== candidate.messageId
     || existing.senderId !== candidate.senderId
     || existing.replyToId !== candidate.replyToId
   )) {
-    inboundTurnByRun.delete(runId);
+    inboundTurnByMessage.delete(messageKey);
+    if (existing.promptRunId) {
+      inboundTurnMessageByRun.delete(existing.promptRunId);
+    }
     return false;
   }
-  inboundTurnByRun.delete(runId);
-  inboundTurnByRun.set(runId, existing
+  inboundTurnByMessage.delete(messageKey);
+  inboundTurnByMessage.set(messageKey, existing
     ? {
         ...existing,
         ...candidate,
         sessionId: existing.sessionId,
         invokedBody: existing.invokedBody,
+        promptRunId: existing.promptRunId,
       }
     : candidate);
   pruneInboundTurns(now);
@@ -880,7 +905,7 @@ export function claimInboundTurnForInvocation(
   const bodyHash = currentSpeakerPromptHash(body);
   if (!sid || !sk || !sender || !bodyHash) return null;
 
-  const matches = [...inboundTurnByRun.entries()].filter(([, entry]) =>
+  const matches = [...inboundTurnByMessage.entries()].filter(([, entry]) =>
     !entry.sessionId
     && entry.sessionKey === sk
     && entry.senderId === sender
@@ -891,16 +916,18 @@ export function claimInboundTurnForInvocation(
   // body rather than borrowing it from the wrong run; prompt-time identity can
   // still use each run's independently captured ids.
   if (matches.length !== 1) return null;
-  const [runId, entry] = matches[0];
+  const [messageKey, entry] = matches[0];
   const claimed = { ...entry, sessionId: sid, invokedBody: body };
-  inboundTurnByRun.set(runId, claimed);
+  inboundTurnByMessage.set(messageKey, claimed);
   return { ...claimed };
 }
 
 /**
  * Resolve the trusted inbound snapshot only when it agrees with this exact
- * prompt build. The per-turn run id and Discord message id prevent an older
- * same-text turn from donating its sender or reply edge.
+ * prompt build. The platform message id locates the hook snapshot; exact
+ * session, channel, and sender agreement then prevents an older or forged turn
+ * from donating its sender or reply edge. A successful lookup is bound to this
+ * prompt run so no second run can reuse it.
  */
 export function findInboundTurnForPrompt(
   runId,
@@ -910,28 +937,49 @@ export function findInboundTurnForPrompt(
   now = Date.now(),
 ) {
   pruneInboundTurns(now);
-  const key = cleanInboundField(runId);
-  const entry = key ? inboundTurnByRun.get(key) : null;
-  if (!entry) return null;
+  const promptRunId = cleanInboundField(runId);
+  if (!promptRunId) return null;
   const sid = cleanInboundField(sessionId);
   const sk = cleanInboundField(sessionKey, 1024);
+  const platform = groupConversationPlatform(sk);
   const sourceMessageId = cleanInboundField(provenance?.source_message_id);
+  const messageKey = inboundTurnMessageKey(sk, platform, sourceMessageId);
+  const entry = messageKey ? inboundTurnByMessage.get(messageKey) : null;
+  if (!entry) return null;
   const provenanceActorId = cleanInboundField(provenance?.sender_actor_id, 512);
   if (
-    entry.sessionKey !== sk
+    entry.platform !== platform
+    || entry.sessionKey !== sk
     || !sourceMessageId
     || entry.messageId !== sourceMessageId
     || (entry.sessionId && entry.sessionId !== sid)
   ) return null;
 
   const expectedActorId = `actor:${entry.platform}:${entry.senderId}`;
-  if (provenanceActorId && provenanceActorId !== expectedActorId) return null;
+  if (!provenanceActorId || provenanceActorId !== expectedActorId) return null;
   const promptChannelId = cleanInboundField(provenance?.origin_channel_id);
   if (
-    entry.originChannelId
-    && promptChannelId
-    && entry.originChannelId !== promptChannelId
+    entry.platform === "discord"
+    && (
+      !entry.originChannelId
+      || !promptChannelId
+      || entry.originChannelId !== promptChannelId
+    )
   ) return null;
+  if (
+    promptRunId
+    && (
+      (entry.promptRunId && entry.promptRunId !== promptRunId)
+      || (
+        inboundTurnMessageByRun.has(promptRunId)
+        && inboundTurnMessageByRun.get(promptRunId) !== messageKey
+      )
+    )
+  ) return null;
+  if (promptRunId && !entry.promptRunId) {
+    entry.promptRunId = promptRunId;
+    inboundTurnMessageByRun.set(promptRunId, messageKey);
+  }
   const promptReplyId = cleanInboundField(provenance?.reply_target_message_id);
   const replyConflict = Boolean(
     entry.replyToId
@@ -948,8 +996,15 @@ export function findInboundTurnForPrompt(
 }
 
 export function forgetInboundTurn(runId) {
-  const key = cleanInboundField(runId);
-  if (key) inboundTurnByRun.delete(key);
+  const promptRunId = cleanInboundField(runId);
+  if (!promptRunId) return;
+  const messageKey = inboundTurnMessageByRun.get(promptRunId);
+  if (!messageKey) return;
+  inboundTurnMessageByRun.delete(promptRunId);
+  const entry = inboundTurnByMessage.get(messageKey);
+  if (entry?.promptRunId === promptRunId) {
+    inboundTurnByMessage.delete(messageKey);
+  }
 }
 
 // Heartbeat turns are machine-generated monitoring polls. They are excluded
@@ -1328,7 +1383,7 @@ async function discordGetMessage(channel, messageId, token, log) {
       method: "GET",
       headers: {
         Authorization: `Bot ${token}`,
-        "User-Agent": "VirtualContextOpenClawPlugin/5.4.7",
+        "User-Agent": "VirtualContextOpenClawPlugin/5.4.8",
       },
       signal: AbortSignal.timeout(5000),
     },
@@ -2490,7 +2545,7 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v5.4.7 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.4.8 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
 
     // ── Config compatibility checks ──
     const defaults = ocConfig.agents?.defaults ?? {};
@@ -2639,12 +2694,13 @@ export default {
     // them. This hook is deliberately synchronous and stores only a bounded
     // routing snapshot; it performs no network call, memory write, or card
     // update. The snapshot is unusable unless a later prompt build presents the
-    // same run id, session key, message id, and sender actor.
+    // same platform message id, session key, channel, and sender actor.
     api.on("message_received", (event, ctx) => {
       const remembered = rememberInboundTurn(event, ctx);
       if (debug && remembered) {
         log.info?.(
-          `[vc:identity] captured inbound routing run=${event?.runId ?? ctx?.runId ?? "?"}`,
+          `[vc:identity] captured inbound routing ` +
+          `message=${event?.messageId ?? ctx?.messageId ?? "?"}`,
         );
       }
     });
@@ -2768,9 +2824,9 @@ export default {
         promptProvenance,
       );
       // Prefer the body captured at the invoked-turn hook. It is bound to this
-      // exact inbound run and excludes host-generated reaction notices that can
+      // exact inbound message and excludes host-generated reaction notices that can
       // be prepended later during prompt assembly. The legacy wrapper-aware
-      // derivation remains the fallback for runtimes without inbound run ids.
+      // derivation remains the fallback when no exact routing snapshot joins.
       const currentBody = inboundTurn?.invokedBody
         || currentTurnForIngest(event.prompt);
       const inboundSpeaker = inboundTurn
@@ -2871,7 +2927,7 @@ export default {
           `[vc:identity] current speaker unavailable ` +
           `contextEngine=${Boolean(contextEngineSpeaker)} ` +
           `sessionRow=${Boolean(sessionSpeaker)} ` +
-          `inboundRun=${Boolean(inboundSpeaker)} ` +
+          `inboundMessage=${Boolean(inboundSpeaker)} ` +
           `promptActor=${Boolean(promptProvenance.sender_actor_id)} ` +
           `hookSender=${Boolean(ctx?.senderId)}`
         );
