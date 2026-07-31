@@ -32,7 +32,13 @@ In `openclaw.json`:
           "vcKey": "vc-your-key-here",
           "baseUrl": "https://api.virtual-context.com",
           "providers": ["openai-direct/gpt-5.4"],
-          "debug": false
+          "debug": false,
+          "modelCallCapture": {
+            "enabled": false,
+            "maxBytes": 536870912,
+            "maxFiles": 2000,
+            "maxAgeHours": 168
+          }
         }
       }
     }
@@ -48,6 +54,7 @@ In `openclaw.json`:
 | `baseUrl` | string | `https://api.virtual-context.com` | VC REST API base URL |
 | `providers` | string[] | all | Provider/model pairs to activate for. Empty = all providers. Example: `["openai-direct/gpt-5.4"]` |
 | `debug` | boolean | `false` | Enable verbose logging of REST API calls and payloads |
+| `modelCallCapture` | object | disabled | Store complete, untruncated `llm_input` and `llm_output` hook payloads in a bounded local gzip log. Defaults to 512 MiB, 2,000 files, and 7 days under `~/.openclaw/logs/virtual-context/model-calls`. |
 
 ## How It Works
 
@@ -72,6 +79,14 @@ This plugin is transparent about what it accesses. Here is the full list:
 
 **Local filesystem reads:**
 - Reads `~/.openclaw/agents/<agentId>/sessions/sessions.json` to determine the current model for provider filtering. This is a read-only access to OpenClaw's session store, used because the `before_prompt_build` hook does not expose the active model in its context. No writes.
+- Reads the active session JSONL to recover Discord speaker names that OpenClaw omits from model-facing history objects.
+
+**Model-call capture (opt-in, off by default):**
+- Writes one atomic mode-`0600` gzip JSON file for every `llm_input` and `llm_output` event.
+- Captures every field exposed by OpenClaw's `llm_input`/`llm_output` hooks—including complete system prompt, user prompt, local history messages, output, usage, and run/session/provider correlation—without the built-in trajectory's string truncation.
+- Enforces total compressed bytes, file count, and age on every write. The directory is mode `0700`.
+- Contains conversation content. Restrict access accordingly.
+- OpenClaw does not expose provider request bytes, tool definitions/images, or state retained inside a persistent provider thread through these hooks. The capture records that limitation and can be correlated by `runId`/`sessionId` with OpenClaw's trajectory `threadId`; it does not falsely claim to materialize provider-side state.
 
 **Payload modification:**
 - Replaces the message array in-place with the compressed payload returned by the cloud
@@ -84,9 +99,11 @@ This plugin is transparent about what it accesses. Here is the full list:
 - When `debug: true`, logs message previews, API responses, and payload sizes to the gateway log. Disable in production.
 
 **What it does NOT do:**
-- Does not write to any local files (except gateway logs via the logger)
-- Does not access files outside the session store
-- Does not send data to any endpoint other than your configured `baseUrl`
+- Does not write local payload files unless `modelCallCapture.enabled` is explicitly set to `true`
+- Does not read files outside the session store; opt-in captures are written only to the configured capture directory
+- Sends context data only to your configured `baseUrl`; when Discord omits a
+  native reply quotation, it may read that exact same-channel message from the
+  Discord API using the already-configured bot account
 - Does not store credentials or API keys beyond what is in your `openclaw.json` config
 
 ## Getting a vcKey
@@ -101,6 +118,33 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 - [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
 
 ## Changelog
+
+### 5.4.7
+
+- **Run-bound current speaker and native reply target**: group turns now join
+  OpenClaw's channel-owned `runId`, message id, sender snowflake, and reply id
+  before attribution. Host-generated reaction notices can no longer break the
+  current-speaker handoff. When Discord omits the quoted reply body, the plugin
+  verifies the current message's same-channel native reference and restores a
+  bounded, explicitly untrusted target quotation; conflicting, forwarded,
+  cross-channel, or post-reply-edited targets fail closed. Reply content travels
+  in a separate provenance lane and is never concatenated into requester text.
+
+### 5.4.6
+
+- **Invoked-turn current-speaker proof**: group turns now capture OpenClaw's channel-owned `senderId` at `before_agent_reply`, bind it to the exact session, session key, and normalized request hash, and require it to agree with the structured current-turn actor provenance before VC receives an actor id or the model receives a `<current-speaker>` boundary. History-only context-engine passes retain that same-turn proof rather than clearing it. This applies only when Vast is invoked; unrelated channel messages, direct messages, stored history, and actor-card write policy are unchanged.
+
+### 5.4.5
+
+- **Current-speaker identity at the authoritative lifecycle seam**: the selected context engine now hands the exact trailing current turn's trusted `senderName`/`senderId` to the later prompt hook through a short-lived, body-hash-bound in-memory record. This supplies structured actor provenance to VC and binds any returned actor card without waiting for the current row to be written to session JSONL. Only invoked model turns pass through this seam; unrelated Discord messages, DMs, stored transcripts, and actor-card write policy are unchanged.
+
+### 5.4.4
+
+- **Exact current-speaker binding without a prompt envelope**: invoked group turns can bind the current speaker's actor card from the newest OpenClaw-owned session row when `before_prompt_build` omits channel identity. The row must be the newest user row, its body must exactly match the current request, and its sender id, name, and platform must be valid; any independently available prompt or hook identity must agree. Direct messages, older-row searches, canonical history, and actor-card writes are unchanged.
+
+### 5.4.3
+
+- **Speaker-attributed native group history**: when selected with `plugins.slots.contextEngine: "virtual-context"`, the plugin preserves OpenClaw's legacy context-engine lifecycle and stock compaction while adding trusted `senderName`/`senderId` attribution to the in-memory group-chat history that OpenClaw renders as `<conversation_context>`. Discord DMs and direct sessions are unchanged, missing metadata is never guessed, and stored OpenClaw/VC conversation text is not rewritten.
 
 ### 5.1.1
 
