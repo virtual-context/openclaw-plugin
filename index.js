@@ -731,17 +731,17 @@ export function currentTurnForIngest(promptText) {
 }
 
 /**
- * Compare two projections of the same Discord body after only the benign
- * normalization OpenClaw applies between dispatch and prompt construction.
- * Routing identity is proved separately by the immutable Discord envelope;
- * this comparison remains strict about characters and line boundaries while
- * tolerating CRLF conversion, collapsed horizontal whitespace, and harmless
- * leading/trailing wrapper whitespace.
+ * Canonical text projection for comparing Discord's dispatch body with
+ * OpenClaw's prompt body. OpenClaw may reflow line endings and whitespace
+ * between those hook surfaces, so both sides use one normalization contract:
+ * NFC Unicode plus one ASCII space for every whitespace run. Immutable
+ * message/channel/sender fields prove routing identity separately; this check
+ * remains strict about every non-whitespace character and its order.
  */
 export function discordBodyAdmissionProjection(body) {
   return (typeof body === "string" ? body : "")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[^\S\n]+/gu, " ")
+    .normalize("NFC")
+    .replace(/\s+/gu, " ")
     .trim();
 }
 

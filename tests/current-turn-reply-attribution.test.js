@@ -609,6 +609,48 @@ describe("current Discord sender and reply target", () => {
       .not.toContain("conflicted with the current prompt projection");
   });
 
+  it("uses one canonical whitespace projection across Discord and OpenClaw", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    const dispatched = [
+      "Off enclo for about a week.",
+      "",
+      "I have to wonder if it was a factor in reduced tendon healing / injury ",
+      "",
+      "<@&1524968904340930633> comment please",
+    ].join("\n");
+    const promptProjection = dispatched
+      .replace("Off enclo for about a week.\n\n", "Off enclo\tfor about a week.\r\n\r\n")
+      .replace("injury \n", "injury\n");
+    stageNativeInbound({
+      handlers,
+      home,
+      rowContent: dispatched,
+      dispatchBody: dispatched,
+    });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: promptProjection },
+      agentContext(),
+    );
+    const projectedPrompt = prompt().replace(CURRENT_BODY, promptProjection);
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: projectedPrompt, messages: [] },
+      agentContext(),
+    );
+
+    expect(result?.prependContext ?? "").not.toContain(
+      "conflicting current-turn",
+    );
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    expect(prepareCall).toBeTruthy();
+    const prepared = JSON.parse(prepareCall.options.body);
+    expect(textOf(prepared.messages.at(-1).content)).toBe(dispatched);
+    expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
+      .not.toContain("conflicted with the current prompt projection");
+  });
+
   it("waits for run-bound llm_output instead of adopting a shared tail", async () => {
     const home = makeHome();
     const calls = installFetch();
