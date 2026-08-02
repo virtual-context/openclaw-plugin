@@ -75,9 +75,14 @@ const MAX_PENDING_USER_TURNS = 512;
 // admission surface again before it can send canonical source material.
 const exactSourceCapabilityByInvocation = new Set();
 const MAX_EXACT_SOURCE_CAPABILITIES = 512;
-const exactSourceRefusalByInvocation = new Map();
-const MAX_EXACT_SOURCE_REFUSALS = 512;
-const EXACT_SOURCE_REFUSAL_TTL_MS = 5 * 60_000;
+// A VC admission failure must never become a user-visible model refusal.
+// Remember the per-run pass-through result so OpenClaw's duplicate prompt
+// build does not retry a failing VC dependency or replace a safe attribution-
+// only fallback with a refusal.  The model still receives its native turn;
+// only VC enrichment and persistence are bypassed for this invocation.
+const exactSourceBypassByInvocation = new Map();
+const MAX_EXACT_SOURCE_BYPASSES = 512;
+const EXACT_SOURCE_BYPASS_TTL_MS = 5 * 60_000;
 const EXACT_SOURCE_ADMISSION_VERSION = 2;
 const EXACT_SOURCE_PREPARE_PATH =
   "/api/v1/tools/__vc_exact_source_prepare_v2";
@@ -153,39 +158,43 @@ function forgetExactSourceCapability(sessionId, runId) {
   if (key) exactSourceCapabilityByInvocation.delete(key);
 }
 
-function rememberExactSourceRefusal(sessionId, runId, hookResult) {
+function rememberExactSourceBypass(sessionId, runId, hookResult) {
   const key = invocationStateKey(sessionId, runId);
-  if (!key || !hookResult) return false;
-  exactSourceRefusalByInvocation.delete(key);
-  exactSourceRefusalByInvocation.set(key, {
-    hookResult: { ...hookResult },
+  if (!key) return false;
+  exactSourceBypassByInvocation.delete(key);
+  exactSourceBypassByInvocation.set(key, {
+    hookResult: hookResult ? { ...hookResult } : undefined,
     capturedAt: Date.now(),
   });
-  while (exactSourceRefusalByInvocation.size > MAX_EXACT_SOURCE_REFUSALS) {
-    exactSourceRefusalByInvocation.delete(
-      exactSourceRefusalByInvocation.keys().next().value,
+  while (exactSourceBypassByInvocation.size > MAX_EXACT_SOURCE_BYPASSES) {
+    exactSourceBypassByInvocation.delete(
+      exactSourceBypassByInvocation.keys().next().value,
     );
   }
   return true;
 }
 
-function findExactSourceRefusal(sessionId, runId) {
+function findExactSourceBypass(sessionId, runId) {
   const key = invocationStateKey(sessionId, runId);
   if (!key) return null;
-  const entry = exactSourceRefusalByInvocation.get(key) ?? null;
+  const entry = exactSourceBypassByInvocation.get(key) ?? null;
   if (
     entry
-    && Date.now() - entry.capturedAt > EXACT_SOURCE_REFUSAL_TTL_MS
+    && Date.now() - entry.capturedAt > EXACT_SOURCE_BYPASS_TTL_MS
   ) {
-    exactSourceRefusalByInvocation.delete(key);
+    exactSourceBypassByInvocation.delete(key);
     return null;
   }
-  return entry?.hookResult ? { ...entry.hookResult } : null;
+  return entry
+    ? {
+        hookResult: entry.hookResult ? { ...entry.hookResult } : undefined,
+      }
+    : null;
 }
 
-function forgetExactSourceRefusal(sessionId, runId) {
+function forgetExactSourceBypass(sessionId, runId) {
   const key = invocationStateKey(sessionId, runId);
-  if (key) exactSourceRefusalByInvocation.delete(key);
+  if (key) exactSourceBypassByInvocation.delete(key);
 }
 
 function assistantContentBlocks(message) {
@@ -3790,7 +3799,7 @@ export default {
       if (key) exactGroupEndByInvocation.delete(key);
       forgetPendingUserTurn(sessionId, runId);
       forgetExactSourceCapability(sessionId, runId);
-      forgetExactSourceRefusal(sessionId, runId);
+      forgetExactSourceBypass(sessionId, runId);
       forgetModelOutput(sessionId, runId);
       forgetInboundTurn(runId);
     }
@@ -4255,35 +4264,10 @@ export default {
           const currentModel = resolveSessionModel(ctx?.sessionKey ?? "");
           if (currentModel && !providerFilter.has(currentModel)) return;
         }
-        if (requiresExactDiscordAdmission(
-          ctx?.sessionKey ?? "",
-          sessionId,
-        )) {
-          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
-          try {
-            await requireExactSourceCapability({
-              baseUrl,
-              vcKey,
-              convId: identity.convId,
-              log: debug ? log : null,
-            });
-            rememberExactSourceCapability(sessionId, turnRunId);
-          } catch (error) {
-            forgetExactSourceCapability(sessionId, turnRunId);
-            forgetPendingUserTurn(sessionId, turnRunId);
-            forgetInboundTurn(turnRunId);
-            log.error?.(
-              `[vc:identity] exact source preflight failed; refusing model ` +
-              `turn session=${sessionId} run=${turnRunId || "?"}: ${error}`,
-            );
-            return {
-              handled: true,
-              reply: (await loadSuppressionMarker(log))({
-                text: "Virtual Context exact-source admission is temporarily unavailable. Please retry this message shortly.",
-              }),
-            };
-          }
-        }
+        // Ordinary model turns are never blocked on VC capability. Exact
+        // admission is checked in before_prompt_build, where any failure
+        // bypasses VC for this invocation and leaves the native model turn
+        // untouched.
         log.info?.(`[vc:DIAG-bar] not a VC command, falling through`);
         return;
       }
@@ -4357,15 +4341,15 @@ export default {
       );
       const correlationId = explicitRunId ?? sessionId;
       const promptText = (event.prompt ?? "").trim();
-      const stickyExactRefusal = exactDiscordAdmission
-        ? findExactSourceRefusal(sessionId, stateRunId)
+      const stickyExactBypass = exactDiscordAdmission
+        ? findExactSourceBypass(sessionId, stateRunId)
         : null;
-      if (stickyExactRefusal) {
+      if (stickyExactBypass) {
         log.warn?.(
-          `[vc:identity] reusing run-scoped exact-source refusal ` +
+          `[vc:identity] reusing run-scoped VC bypass; native model turn continues ` +
           `session=${sessionId} run=${stateRunId || "?"}`,
         );
-        return stickyExactRefusal;
+        return stickyExactBypass.hookResult;
       }
       // VC commands must always reach prepare. Ordinary turns on an excluded
       // provider must return before exact-capability preflight: exclusion
@@ -4446,18 +4430,14 @@ export default {
         warnIdentityOnce(
           log,
           `body:${sessionKey}:${explicitRunId || "?"}`,
-          `[vc:identity] prepare skipped: exact dispatch-bound Discord body ` +
-          `was unavailable`,
+          `[vc:identity] VC bypassed: exact dispatch-bound Discord body ` +
+          `was unavailable; native model turn continues`,
         );
+        forgetPendingUserTurn(sessionId, stateRunId);
+        forgetExactSourceCapability(sessionId, stateRunId);
         forgetInboundTurn(explicitRunId);
-        const refusal = {
-          prependContext: buildCodexPreparedContext(
-            "Virtual Context could not prove the exact current Discord turn. " +
-            "Tell the user to retry shortly; do not answer the substantive request.",
-          ).text,
-        };
-        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-        return refusal;
+        rememberExactSourceBypass(sessionId, stateRunId, undefined);
+        return;
       }
       const promptCurrentBody = currentTurnForIngest(event.prompt);
       const promptBodyWithoutLocalMedia = promptCurrentBody.replace(
@@ -4473,18 +4453,14 @@ export default {
         warnIdentityOnce(
           log,
           `body-conflict:${sessionKey}:${explicitRunId || "?"}`,
-          `[vc:identity] prepare skipped: dispatch-bound Discord body ` +
-          `conflicted with the current prompt projection`,
+          `[vc:identity] VC bypassed: dispatch-bound Discord body ` +
+          `conflicted with the current prompt projection; native model turn continues`,
         );
+        forgetPendingUserTurn(sessionId, stateRunId);
+        forgetExactSourceCapability(sessionId, stateRunId);
         forgetInboundTurn(explicitRunId);
-        const refusal = {
-          prependContext: buildCodexPreparedContext(
-            "Virtual Context found conflicting current-turn identity evidence. " +
-            "Tell the user to retry shortly; do not answer the substantive request.",
-          ).text,
-        };
-        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-        return refusal;
+        rememberExactSourceBypass(sessionId, stateRunId, undefined);
+        return;
       }
       // The routing snapshot proves who/where/which message. The invocation
       // dispatch hook contributes OpenClaw's body-for-agent projection. Group
@@ -4656,20 +4632,17 @@ export default {
           forgetExactSourceCapability(sessionId, stateRunId);
           forgetInboundTurn(explicitRunId);
           log.error?.(
-            `[vc:identity] prepare refused: exact source capability was not ` +
-            `proven session=${sessionId} run=${stateRunId || "?"}: ${error}`,
+            `[vc:identity] VC bypassed: exact source capability was not ` +
+            `proven; native model turn continues session=${sessionId} ` +
+            `run=${stateRunId || "?"}: ${error}`,
           );
-          const unavailable = buildCodexPreparedContext(
-            "Virtual Context exact-source admission is temporarily unavailable. " +
-            "Tell the user to retry shortly; do not answer the substantive request.",
-          ).text;
-          const refusal = {
-            prependContext: speakerGuardOnlyResult
-              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
-              : unavailable,
-          };
-          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-          return refusal;
+          rememberSpeakerGuardFallback();
+          rememberExactSourceBypass(
+            sessionId,
+            stateRunId,
+            speakerGuardOnlyResult ?? undefined,
+          );
+          return speakerGuardOnlyResult ?? undefined;
         }
       }
 
@@ -4904,6 +4877,29 @@ export default {
         });
       }
 
+      // Exact Discord admission protects VC's durable data, not the user's
+      // ability to talk to the model. If this turn cannot produce a complete
+      // source attestation, do not downgrade it onto the legacy VC endpoint
+      // and do not inject a refusal. Bypass VC for this invocation and let
+      // OpenClaw deliver the native text/media turn normally.
+      if (exactDiscordAdmission && !admittedTurnProvenance.source_attestation) {
+        forgetPendingUserTurn(sessionId, stateRunId);
+        forgetExactSourceCapability(sessionId, stateRunId);
+        forgetInboundTurn(explicitRunId);
+        log.warn?.(
+          `[vc:identity] VC bypassed: exact source attestation unavailable; ` +
+          `native model turn continues session=${sessionId} ` +
+          `run=${stateRunId || "?"}`,
+        );
+        rememberSpeakerGuardFallback();
+        rememberExactSourceBypass(
+          sessionId,
+          stateRunId,
+          speakerGuardOnlyResult ?? undefined,
+        );
+        return speakerGuardOnlyResult ?? undefined;
+      }
+
       const prepareBody = {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
@@ -4946,23 +4942,20 @@ export default {
           forgetExactSourceCapability(sessionId, stateRunId);
           forgetInboundTurn(explicitRunId);
           log.error?.(
-            `[vc:identity] exact prepare failed closed: ${err} ` +
-            `session=${sessionId} run=${stateRunId || "?"}`,
+            `[vc:identity] VC bypassed after exact prepare failure; native ` +
+            `model turn continues: ${err} session=${sessionId} ` +
+            `run=${stateRunId || "?"}`,
           );
           if (debug) {
             log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
           }
-          const unavailable = buildCodexPreparedContext(
-            "Virtual Context exact-source admission is temporarily unavailable. " +
-            "Tell the user to retry shortly; do not answer the substantive request.",
-          ).text;
-          const refusal = {
-            prependContext: speakerGuardOnlyResult
-              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
-              : unavailable,
-          };
-          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-          return refusal;
+          rememberSpeakerGuardFallback();
+          rememberExactSourceBypass(
+            sessionId,
+            stateRunId,
+            speakerGuardOnlyResult ?? undefined,
+          );
+          return speakerGuardOnlyResult ?? undefined;
         }
         log.error?.(
           `[vc] prepare failed: ${err} — ` +
@@ -4991,22 +4984,19 @@ export default {
         forgetExactSourceCapability(sessionId, stateRunId);
         forgetInboundTurn(explicitRunId);
         log.error?.(
-          `[vc:identity] prepare response refused: exact source capability ` +
+          `[vc:identity] VC bypassed: exact source capability response ` +
           `mismatch expected=${EXACT_SOURCE_ADMISSION_VERSION} ` +
           `actual=${meta.exact_source_admission_version ?? "missing"} ` +
-          `generation_token=${exactSourceAdmission ? "valid" : "invalid"}`,
+          `generation_token=${exactSourceAdmission ? "valid" : "invalid"}; ` +
+          `native model turn continues`,
         );
-        const unavailable = buildCodexPreparedContext(
-          "Virtual Context exact-source admission is temporarily unavailable. " +
-          "Tell the user to retry shortly; do not answer the substantive request.",
-        ).text;
-        const refusal = {
-          prependContext: speakerGuardOnlyResult
-            ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
-            : unavailable,
-        };
-        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-        return refusal;
+        rememberSpeakerGuardFallback();
+        rememberExactSourceBypass(
+          sessionId,
+          stateRunId,
+          speakerGuardOnlyResult ?? undefined,
+        );
+        return speakerGuardOnlyResult ?? undefined;
       }
       if (exactSourceAdmission) {
         const pending = findPendingUserTurn(sessionId, stateRunId);
@@ -5014,20 +5004,17 @@ export default {
           forgetExactSourceCapability(sessionId, stateRunId);
           forgetInboundTurn(explicitRunId);
           log.error?.(
-            `[vc:identity] prepare response refused: pending exact user turn ` +
-            `was unavailable session=${sessionId} run=${stateRunId || "?"}`,
+            `[vc:identity] VC bypassed: pending exact user turn was ` +
+            `unavailable; native model turn continues session=${sessionId} ` +
+            `run=${stateRunId || "?"}`,
           );
-          const unavailable = buildCodexPreparedContext(
-            "Virtual Context exact-source admission is temporarily unavailable. " +
-            "Tell the user to retry shortly; do not answer the substantive request.",
-          ).text;
-          const refusal = {
-            prependContext: speakerGuardOnlyResult
-              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
-              : unavailable,
-          };
-          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
-          return refusal;
+          rememberSpeakerGuardFallback();
+          rememberExactSourceBypass(
+            sessionId,
+            stateRunId,
+            speakerGuardOnlyResult ?? undefined,
+          );
+          return speakerGuardOnlyResult ?? undefined;
         }
         rememberPendingUserTurn(sessionId, stateRunId, {
           ...pending,

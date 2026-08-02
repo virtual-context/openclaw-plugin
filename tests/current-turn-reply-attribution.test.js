@@ -537,7 +537,7 @@ describe("current Discord sender and reply target", () => {
     }
   });
 
-  it("rejects a shared-prompt body that conflicts with the exact dispatch body", async () => {
+  it("bypasses VC without blocking the model when prompt and dispatch bodies conflict", async () => {
     const home = makeHome();
     const calls = installFetch();
     const { handlers, log } = await registerPlugin(home);
@@ -558,14 +558,15 @@ describe("current Discord sender and reply target", () => {
       ctx,
     );
 
-    expect(result?.prependContext).toContain("conflicting current-turn");
-    expect(result?.prependContext).toContain("do not answer");
+    expect(result).toBeUndefined();
     expect(calls.some((call) => isPrepareHref(call.href)))
       .toBe(false);
     expect(calls.some((call) => isIngestHref(call.href)))
       .toBe(false);
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("conflicted with the current prompt projection"),
+      expect.stringContaining(
+        "conflicted with the current prompt projection; native model turn continues",
+      ),
     );
   });
 
@@ -943,7 +944,7 @@ describe("current Discord sender and reply target", () => {
       .toBe("protocol_generation_fence_missing");
   });
 
-  it("refuses an exact model turn before prepare when cloud capability is absent", async () => {
+  it("lets the native model turn continue when cloud capability is absent", async () => {
     const home = makeHome();
     const calls = [];
     globalThis.fetch = vi.fn(async (url) => {
@@ -957,29 +958,43 @@ describe("current Discord sender and reply target", () => {
     const guildSessionKey =
       "agent:vast:discord:guild:1524917037191925871";
     const ctx = agentContext({ sessionKey: guildSessionKey });
+    const inbound = messageHookEvent();
+    inbound.replyToId = "";
+    const inboundContext = messageHookContext();
+    inboundContext.replyToId = "";
     stageNativeInbound({
       handlers,
       home,
+      event: inbound,
+      messageContext: inboundContext,
       dispatchSessionKey: guildSessionKey,
     });
 
-    const result = await handlers.get("before_agent_reply")(
+    const earlyResult = await handlers.get("before_agent_reply")(
       { cleanedBody: CURRENT_BODY },
       ctx,
     );
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: prompt(""), messages: [] },
+      ctx,
+    );
 
-    expect(result?.handled).toBe(true);
-    expect(result?.reply?.text).toContain("temporarily unavailable");
+    expect(earlyResult).toBeUndefined();
+    expect(result?.prependContext).toContain("<current-speaker");
+    expect(result?.prependContext ?? "").not.toContain("retry");
+    expect(result?.prependContext ?? "").not.toContain("do not answer");
     expect(calls).toHaveLength(1);
     expect(calls[0]).toContain("/context/capabilities");
     expect(calls.some((url) => isPrepareHref(url))).toBe(false);
     expect(calls.some((url) => isIngestHref(url))).toBe(false);
     expect(log.error).toHaveBeenCalledWith(
-      expect.stringContaining("exact source preflight failed"),
+      expect.stringContaining(
+        "VC bypassed: exact source capability was not proven; native model turn continues",
+      ),
     );
   });
 
-  it("keeps an exact prepare failure sticky across duplicate prompt passes", async () => {
+  it("keeps a nonblocking VC bypass sticky across duplicate prompt passes", async () => {
     const home = makeHome();
     const calls = [];
     globalThis.fetch = vi.fn(async (url) => {
@@ -1026,8 +1041,9 @@ describe("current Discord sender and reply target", () => {
     const second = await handlers.get("before_prompt_build")(hookEvent, ctx);
 
     for (const result of [first, second]) {
-      expect(result?.prependContext).toContain("temporarily unavailable");
-      expect(result?.prependContext).toContain("do not answer");
+      expect(result?.prependContext).toContain("<current-speaker");
+      expect(result?.prependContext ?? "").not.toContain("retry");
+      expect(result?.prependContext ?? "").not.toContain("do not answer");
     }
     await finishRun({ handlers, ctx, answer: "must not be persisted" });
     expect(calls.filter((href) => isPrepareHref(href))).toHaveLength(1);
@@ -1583,6 +1599,49 @@ describe("current Discord sender and reply target", () => {
     const prepare = JSON.parse(prepareCall.options.body);
     expect(textOf(prepare.messages.at(-1).content)).toBe(CURRENT_BODY);
     expect(textOf(prepare.messages.at(-1).content)).not.toContain("/root/");
+  });
+
+  it("never blocks an image-only model turn when OpenClaw adds media scaffolding", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    const imageMarker = "<media:image> (1 image)";
+    const imageEvent = messageHookEvent();
+    imageEvent.content = "";
+    stageNativeInbound({
+      handlers,
+      home,
+      event: imageEvent,
+      rowContent: imageMarker,
+      dispatchBody: imageMarker,
+    });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: imageMarker },
+      agentContext(),
+    );
+    const mediaPrompt = prompt().replace(
+      CURRENT_BODY,
+      [
+        "[media attached: /root/.openclaw/media/inbound/IMG_0588.png (image/png)]",
+        "To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath. Keep caption in the text body.",
+        imageMarker,
+      ].join("\n"),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: mediaPrompt, messages: [] },
+      agentContext(),
+    );
+
+    // Undefined means the plugin leaves OpenClaw's native image/model turn
+    // untouched. VC may skip an unattested turn, but it may never replace the
+    // user's request with an identity/context refusal.
+    expect(result).toBeUndefined();
+    expect(calls.some((call) => isPrepareHref(call.href))).toBe(false);
+    expect(calls.some((call) => isIngestHref(call.href))).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("native model turn continues"),
+    );
   });
 
   it("does not reuse one message snapshot for a different prompt run", async () => {
