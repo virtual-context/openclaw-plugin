@@ -569,6 +569,46 @@ describe("current Discord sender and reply target", () => {
     );
   });
 
+  it("accepts OpenClaw collapsing harmless horizontal whitespace", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    const dispatched = (
+      "do you remember we discussed a personal follow up question?  "
+      + "Give me a new example."
+    );
+    const promptProjection = (
+      "do you remember we discussed a personal follow up question? "
+      + "Give me a new example."
+    );
+    stageNativeInbound({
+      handlers,
+      home,
+      rowContent: dispatched,
+      dispatchBody: dispatched,
+    });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: promptProjection },
+      agentContext(),
+    );
+    const projectedPrompt = prompt().replace(CURRENT_BODY, promptProjection);
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: projectedPrompt, messages: [] },
+      agentContext(),
+    );
+
+    expect(result?.prependContext ?? "").not.toContain(
+      "conflicting current-turn",
+    );
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    expect(prepareCall).toBeTruthy();
+    const prepared = JSON.parse(prepareCall.options.body);
+    expect(textOf(prepared.messages.at(-1).content)).toBe(dispatched);
+    expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
+      .not.toContain("conflicted with the current prompt projection");
+  });
+
   it("waits for run-bound llm_output instead of adopting a shared tail", async () => {
     const home = makeHome();
     const calls = installFetch();

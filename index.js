@@ -730,6 +730,21 @@ export function currentTurnForIngest(promptText) {
   return currentTurnBody(promptText);
 }
 
+/**
+ * Compare two projections of the same Discord body after only the benign
+ * normalization OpenClaw applies between dispatch and prompt construction.
+ * Routing identity is proved separately by the immutable Discord envelope;
+ * this comparison remains strict about characters and line boundaries while
+ * tolerating CRLF conversion, collapsed horizontal whitespace, and harmless
+ * leading/trailing wrapper whitespace.
+ */
+export function discordBodyAdmissionProjection(body) {
+  return (typeof body === "string" ? body : "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/gu, " ")
+    .trim();
+}
+
 function preparedContinuityTurnKey(promptText) {
   const info = parseConversationInfo(promptText);
   const messageId = typeof info?.message_id === "string"
@@ -2774,6 +2789,7 @@ export function buildUrl(baseUrl, path, vcKey, convId, opts = {}) {
   const base = `${baseUrl.replace(/\/+$/, "")}${path}`;
   const params = [`vckey=${encodeURIComponent(vcKey)}`];
   if (convId) params.push(`vcconv=${encodeURIComponent(convId)}`);
+  if (opts.channel) params.push(`vcchannel=${encodeURIComponent(opts.channel)}`);
   if (opts.predecessor) params.push(`predecessor=${encodeURIComponent(opts.predecessor)}`);
   return `${base}?${params.join("&")}`;
 }
@@ -3136,8 +3152,8 @@ export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 150
   return res.json();
 }
 
-export async function vcGet(baseUrl, path, vcKey, convId, timeoutMs = 8000, log = null) {
-  const url = buildUrl(baseUrl, path, vcKey, convId);
+export async function vcGet(baseUrl, path, vcKey, convId, timeoutMs = 8000, log = null, urlOpts = {}) {
+  const url = buildUrl(baseUrl, path, vcKey, convId, urlOpts);
   const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(timeoutMs) });
   if (log) log.info?.(`[vc:wire] GET ${path} — HTTP ${res.status}`);
   if (!res.ok) {
@@ -3659,34 +3675,49 @@ function scheduleCompletionOutboxDrain(options) {
 // speaker enum into eligible tool schemas from the conversation's current
 // roster snapshot; hardcoded definitions remain the fail-open baseline
 // whenever the fetch is stale, failing, or the feature is disabled.
-const toolDefsCache = new Map(); // convId -> { byName: Map, fetchedAt }
+const toolDefsCache = new Map(); // convId + channel -> { byName: Map, fetchedAt }
 const TOOL_DEFS_TTL_MS = 60_000;
 const toolDefsInflight = new Set();
 
-export function maybeRefreshToolDefs(baseUrl, vcKey, convId, log = null) {
+function toolDefsCacheKey(convId, channelId = "") {
+  return `${convId}\u0000${cleanInboundField(channelId, 256)}`;
+}
+
+export function maybeRefreshToolDefs(
+  baseUrl, vcKey, convId, channelId = "", log = null,
+) {
   if (!convId) return;
-  const entry = toolDefsCache.get(convId);
+  const cacheKey = toolDefsCacheKey(convId, channelId);
+  const entry = toolDefsCache.get(cacheKey);
   if (entry && Date.now() - entry.fetchedAt < TOOL_DEFS_TTL_MS) return;
-  if (toolDefsInflight.has(convId)) return;
-  toolDefsInflight.add(convId);
-  vcGet(baseUrl, "/api/v1/tools/definitions", vcKey, convId, 8000, null)
+  if (toolDefsInflight.has(cacheKey)) return;
+  toolDefsInflight.add(cacheKey);
+  vcGet(
+    baseUrl,
+    "/api/v1/tools/definitions",
+    vcKey,
+    convId,
+    8000,
+    null,
+    { channel: cleanInboundField(channelId, 256) },
+  )
     .then((resp) => {
       const byName = new Map();
       for (const tdef of resp?.tools ?? []) {
         if (tdef?.name) byName.set(tdef.name, tdef);
       }
-      toolDefsCache.set(convId, { byName, fetchedAt: Date.now() });
+      toolDefsCache.set(cacheKey, { byName, fetchedAt: Date.now() });
     })
     .catch((err) => {
-      const prior = toolDefsCache.get(convId)?.byName ?? new Map();
-      toolDefsCache.set(convId, { byName: prior, fetchedAt: Date.now() });
+      const prior = toolDefsCache.get(cacheKey)?.byName ?? new Map();
+      toolDefsCache.set(cacheKey, { byName: prior, fetchedAt: Date.now() });
       log?.info?.(`[vc] tool definitions refresh failed for ${convId}: ${err.message}`);
     })
-    .finally(() => toolDefsInflight.delete(convId));
+    .finally(() => toolDefsInflight.delete(cacheKey));
 }
 
-export function cachedToolDef(convId, name) {
-  return toolDefsCache.get(convId)?.byName?.get(name);
+export function cachedToolDef(convId, name, channelId = "") {
+  return toolDefsCache.get(toolDefsCacheKey(convId, channelId))?.byName?.get(name);
 }
 
 
@@ -3991,12 +4022,41 @@ export default {
       { name: "vc_find_session", description: "Retrieve full conversation excerpts from a specific older session that was marked as superseded in a previous vc_find_quote result. Use this ONLY when you see '[Older session \u2014 superseded]' and need the original text to answer the question.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for within the session." }, session: { type: "string", description: "The session date to search (e.g. '2023/05/25'). Copy the date shown in the '[Older session (...)]' marker." } }, required: ["query", "session"] } },
     ];
 
+    // A first model turn can arrive before the asynchronous dynamic-schema
+    // refresh completes. Keep speaker selection available on that cold path;
+    // cloud validates every supplied handle against its request-local roster,
+    // and exact mode fails closed on an invalid or stale value.
+    const coldSpeakerProperty = {
+      type: "string",
+      description: (
+        "Optional speaker handle from the speaker-roster supplied in the " +
+        "current prompt. Omit unless asking about one specific participant."
+      ),
+    };
+    const coldSpeakerOnlyProperty = {
+      type: "boolean",
+      description: (
+        "Set true with a speaker handle to return only statements verifiably " +
+        "made by that participant."
+      ),
+    };
+    for (const def of vcTools) {
+      if (!["vc_find_quote", "vc_query_facts"].includes(def.name)) continue;
+      def.input_schema.properties.speaker = { ...coldSpeakerProperty };
+      def.input_schema.properties.speaker_only = { ...coldSpeakerOnlyProperty };
+    }
+
     for (const def of vcTools) {
       api.registerTool((ctx) => {
         const factorySession = ctx?.sessionId ?? "unknown";
         const factoryIdentity = selectConvId(ctx?.sessionKey ?? "", factorySession);
-        maybeRefreshToolDefs(baseUrl, vcKey, factoryIdentity.convId, log);
-        const fetched = cachedToolDef(factoryIdentity.convId, def.name);
+        const factoryChannelId = cleanInboundField(ctx?.channelId, 256);
+        maybeRefreshToolDefs(
+          baseUrl, vcKey, factoryIdentity.convId, factoryChannelId, log,
+        );
+        const fetched = cachedToolDef(
+          factoryIdentity.convId, def.name, factoryChannelId,
+        );
         return {
         name: def.name,
         description: fetched?.description ?? def.description,
@@ -4015,7 +4075,8 @@ export default {
               identity.convId,
               { arguments: params },
               15000,
-              debug ? log : null
+              debug ? log : null,
+              { channel: cleanInboundField(ctx?.channelId, 256) },
             );
             if (debug) log.info?.(`[vc:debug] tool ${def.name} response: ${(response.result ?? "").slice(0, 500)}`);
             return {
@@ -4406,7 +4467,8 @@ export default {
       if (
         exactDiscordAdmission
         && promptCurrentBody
-        && promptBodyWithoutLocalMedia !== inboundTurn.invokedBody
+        && discordBodyAdmissionProjection(promptBodyWithoutLocalMedia)
+          !== discordBodyAdmissionProjection(inboundTurn.invokedBody)
       ) {
         warnIdentityOnce(
           log,

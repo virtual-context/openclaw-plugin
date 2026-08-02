@@ -36,6 +36,18 @@ describe("buildUrl URL construction", () => {
     expect(url).toBe("https://api.virtual-context.com/api/v1/context/prepare?vckey=k");
     expect(url).not.toContain("vcconv");
   });
+
+  it("carries the current source channel for scoped speaker rosters", () => {
+    const url = buildUrl(
+      "https://api.virtual-context.com",
+      "/api/v1/tools/vc_find_quote",
+      "k",
+      "guild-conversation",
+      { channel: "1524946242499514418" },
+    );
+    expect(url).toContain("vcconv=guild-conversation");
+    expect(url).toContain("vcchannel=1524946242499514418");
+  });
 });
 
 describe("vcPost fires correct wire request for VCMERGE / VCMERGE PREVIEW", () => {
