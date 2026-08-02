@@ -3997,7 +3997,7 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v5.5.0 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.5.1 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
     void scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
 
     // ── Config compatibility checks ──
