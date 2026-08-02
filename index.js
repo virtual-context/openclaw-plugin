@@ -2787,15 +2787,16 @@ export function buildUrl(baseUrl, path, vcKey, convId, opts = {}) {
  *   into the async path, NOT bumping this timeout further.
  * - Initial JSONL ingest gets 120s. The cloud has to chew through the full session
  *   history on first contact; varies with conversation size.
- * - Everything else stays at 15s. Preserves the historical default; tight enough to
- *   fail-fast on transient cloud issues.
+ * - Everything else gets 30s. Production cold starts can spend more than 15s
+ *   restoring a conversation and warming the shared embedding cache; 30s keeps
+ *   that bounded path from discarding an otherwise valid exact-source response.
  *
  * Pure function; exported for unit testing.
  */
 export function selectPrepareTimeout({ isVcCommand = false, isInitialIngest = false } = {}) {
   if (isVcCommand) return 60000;
   if (isInitialIngest) return 120000;
-  return 15000;
+  return 30000;
 }
 
 /**

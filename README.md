@@ -214,6 +214,11 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
   completion before cloud ingest. Mixed-version cloud workers fail before
   canonical mutation, and non-exact group routes use the same run-bound output
   handoff without being mistaken for stable guild admission.
+- **Normal prepare cold-start allowance**: normal prepare calls now allow `30s`
+  instead of `15s`; VC commands remain at `60s` and initial JSONL ingest remains
+  at `120s`. This covers a measured bounded conversation restore and shared
+  embedding-cache warmup. Repeated cold-cache pressure should be fixed through
+  cloud-side cache residency rather than by increasing this deadline again.
 
 ### 5.4.8
 

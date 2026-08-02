@@ -1,11 +1,11 @@
 /**
  * vcPost prepare-timeout selection per branch.
  *
- *   isVcCommand ? 60000 : (isInitialIngest ? 120000 : 15000)
+ *   isVcCommand ? 60000 : (isInitialIngest ? 120000 : 30000)
  *
  * - VC commands (VCMERGE, VCATTACH, VCMERGE PREVIEW, etc.): 60s.
  * - Initial JSONL ingest path: 120s.
- * - Everything else: 15s (the historical default).
+ * - Everything else: 30s (covers bounded production cold-cache prepares).
  *
  * Exercises `selectPrepareTimeout` directly and asserts `vcPost` passes the
  * chosen timeout to fetch's AbortSignal.
@@ -29,13 +29,13 @@ describe("selectPrepareTimeout per-branch values", () => {
     expect(selectPrepareTimeout({ isVcCommand: false, isInitialIngest: true })).toBe(120000);
   });
 
-  it("normal prepare (neither branch) returns the 15000ms default", () => {
-    expect(selectPrepareTimeout({ isVcCommand: false, isInitialIngest: false })).toBe(15000);
+  it("normal prepare (neither branch) returns the 30000ms default", () => {
+    expect(selectPrepareTimeout({ isVcCommand: false, isInitialIngest: false })).toBe(30000);
   });
 
-  it("called with no args defaults to 15000ms (defensive)", () => {
-    expect(selectPrepareTimeout()).toBe(15000);
-    expect(selectPrepareTimeout({})).toBe(15000);
+  it("called with no args defaults to 30000ms (defensive)", () => {
+    expect(selectPrepareTimeout()).toBe(30000);
+    expect(selectPrepareTimeout({})).toBe(30000);
   });
 });
 
@@ -82,7 +82,7 @@ describe("vcPost honors the timeout argument via AbortSignal.timeout", () => {
     expect(abortTimeoutSpy).toHaveBeenCalledWith(120000);
   });
 
-  it("passes 15000ms in the default branch", async () => {
+  it("passes 30000ms in the default branch", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -93,6 +93,6 @@ describe("vcPost honors the timeout argument via AbortSignal.timeout", () => {
     const timeoutMs = selectPrepareTimeout({ isVcCommand: false, isInitialIngest: false });
     await vcPost("https://api.virtual-context.com", "/api/v1/context/prepare", "vc-key", "session-1", { messages: [] }, timeoutMs, null);
 
-    expect(abortTimeoutSpy).toHaveBeenCalledWith(15000);
+    expect(abortTimeoutSpy).toHaveBeenCalledWith(30000);
   });
 });
