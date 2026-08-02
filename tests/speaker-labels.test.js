@@ -17,7 +17,11 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: () => process.env.VC_TEST_HOME ?? actual.homedir() };
 });
 
-import { readSpeakerNames, labelSpeakers } from "../index.js";
+import {
+  labelFullSessionSpeakers,
+  labelSpeakers,
+  readSpeakerNames,
+} from "../index.js";
 
 const SID = "1fd564f6-3705-4c54-9fbf-2b59ed05d31a";
 const SESSION_KEY = "agent:vast:discord:channel:1524920218944798940";
@@ -177,5 +181,34 @@ describe("labelSpeakers", () => {
   it("passes messages through when no names are available", () => {
     const messages = [{ role: "user", content: "hi" }];
     expect(labelSpeakers(messages, null)).toBe(messages);
+  });
+});
+
+describe("labelFullSessionSpeakers", () => {
+  it("uses each JSONL row's own sender even when two people repeat text", () => {
+    const messages = [
+      { role: "user", senderName: "BigTex", content: "same words" },
+      { role: "assistant", content: "first reply" },
+      { role: "user", senderName: "optics", content: "same words" },
+    ];
+    const output = labelFullSessionSpeakers(messages, SESSION_KEY);
+    expect(output.map(textOf)).toEqual([
+      "BigTex: same words",
+      "first reply",
+      "optics: same words",
+    ]);
+    expect(messages.map(textOf)).toEqual([
+      "same words",
+      "first reply",
+      "same words",
+    ]);
+  });
+
+  it("keeps one-speaker full histories byte-identical", () => {
+    const messages = [
+      { role: "user", senderName: "optics", content: "one" },
+      { role: "user", senderName: "optics", content: "two" },
+    ];
+    expect(labelFullSessionSpeakers(messages, SESSION_KEY)).toBe(messages);
   });
 });

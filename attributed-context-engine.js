@@ -206,7 +206,7 @@ export function createSpeakerAttributedContextEngine({
     info: {
       id: SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID,
       name: "Virtual Context Speaker-Attributed Legacy Engine",
-      version: "5.4.7",
+      version: "5.5.0",
     },
     async ingest() {
       return { ingested: false };
@@ -224,6 +224,7 @@ export function createSpeakerAttributedContextEngine({
         );
         onCurrentSpeaker?.({
           sessionId: params.sessionId,
+          runId: params.runId,
           sessionKey: params.sessionKey,
           prompt: currentPrompt,
           speaker: currentSpeaker,

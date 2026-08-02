@@ -120,7 +120,7 @@ On gateways that don't expose command registration the plugin skips these and lo
 **1. Check the plugin loaded, and which version.** On gateway startup:
 
 ```
-[vc] register() v5.4.8 — baseUrl=... convIdentity=... groupedSessions=... providers=...
+[vc] register() v5.5.0 — baseUrl=... convIdentity=... groupedSessions=... providers=...
 [vc] registered 7 tools (dynamic schemas, hardcoded fallback)
 [vc] registered 5 native slash commands (vcstatus, vcmerge, vclabel, vcattach, vcreingest)
 ```
@@ -206,6 +206,14 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 - [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
 
 ## Changelog
+
+### 5.5.0
+
+- **Immutable Discord source admission**: stable guild turns bind the native
+  message, author, body, and matching model output into an ordered durable
+  completion before cloud ingest. Mixed-version cloud workers fail before
+  canonical mutation, and non-exact group routes use the same run-bound output
+  handoff without being mistaken for stable guild admission.
 
 ### 5.4.8
 

@@ -29,11 +29,12 @@
 
 import {
   readFileSync, writeFileSync, existsSync,
-  statSync, openSync, readSync, closeSync,
+  statSync, openSync, readSync, closeSync, mkdirSync,
+  renameSync, readdirSync, unlinkSync, fsyncSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   captureModelCallEvent,
   normalizeModelCallCaptureConfig,
@@ -48,8 +49,10 @@ import {
 
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
-// Tracks sessions where last prepare was a VC command (skip ingest)
-const vcCommandSessions = new Set();
+// Exact invocation keys whose reply was a VC command (skip ingest). A unified
+// guild session can run multiple channel turns concurrently, so session-only
+// state is never a completion identity.
+const vcCommandInvocations = new Set();
 
 // sessionId -> the user text this turn's prepare sent to the cloud.
 //
@@ -63,44 +66,226 @@ const vcCommandSessions = new Set();
 //
 // It must be the text prepare actually sent (speaker label included), or the
 // cloud would hash it as a different message and store the turn twice.
-const pendingUserTurn = new Map();
-// sessionId -> structured provenance extracted from the same host prompt as
-// pendingUserTurn. It travels beside the text so storage never needs to parse
-// routing/sender scaffolding back out of conversational content.
-const pendingUserTurnProvenance = new Map();
-// Host message id that pendingUserTurn's value came from, so a stale entry
-// left by an earlier turn is never mistaken for this turn's user half.
-const pendingUserTurnMessage = new Map();
+const pendingUserTurnByInvocation = new Map();
+const MAX_PENDING_USER_TURNS = 512;
+
+// A read-only cloud capability probe is bound to the exact host invocation
+// that performed it.  It is deliberately not a deployment-wide cache: after
+// a rollback or mixed deployment, a later Discord turn must prove the exact
+// admission surface again before it can send canonical source material.
+const exactSourceCapabilityByInvocation = new Set();
+const MAX_EXACT_SOURCE_CAPABILITIES = 512;
+const exactSourceRefusalByInvocation = new Map();
+const MAX_EXACT_SOURCE_REFUSALS = 512;
+const EXACT_SOURCE_REFUSAL_TTL_MS = 5 * 60_000;
+const EXACT_SOURCE_ADMISSION_VERSION = 2;
+const EXACT_SOURCE_PREPARE_PATH =
+  "/api/v1/tools/__vc_exact_source_prepare_v2";
+const EXACT_SOURCE_INGEST_PATH =
+  "/api/v1/tools/__vc_exact_source_ingest_v2";
+
+// Exact model output keyed by the host's stable invocation run id.  The
+// agent_end payload is a full session snapshot, so its newest assistant row is
+// not proof that the row belongs to the pending user turn.  llm_output is the
+// model-boundary hook that carries runId; retain only the bounded final output
+// candidates needed to complete that same run.
+const modelOutputByInvocation = new Map();
+const MAX_MODEL_OUTPUTS = 512;
 
 // sessionId -> trusted current speaker proof captured before prompt preparation.
 // Keep only a bounded, short-lived hash-bound handoff; no conversational text
 // is retained here. The invoked-turn hook normally supplies channel-owned
 // senderId; the context engine may strengthen it when a host exposes the
 // current row there.
-const currentContextSpeakerBySession = new Map();
+const currentContextSpeakerByInvocation = new Map();
 const MAX_CURRENT_CONTEXT_SPEAKERS = 256;
 const CURRENT_CONTEXT_SPEAKER_TTL_MS = 5 * 60_000;
 
-// full session route + platform + messageId -> channel-owned metadata for one
-// inbound turn. One Discord snowflake can legitimately be observed by more
-// than one configured bot/agent route, so message id alone is not a process-
-// global key.
-// OpenClaw's message_received hook carries the exact inbound message, sender,
-// and native-reply ids, but production does NOT assign that hook a runId. The
-// later before_prompt_build hook does carry a runId and repeats the current
-// source message id in its host-owned Conversation info. Join those two
-// lifecycle surfaces by the platform message id, then bind the successful join
-// to the prompt run for cleanup and replay protection.
+function invocationStateKey(sessionId, runId) {
+  const sid = typeof sessionId === "string" ? sessionId.trim() : "";
+  const rid = typeof runId === "string" ? runId.trim() : "";
+  return sid && rid ? `${sid}\0${rid}` : "";
+}
+
+function rememberPendingUserTurn(sessionId, runId, value) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key) return false;
+  pendingUserTurnByInvocation.delete(key);
+  pendingUserTurnByInvocation.set(key, { ...value, capturedAt: Date.now() });
+  while (pendingUserTurnByInvocation.size > MAX_PENDING_USER_TURNS) {
+    pendingUserTurnByInvocation.delete(
+      pendingUserTurnByInvocation.keys().next().value,
+    );
+  }
+  return true;
+}
+
+function findPendingUserTurn(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  return key ? pendingUserTurnByInvocation.get(key) ?? null : null;
+}
+
+function forgetPendingUserTurn(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) pendingUserTurnByInvocation.delete(key);
+}
+
+function rememberExactSourceCapability(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key) return false;
+  exactSourceCapabilityByInvocation.delete(key);
+  exactSourceCapabilityByInvocation.add(key);
+  while (exactSourceCapabilityByInvocation.size > MAX_EXACT_SOURCE_CAPABILITIES) {
+    exactSourceCapabilityByInvocation.delete(
+      exactSourceCapabilityByInvocation.values().next().value,
+    );
+  }
+  return true;
+}
+
+function hasExactSourceCapability(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  return key ? exactSourceCapabilityByInvocation.has(key) : false;
+}
+
+function forgetExactSourceCapability(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) exactSourceCapabilityByInvocation.delete(key);
+}
+
+function rememberExactSourceRefusal(sessionId, runId, hookResult) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key || !hookResult) return false;
+  exactSourceRefusalByInvocation.delete(key);
+  exactSourceRefusalByInvocation.set(key, {
+    hookResult: { ...hookResult },
+    capturedAt: Date.now(),
+  });
+  while (exactSourceRefusalByInvocation.size > MAX_EXACT_SOURCE_REFUSALS) {
+    exactSourceRefusalByInvocation.delete(
+      exactSourceRefusalByInvocation.keys().next().value,
+    );
+  }
+  return true;
+}
+
+function findExactSourceRefusal(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key) return null;
+  const entry = exactSourceRefusalByInvocation.get(key) ?? null;
+  if (
+    entry
+    && Date.now() - entry.capturedAt > EXACT_SOURCE_REFUSAL_TTL_MS
+  ) {
+    exactSourceRefusalByInvocation.delete(key);
+    return null;
+  }
+  return entry?.hookResult ? { ...entry.hookResult } : null;
+}
+
+function forgetExactSourceRefusal(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) exactSourceRefusalByInvocation.delete(key);
+}
+
+function assistantContentBlocks(message) {
+  return Array.isArray(message?.content) ? message.content : [];
+}
+
+function assistantMessageText(message) {
+  if (typeof message?.content === "string") return message.content;
+  return assistantContentBlocks(message)
+    .filter((block) => block?.type === "text")
+    .map((block) => (
+      typeof block?.text === "string" ? block.text : ""
+    ))
+    .filter((text) => text.trim())
+    .join("\n");
+}
+
+function assistantDeliveredText(message) {
+  return assistantContentBlocks(message)
+    .filter((block) => block?.type === "toolCall" || block?.type === "tool_use")
+    .map((block) => ({
+      name: block?.name ?? block?.toolName,
+      args: block?.arguments ?? block?.input ?? {},
+    }))
+    .filter(({ name, args }) => (
+      (name === "message" && args?.action === "send")
+      || name === "sessions_yield"
+    ))
+    .map(({ args }) => args?.message)
+    .filter((text) => typeof text === "string" && text.trim())
+    .join("\n");
+}
+
+function rememberModelOutput(sessionId, runId, event) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key) return false;
+  const deliveredText = assistantDeliveredText(event?.lastAssistant);
+  const lastAssistantText = assistantMessageText(event?.lastAssistant);
+  const assistantText = Array.isArray(event?.assistantTexts)
+    ? [...event.assistantTexts].reverse().find(
+        (text) => typeof text === "string" && text.trim(),
+      ) ?? ""
+    : "";
+  const existing = modelOutputByInvocation.get(key) ?? {};
+  modelOutputByInvocation.delete(key);
+  modelOutputByInvocation.set(key, {
+    // Preserve an actual delivery-tool payload across a later silent model
+    // bookkeeping pass. A later delivery replaces an earlier delivery.
+    deliveredText: deliveredText || existing.deliveredText || "",
+    assistantText: lastAssistantText || assistantText || existing.assistantText || "",
+    capturedAt: Date.now(),
+  });
+  while (modelOutputByInvocation.size > MAX_MODEL_OUTPUTS) {
+    modelOutputByInvocation.delete(modelOutputByInvocation.keys().next().value);
+  }
+  return Boolean(deliveredText || lastAssistantText || assistantText);
+}
+
+function findModelOutput(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  return key ? modelOutputByInvocation.get(key) ?? null : null;
+}
+
+function forgetModelOutput(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) modelOutputByInvocation.delete(key);
+}
+
+function markVcCommandInvocation(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) vcCommandInvocations.add(key);
+}
+
+function consumeVcCommandInvocation(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key || !vcCommandInvocations.has(key)) return false;
+  vcCommandInvocations.delete(key);
+  return true;
+}
+
+// account + platform + messageId -> channel-owned metadata for one inbound
+// turn. OpenClaw 2026.7.1-beta.2's public hook type says message_received has a
+// runId, but its shipped inbound mapper does not populate one. Capture the
+// immutable transport envelope here, promote it through before_dispatch's
+// resolved session, then bind it to before_prompt_build only when the host's
+// current-turn Conversation-info wrapper independently supplies the exact
+// message id and sender id. The session JSONL is deliberately not identity
+// evidence: real Discord user rows contain role/content/timestamp but no
+// sender id. Zero or multiple candidates fail closed. Message text, arrival
+// order and nearest-time heuristics are deliberately absent from the join.
 //
-// Keep only a bounded, short-lived routing snapshot. The current body is
-// initially represented only by a hash; a bounded native reply quotation may
-// be retained. before_agent_reply marks the matching entry as the invoked turn
-// and supplies its already-cleaned body; before_prompt_build then requires the
-// session, channel, sender actor, and source message id to agree before use.
+// Keep only a bounded, short-lived routing snapshot. It contains channel-owned
+// ids plus hashes/quotations, not conversational memory, and never updates an
+// actor card by itself.
 const inboundTurnByMessage = new Map();
 const inboundTurnMessageByRun = new Map();
 const MAX_INBOUND_TURNS = 512;
 const INBOUND_TURN_TTL_MS = 5 * 60_000;
+const identityWarningKeys = new Set();
+const MAX_IDENTITY_WARNING_KEYS = 256;
 
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
@@ -318,9 +503,58 @@ export function parseConversationInfo(promptText) {
   return parseLabeledJsonBlock(promptText, _CONV_INFO_LABEL);
 }
 
+/**
+ * Parse the host-owned Conversation-info wrapper for the current turn.
+ *
+ * On the first prompt-build pass it is the first such block; user text comes
+ * later and therefore cannot replace it by quoting the label. On repeated
+ * Codex prompt-build passes, VC's prepared context is placed before the real
+ * host envelope and the assembled-context marker follows it, so the last
+ * parsable block before that marker is authoritative. This is routing
+ * evidence only; none of the prose inside the untrusted block is an
+ * instruction.
+ */
+export function parseCurrentConversationInfo(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
+  const limit = replayAt >= 0 ? replayAt : text.length;
+  const candidates = [];
+  let from = 0;
+  while (from < limit) {
+    const at = text.indexOf(_CONV_INFO_LABEL, from);
+    if (at < 0 || at >= limit) break;
+    const lineStart = at === 0 || text[at - 1] === "\n";
+    if (lineStart) {
+      const fence = text.indexOf("```json", at + _CONV_INFO_LABEL.length);
+      const start = fence >= 0 ? text.indexOf("\n", fence) : -1;
+      const end = start >= 0 ? text.indexOf("```", start + 1) : -1;
+      if (
+        fence >= 0
+        && fence < limit
+        && start >= 0
+        && end >= 0
+        && end < limit
+      ) {
+        try {
+          const parsed = JSON.parse(text.slice(start + 1, end).trim());
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            candidates.push(parsed);
+          }
+        } catch {
+          // A malformed quoted block is not evidence. Keep looking for the
+          // host's real block on repeated prompt-build passes.
+        }
+      }
+    }
+    from = at + _CONV_INFO_LABEL.length;
+  }
+  if (!candidates.length) return null;
+  return replayAt >= 0 ? candidates.at(-1) : candidates[0];
+}
+
 /** Structured provenance for the current turn, with no prompt text attached. */
 export function currentTurnProvenance(promptText, sessionKey = "") {
-  const info = parseConversationInfo(promptText);
+  const info = parseCurrentConversationInfo(promptText);
   if (!info || typeof info !== "object" || Array.isArray(info)) return {};
 
   const clean = (value) => {
@@ -439,12 +673,23 @@ export function currentTurnBody(promptText) {
     const searchFrom = closeAt >= 0 ? closeAt + _REPLAY_CLOSE_TAG.length : replayAt;
     const labelAt = text.indexOf(_CURRENT_REQUEST_LABEL, searchFrom);
     if (labelAt >= 0) {
-      return stripHistoryBlock(
+      return stripHostNotificationLines(stripHistoryBlock(
         currentMessageBody(text.slice(labelAt + _CURRENT_REQUEST_LABEL.length)),
-      );
+      ));
     }
   }
-  return stripHistoryBlock(currentMessageBody(text));
+  return stripHostNotificationLines(stripHistoryBlock(currentMessageBody(text)));
+}
+
+/** Remove host-generated Discord notification scaffolding from current text. */
+function stripHostNotificationLines(text) {
+  return (typeof text === "string" ? text : "")
+    .split("\n")
+    .filter((line) => !/^System: \[[^\]\r\n]+\] Discord reaction (?:added|removed):/.test(
+      line.trim(),
+    ))
+    .join("\n")
+    .trim();
 }
 
 /**
@@ -627,6 +872,10 @@ export function preparedBodyUnusableForReply(promptText, body) {
 // changed shape between turns would be stored twice.
 
 const SPEAKER_JSONL_TAIL_BYTES = 512 * 1024;
+// An in-memory, non-serializing handle for the one row synthesized or exactly
+// replaced from the native inbound Discord event. Object spread preserves the
+// symbol through speaker labeling; JSON.stringify never sends it on the wire.
+const CURRENT_NATIVE_TURN = Symbol("vc.currentNativeTurn");
 
 /** Plain text of a message body, whichever content shape it uses. */
 function speakerMessageText(content) {
@@ -731,7 +980,12 @@ export function labelSpeakers(messages, names, log) {
   const out = messages.map((msg) => {
     if (msg?.role !== "user") return msg;
     const text = speakerMessageText(msg.content);
-    const name = names.get(text.trim());
+    // The exact current row owns native sender metadata. A text lookup can
+    // resolve repeated words ("yes", "same") to a different historical
+    // member, so it is never authoritative for this marked row.
+    const name = msg?.[CURRENT_NATIVE_TURN]
+      ? (typeof msg?.senderName === "string" ? msg.senderName.trim() : "")
+      : names.get(text.trim());
     if (!name || text.startsWith(`${name}: `)) return msg;
     labeled++;
     return withSpeakerText(msg, `${name}: ${text}`);
@@ -743,6 +997,50 @@ export function labelSpeakers(messages, names, log) {
     );
   }
   return out;
+}
+
+/**
+ * Label a full JSONL replay from each message's own retained sender metadata.
+ *
+ * Unlike the bounded text lookup used for OpenClaw's anonymous windowed
+ * messages, a full JSONL row still owns its senderName.  Binding the label by
+ * row position avoids both the 512 KiB tail limit and repeated-text ambiguity.
+ * The two-speaker and group-session gates preserve byte identity for DMs and
+ * genuinely one-person histories.
+ */
+export function labelFullSessionSpeakers(messages, sessionKey, log) {
+  if (!groupConversationSession(sessionKey) || !Array.isArray(messages)) {
+    return messages;
+  }
+  const names = new Set(
+    messages
+      .filter((message) => message?.role === "user")
+      .map((message) => (
+        typeof message?.senderName === "string"
+          ? message.senderName.trim()
+          : ""
+      ))
+      .filter(Boolean),
+  );
+  if (names.size < 2) return messages;
+  let labeled = 0;
+  const output = messages.map((message) => {
+    if (message?.role !== "user") return message;
+    const name = typeof message.senderName === "string"
+      ? message.senderName.trim()
+      : "";
+    const text = speakerMessageText(message.content);
+    if (!name || !text || text.startsWith(`${name}: `)) return message;
+    labeled += 1;
+    return withSpeakerText(message, `${name}: ${text}`);
+  });
+  if (labeled) {
+    log?.info?.(
+      `[vc] full-session speaker-labeled ${labeled} message(s) across ` +
+      `${names.size} speakers`,
+    );
+  }
+  return output;
 }
 
 function groupConversationSession(sessionKey) {
@@ -758,11 +1056,91 @@ function groupConversationPlatform(sessionKey) {
   return /^[a-z0-9._-]+$/.test(platform) ? platform : "";
 }
 
+function requiresExactDiscordAttestation(sessionKey) {
+  return typeof sessionKey === "string"
+    && /^(?:sk:)?agent:[^:]+:discord:(?:channel|guild):/.test(
+      sessionKey.trim(),
+    );
+}
+
 function currentSpeakerPromptHash(prompt) {
   const text = typeof prompt === "string" ? prompt.trim() : "";
   return text
     ? createHash("sha256").update(text, "utf-8").digest("hex")
     : "";
+}
+
+function exactSourceBodyHash(value) {
+  if (typeof value !== "string" || value.length === 0) return "";
+  return createHash("sha256").update(value, "utf-8").digest("hex");
+}
+
+function validatedExactSourceAdmission(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [
+    "conversation_generation",
+    "lifecycle_epoch",
+    "owner_conversation_id",
+    "version",
+  ];
+  if (
+    keys.length !== expectedKeys.length
+    || keys.some((key, index) => key !== expectedKeys[index])
+    || value.version !== EXACT_SOURCE_ADMISSION_VERSION
+    || typeof value.owner_conversation_id !== "string"
+    || !value.owner_conversation_id
+    || value.owner_conversation_id !== value.owner_conversation_id.trim()
+    || value.owner_conversation_id.length > 1024
+    || /[\x00-\x1f\x7f]/.test(value.owner_conversation_id)
+    || !Number.isSafeInteger(value.conversation_generation)
+    || value.conversation_generation < 0
+    || !Number.isSafeInteger(value.lifecycle_epoch)
+    || value.lifecycle_epoch < 1
+  ) return null;
+  return {
+    version: value.version,
+    owner_conversation_id: value.owner_conversation_id,
+    conversation_generation: value.conversation_generation,
+    lifecycle_epoch: value.lifecycle_epoch,
+  };
+}
+
+function warnIdentityOnce(log, key, message) {
+  if (!key || identityWarningKeys.has(key)) return;
+  identityWarningKeys.add(key);
+  while (identityWarningKeys.size > MAX_IDENTITY_WARNING_KEYS) {
+    identityWarningKeys.delete(identityWarningKeys.values().next().value);
+  }
+  log?.warn?.(message);
+}
+
+function inboundTurnAdmissionDiagnostic(event, ctx) {
+  const metadata = event?.metadata && typeof event.metadata === "object"
+    ? event.metadata
+    : {};
+  const platform = cleanInboundField(
+    metadata.provider ?? metadata.originatingChannel ?? ctx?.channelId,
+    64,
+  ).toLowerCase();
+  if (platform !== "discord") return null;
+  const required = {
+    accountId: ctx?.accountId,
+    messageId: event?.messageId ?? ctx?.messageId ?? metadata.messageId,
+    senderId: event?.senderId ?? ctx?.senderId ?? metadata.senderId,
+    timestamp: Number.isFinite(Number(event?.timestamp))
+      ? String(event.timestamp)
+      : "",
+  };
+  const missing = Object.entries(required)
+    .filter(([, value]) => !cleanInboundField(value, 1024))
+    .map(([name]) => name);
+  return {
+    platform,
+    sessionKey: cleanInboundField(event?.sessionKey ?? ctx?.sessionKey, 1024),
+    messageId: cleanInboundField(required.messageId),
+    missing,
+  };
 }
 
 function cleanInboundField(value, maxLength = 256) {
@@ -792,7 +1170,7 @@ function pruneInboundTurns(now = Date.now()) {
   }
   while (inboundTurnByMessage.size > MAX_INBOUND_TURNS) {
     const evictable = [...inboundTurnByMessage.entries()].find(
-      ([, entry]) => !entry.sessionId && !entry.promptRunId,
+      ([, entry]) => !entry.sessionId,
     );
     // Claimed entries are active agent turns. Never evict one merely because
     // unrelated inbound traffic filled the observer cache; agent_end or TTL
@@ -802,72 +1180,146 @@ function pruneInboundTurns(now = Date.now()) {
   }
 }
 
-function inboundTurnMessageKey(sessionKey, platform, messageId) {
-  const cleanSessionKey = cleanInboundField(sessionKey, 1024);
+function inboundTurnMessageKey(accountId, platform, messageId) {
+  const cleanAccountId = cleanInboundField(accountId, 128);
   const cleanPlatform = cleanInboundField(platform, 64).toLowerCase();
   const cleanMessageId = cleanInboundField(messageId);
-  return cleanSessionKey && cleanPlatform && cleanMessageId
-    ? `${cleanSessionKey}\0${cleanPlatform}\0${cleanMessageId}`
+  return cleanAccountId && cleanPlatform && cleanMessageId
+    ? `${cleanAccountId}\0${cleanPlatform}\0${cleanMessageId}`
     : "";
 }
 
-/**
- * Capture one channel-owned inbound routing envelope by its platform message
- * id. A run id is deliberately not required: production OpenClaw does not
- * expose one on message_received.
- *
- * The current message itself is represented only by a hash. A bounded native
- * reply quotation may be retained because it is precisely the context this
- * handoff exists to preserve. Nothing here writes memory or updates a card.
- */
+function sessionAgentScopeId(sessionKey) {
+  const match = /^(?:sk:)?agent:([^:]+):/.exec(
+    typeof sessionKey === "string" ? sessionKey.trim() : "",
+  );
+  return cleanInboundField(match?.[1], 128);
+}
+
+function boundAccountForAgent(config, agentId, platform, exactAccountId = "") {
+  const bindings = Array.isArray(config?.bindings) ? config.bindings : [];
+  const matches = bindings
+    .filter((binding) =>
+      binding?.agentId === agentId
+      && binding?.match?.channel === platform
+      && typeof binding?.match?.accountId === "string"
+      && binding.match.accountId.trim()
+    )
+    .map((binding) => binding.match.accountId.trim());
+  const unique = [...new Set(matches)];
+  const exact = cleanInboundField(exactAccountId, 128);
+  if (exact) return unique.includes(exact) ? exact : "";
+  return unique.length === 1 ? cleanInboundField(unique[0], 128) : "";
+}
+
+function inboundAccountForRun(runId) {
+  const promptRunId = cleanInboundField(runId);
+  const messageKey = promptRunId
+    ? inboundTurnMessageByRun.get(promptRunId) ?? ""
+    : "";
+  return cleanInboundField(
+    messageKey ? inboundTurnByMessage.get(messageKey)?.accountId : "",
+    128,
+  );
+}
+
+/** Capture one channel-owned inbound envelope before OpenClaw creates a run. */
 export function rememberInboundTurn(event, ctx, now = Date.now()) {
   pruneInboundTurns(now);
-  const sessionKey = cleanInboundField(event?.sessionKey ?? ctx?.sessionKey, 1024);
-  const platform = groupConversationPlatform(sessionKey);
+  const metadata = event?.metadata && typeof event.metadata === "object"
+    ? event.metadata
+    : {};
+  const platform = cleanInboundField(
+    metadata.provider ?? metadata.originatingChannel ?? ctx?.channelId,
+    64,
+  ).toLowerCase();
   const hookChannel = cleanInboundField(ctx?.channelId, 64).toLowerCase();
-  const messageId = cleanInboundField(event?.messageId ?? ctx?.messageId);
-  const senderId = cleanInboundField(event?.senderId ?? ctx?.senderId);
-  const messageKey = inboundTurnMessageKey(sessionKey, platform, messageId);
+  const messageId = cleanInboundField(
+    event?.messageId ?? ctx?.messageId ?? metadata.messageId,
+  );
+  const senderId = cleanInboundField(
+    event?.senderId ?? ctx?.senderId ?? metadata.senderId,
+  );
+  const accountId = cleanInboundField(ctx?.accountId, 128);
+  const sourceTimestamp = Number(event?.timestamp);
+  const sessionKey = cleanInboundField(
+    event?.sessionKey ?? ctx?.sessionKey,
+    1024,
+  );
+  const agentScopeId = sessionAgentScopeId(sessionKey);
+  const messageKey = inboundTurnMessageKey(
+    accountId,
+    platform,
+    messageId,
+  );
   if (
-    !sessionKey
+    platform !== "discord"
+    || !accountId
     || !messageId
     || !senderId
-    || !platform
     || !messageKey
+    || !Number.isFinite(sourceTimestamp)
     || (hookChannel && hookChannel !== platform)
   ) return false;
 
-  const replyToId = cleanInboundField(
-    event?.replyToId ?? ctx?.replyToId ?? event?.replyToIdFull ?? ctx?.replyToIdFull,
-  );
-  const bodyHash = currentSpeakerPromptHash(event?.content);
+  // This digest is immutable source evidence, not a fuzzy prompt match.  Hash
+  // the exact UTF-8 projection, including leading/trailing whitespace.
+  const bodyHash = exactSourceBodyHash(event?.content);
   const candidate = {
     sessionKey,
+    capturedSessionKey: sessionKey,
+    agentScopeId,
     platform,
     messageId,
     senderId,
-    accountId: cleanInboundField(ctx?.accountId, 128),
-    conversationId: cleanInboundField(ctx?.conversationId, 512),
-    originChannelId: trustedDiscordChannelId(
-      sessionKey,
-      ctx?.conversationId,
+    senderName: cleanInboundField(
+      metadata.senderName ?? metadata.senderUsername,
+      128,
     ),
-    replyToId,
-    replyToBody: boundedReplyBody(event?.replyToBody ?? ctx?.replyToBody),
-    replyToSender: cleanInboundField(event?.replyToSender ?? ctx?.replyToSender, 128),
+    accountId,
+    conversationId: cleanInboundField(
+      ctx?.conversationId ?? metadata.originatingTo,
+      512,
+    ),
+    originChannelId: trustedDiscordChannelId(
+      "",
+      ctx?.conversationId ?? metadata.originatingTo,
+    ),
+    guildId: cleanInboundField(metadata.guildId, 128),
+    replyToId: cleanInboundField(
+      event?.replyToId ?? ctx?.replyToId ?? metadata.replyToId,
+    ),
+    replyToBody: boundedReplyBody(
+      event?.replyToBody ?? ctx?.replyToBody ?? metadata.replyToBody,
+    ),
+    replyToSender: cleanInboundField(
+      event?.replyToSender ?? ctx?.replyToSender ?? metadata.replyToSender,
+      128,
+    ),
     bodyHash,
+    sourceTimestamp,
+    dispatchBound: false,
     sessionId: "",
-    invokedBody: "",
     promptRunId: "",
     capturedAt: now,
   };
 
   const existing = inboundTurnByMessage.get(messageKey);
   if (existing && (
-    existing.sessionKey !== candidate.sessionKey
-    || existing.messageId !== candidate.messageId
+    existing.messageId !== candidate.messageId
     || existing.senderId !== candidate.senderId
+    || existing.originChannelId !== candidate.originChannelId
+    || existing.guildId !== candidate.guildId
+    || existing.bodyHash !== candidate.bodyHash
+    || (
+      existing.capturedSessionKey
+      && candidate.capturedSessionKey
+      && existing.capturedSessionKey !== candidate.capturedSessionKey
+    )
     || existing.replyToId !== candidate.replyToId
+    || existing.replyToBody !== candidate.replyToBody
+    || existing.replyToSender !== candidate.replyToSender
+    || existing.sourceTimestamp !== candidate.sourceTimestamp
   )) {
     inboundTurnByMessage.delete(messageKey);
     if (existing.promptRunId) {
@@ -880,60 +1332,266 @@ export function rememberInboundTurn(event, ctx, now = Date.now()) {
     ? {
         ...existing,
         ...candidate,
+        sessionKey: existing.dispatchBound
+          ? existing.sessionKey
+          : candidate.sessionKey,
+        agentScopeId: existing.dispatchBound
+          ? existing.agentScopeId
+          : candidate.agentScopeId,
+        capturedSessionKey: existing.capturedSessionKey
+          || candidate.capturedSessionKey,
+        dispatchBound: Boolean(existing.dispatchBound),
         sessionId: existing.sessionId,
-        invokedBody: existing.invokedBody,
         promptRunId: existing.promptRunId,
+        ...(existing.invokedBody ? { invokedBody: existing.invokedBody } : {}),
       }
     : candidate);
   pruneInboundTurns(now);
   return true;
 }
 
-/** Mark only the exact latest channel event that became an invoked agent turn. */
-export function claimInboundTurnForInvocation(
-  sessionId,
-  sessionKey,
-  senderId,
-  cleanedBody,
+/**
+ * Promote a captured transport envelope to OpenClaw's resolved dispatch
+ * session. This hook still has no model run id, but it bridges a channel-keyed
+ * inbound event to the guild-wide session key without looking at message text.
+ */
+export function rememberInboundDispatch(
+  event,
+  ctx,
+  config,
   now = Date.now(),
 ) {
   pruneInboundTurns(now);
+  const platform = cleanInboundField(
+    event?.channel ?? ctx?.channelId,
+    64,
+  ).toLowerCase();
+  const accountId = cleanInboundField(ctx?.accountId, 128);
+  const sessionKey = cleanInboundField(
+    event?.sessionKey ?? ctx?.sessionKey,
+    1024,
+  );
+  const senderId = cleanInboundField(event?.senderId ?? ctx?.senderId);
+  const timestamp = Number(event?.timestamp);
+  const originChannelId = trustedDiscordChannelId(
+    "",
+    ctx?.conversationId,
+  );
+  const agentScopeId = sessionAgentScopeId(sessionKey);
+  const invokedBody = typeof event?.body === "string"
+    ? event.body.trim()
+    : "";
+  if (
+    platform !== "discord"
+    || !accountId
+    || !sessionKey
+    || !senderId
+    || !Number.isFinite(timestamp)
+    || !originChannelId
+    || !agentScopeId
+    || !invokedBody
+    || boundAccountForAgent(
+      config, agentScopeId, platform, accountId,
+    ) !== accountId
+  ) return false;
+  const candidates = [...inboundTurnByMessage.entries()].filter(([, entry]) => (
+    !entry.promptRunId
+    && !entry.sessionId
+    && !entry.dispatchBound
+    && entry.accountId === accountId
+    && entry.platform === platform
+    && entry.senderId === senderId
+    && entry.sourceTimestamp === timestamp
+    && entry.originChannelId === originChannelId
+  ));
+  if (candidates.length !== 1) return false;
+  const [messageKey, entry] = candidates[0];
+  if (
+    entry.dispatchBound
+    && (
+      entry.sessionKey !== sessionKey
+      || entry.agentScopeId !== agentScopeId
+    )
+  ) return false;
+  inboundTurnByMessage.set(messageKey, {
+    ...entry,
+    sessionKey,
+    agentScopeId,
+    invokedBody,
+    dispatchBound: true,
+  });
+  return true;
+}
+
+/** Return exact native user-row matches; never searches by message text. */
+const DISCORD_EPOCH_MS = 1_420_070_400_000n;
+
+/** Millisecond creation time encoded by a Discord message snowflake. */
+export function discordSnowflakeTimestamp(messageId) {
+  const id = cleanInboundField(messageId);
+  if (!/^\d{16,20}$/.test(id)) return null;
+  try {
+    const timestamp = (BigInt(id) >> 22n) + DISCORD_EPOCH_MS;
+    const numeric = Number(timestamp);
+    return Number.isSafeInteger(numeric) ? numeric : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bind exactly one captured transport envelope to one prompt-build run.
+ * The native Discord envelope and before_dispatch prove account/session/
+ * channel/sender/timestamp. The host's current-turn wrapper must then name the
+ * exact native message and sender. Real session JSONL cannot prove sender
+ * identity and is intentionally outside this trust path.
+ */
+export function bindInboundTurnToInvocation({
+  runId,
+  sessionId,
+  sessionKey,
+  conversationInfo,
+  config,
+  now = Date.now(),
+}) {
+  pruneInboundTurns(now);
+  const promptRunId = cleanInboundField(runId);
   const sid = cleanInboundField(sessionId);
   const sk = cleanInboundField(sessionKey, 1024);
-  const sender = cleanInboundField(senderId);
-  const body = typeof cleanedBody === "string" ? cleanedBody.trim() : "";
-  const bodyHash = currentSpeakerPromptHash(body);
-  if (!sid || !sk || !sender || !bodyHash) return null;
-
-  const matches = [...inboundTurnByMessage.entries()].filter(([, entry]) =>
-    !entry.sessionId
+  const platform = groupConversationPlatform(sk);
+  const agentScopeId = sessionAgentScopeId(sk);
+  if (!promptRunId || !sid || !sk || platform !== "discord" || !agentScopeId) {
+    return null;
+  }
+  const info = conversationInfo && typeof conversationInfo === "object"
+    && !Array.isArray(conversationInfo)
+    ? conversationInfo
+    : null;
+  const sourceMessageId = cleanInboundField(info?.message_id);
+  const promptSender = info?.sender && typeof info.sender === "object"
+    && !Array.isArray(info.sender)
+    ? cleanInboundField(info.sender.id)
+    : cleanInboundField(info?.sender_id);
+  if (!info || !sourceMessageId || !promptSender) return null;
+  const snowflakeTimestamp = discordSnowflakeTimestamp(sourceMessageId);
+  if (snowflakeTimestamp === null) return null;
+  const promptChannelId = trustedDiscordChannelId("", info.chat_id);
+  const promptGuildId = cleanInboundField(info.group_space, 128);
+  const alreadyBoundKey = inboundTurnMessageByRun.get(promptRunId) ?? "";
+  if (alreadyBoundKey) {
+    const bound = inboundTurnByMessage.get(alreadyBoundKey);
+    return bound?.promptRunId === promptRunId
+      && bound.sessionId === sid
+      && bound.sessionKey === sk
+      && bound.agentScopeId === agentScopeId
+      && bound.messageId === sourceMessageId
+      && bound.senderId === promptSender
+      && bound.sourceTimestamp === snowflakeTimestamp
+      && (!promptChannelId || bound.originChannelId === promptChannelId)
+      && (!promptGuildId || bound.guildId === promptGuildId)
+      ? { ...bound }
+      : null;
+  }
+  const candidates = [...inboundTurnByMessage.entries()].filter(([, entry]) => (
+    !entry.promptRunId
+    && !entry.sessionId
+    && entry.dispatchBound
+    && entry.platform === platform
+    && entry.agentScopeId === agentScopeId
     && entry.sessionKey === sk
-    && entry.senderId === sender
-    && entry.bodyHash === bodyHash
-  );
-  // Two simultaneous, text-identical messages are not distinguishable at this
-  // hook because OpenClaw does not expose runId here. Refuse to attach the clean
-  // body rather than borrowing it from the wrong run; prompt-time identity can
-  // still use each run's independently captured ids.
-  if (matches.length !== 1) return null;
-  const [messageKey, entry] = matches[0];
-  const claimed = { ...entry, sessionId: sid, invokedBody: body };
+    && entry.messageId === sourceMessageId
+    && entry.senderId === promptSender
+    && entry.sourceTimestamp === snowflakeTimestamp
+    && (!promptChannelId || entry.originChannelId === promptChannelId)
+    && (!promptGuildId || entry.guildId === promptGuildId)
+    && boundAccountForAgent(
+      config, agentScopeId, platform, entry.accountId,
+    ) === entry.accountId
+  ));
+  if (candidates.length !== 1) return null;
+  const [messageKey, entry] = candidates[0];
+  const claimed = {
+    ...entry,
+    sessionId: sid,
+    promptRunId,
+  };
   inboundTurnByMessage.set(messageKey, claimed);
+  inboundTurnMessageByRun.set(promptRunId, messageKey);
   return { ...claimed };
 }
 
 /**
+ * Add the current user exactly once, replacing its own just-flushed JSONL row
+ * when native sender and source timestamp prove that row is the same message.
+ * Text alone is never used to delete history because users can repeat words.
+ */
+export function mergeCurrentUserMessage(messages, currentBody, inboundTurn) {
+  const source = Array.isArray(messages) ? messages : [];
+  const body = typeof currentBody === "string" ? currentBody : "";
+  if (!body) return [...source];
+  const senderId = cleanInboundField(inboundTurn?.senderId);
+  const sourceTimestamp = Number(inboundTurn?.sourceTimestamp);
+  const hasNativeIdentity = Boolean(
+    senderId && Number.isFinite(sourceTimestamp),
+  );
+  let currentIndex = -1;
+  if (hasNativeIdentity) {
+    for (let index = source.length - 1; index >= 0; index -= 1) {
+      const message = source[index];
+      if (message?.role !== "user") continue;
+      const messageSender = cleanInboundField(message?.senderId);
+      const messageTimestamp = Number(message?.timestamp);
+      if (
+        messageSender === senderId
+        && Number.isFinite(messageTimestamp)
+        && messageTimestamp === sourceTimestamp
+        && speakerMessageText(message.content) === body
+      ) {
+        currentIndex = index;
+        break;
+      }
+    }
+  }
+  const current = {
+    ...(currentIndex >= 0 ? source[currentIndex] : {}),
+    role: "user",
+    content: [{ type: "text", text: body }],
+    ...(senderId ? { senderId } : {}),
+    ...(inboundTurn?.senderName
+      ? { senderName: inboundTurn.senderName }
+      : {}),
+    ...(Number.isFinite(sourceTimestamp) ? { timestamp: sourceTimestamp } : {}),
+    [CURRENT_NATIVE_TURN]: {
+      messageId: cleanInboundField(inboundTurn?.messageId),
+      senderId,
+      sourceTimestamp,
+      bodyHash: exactSourceBodyHash(body),
+    },
+  };
+  if (currentIndex < 0) return [...source, current];
+  // The model and cloud both define the active user as the trailing user row.
+  // A just-flushed native row can appear before concurrently flushed history;
+  // replace it by identity and move that exact replacement to the tail. The
+  // in-memory marker then binds both prepare and agent_end to this same row.
+  return [
+    ...source.slice(0, currentIndex),
+    ...source.slice(currentIndex + 1),
+    current,
+  ];
+}
+
+/**
  * Resolve the trusted inbound snapshot only when it agrees with this exact
- * prompt build. The platform message id locates the hook snapshot; exact
- * session, channel, and sender agreement then prevents an older or forged turn
- * from donating its sender or reply edge. A successful lookup is bound to this
- * prompt run so no second run can reuse it.
+ * prompt build. The per-turn run id locates the hook snapshot; exact session,
+ * agent, account, channel and sender agreement then prevents an older or
+ * forged turn from donating its sender or reply edge.
  */
 export function findInboundTurnForPrompt(
   runId,
   sessionId,
   sessionKey,
   provenance,
+  expectedAccountId,
   now = Date.now(),
 ) {
   pruneInboundTurns(now);
@@ -942,44 +1600,37 @@ export function findInboundTurnForPrompt(
   const sid = cleanInboundField(sessionId);
   const sk = cleanInboundField(sessionKey, 1024);
   const platform = groupConversationPlatform(sk);
+  const agentScopeId = sessionAgentScopeId(sk);
+  const accountId = cleanInboundField(expectedAccountId, 128);
   const sourceMessageId = cleanInboundField(provenance?.source_message_id);
-  const messageKey = inboundTurnMessageKey(sk, platform, sourceMessageId);
+  const messageKey = inboundTurnMessageByRun.get(promptRunId) ?? "";
   const entry = messageKey ? inboundTurnByMessage.get(messageKey) : null;
   if (!entry) return null;
   const provenanceActorId = cleanInboundField(provenance?.sender_actor_id, 512);
   if (
     entry.platform !== platform
+    || !agentScopeId
+    || !accountId
+    || entry.accountId !== accountId
+    || entry.agentScopeId !== agentScopeId
+    || entry.promptRunId !== promptRunId
     || entry.sessionKey !== sk
-    || !sourceMessageId
-    || entry.messageId !== sourceMessageId
+    || (sourceMessageId && entry.messageId !== sourceMessageId)
     || (entry.sessionId && entry.sessionId !== sid)
   ) return null;
 
   const expectedActorId = `actor:${entry.platform}:${entry.senderId}`;
-  if (!provenanceActorId || provenanceActorId !== expectedActorId) return null;
+  if (provenanceActorId && provenanceActorId !== expectedActorId) return null;
   const promptChannelId = cleanInboundField(provenance?.origin_channel_id);
   if (
     entry.platform === "discord"
     && (
       !entry.originChannelId
-      || !promptChannelId
-      || entry.originChannelId !== promptChannelId
+      || (promptChannelId && entry.originChannelId !== promptChannelId)
     )
   ) return null;
-  if (
-    promptRunId
-    && (
-      (entry.promptRunId && entry.promptRunId !== promptRunId)
-      || (
-        inboundTurnMessageByRun.has(promptRunId)
-        && inboundTurnMessageByRun.get(promptRunId) !== messageKey
-      )
-    )
-  ) return null;
-  if (promptRunId && !entry.promptRunId) {
-    entry.promptRunId = promptRunId;
-    inboundTurnMessageByRun.set(promptRunId, messageKey);
-  }
+  if (inboundTurnMessageByRun.get(promptRunId) !== messageKey) return null;
+  entry.sessionId = sid;
   const promptReplyId = cleanInboundField(provenance?.reply_target_message_id);
   const replyConflict = Boolean(
     entry.replyToId
@@ -990,8 +1641,46 @@ export function findInboundTurnForPrompt(
     ...entry,
     actorId: expectedActorId,
     originChannelId: entry.originChannelId || promptChannelId,
-    replyToId: replyConflict ? "" : (entry.replyToId || promptReplyId),
+    // A channel-owned native reply edge outranks the untrusted prompt wrapper.
+    replyToId: entry.replyToId || promptReplyId,
     replyConflict,
+  };
+}
+
+export function buildSourceAttestation(
+  inbound,
+  canonicalBody,
+  replyTargetMessageId = "",
+) {
+  const body = typeof canonicalBody === "string" ? canonicalBody : "";
+  const canonicalBodySha = exactSourceBodyHash(body);
+  const replyId = cleanInboundField(replyTargetMessageId);
+  if (
+    !inbound
+    || inbound.platform !== "discord"
+    || !inbound.agentScopeId
+    || !inbound.accountId
+    || !inbound.messageId
+    || !inbound.originChannelId
+    || !inbound.guildId
+    || !inbound.senderId
+    || !inbound.bodyHash
+    || !inbound.promptRunId
+    || !canonicalBodySha
+  ) return null;
+  return {
+    version: 1,
+    agent_scope_id: inbound.agentScopeId,
+    platform: inbound.platform,
+    account_id: inbound.accountId,
+    message_id: inbound.messageId,
+    channel_id: inbound.originChannelId,
+    guild_id: inbound.guildId,
+    author_id: inbound.senderId,
+    transport_body_sha256: inbound.bodyHash,
+    canonical_body_sha256: canonicalBodySha,
+    projection_version: "openclaw-current-user-v1",
+    reply_target_message_id: replyId,
   };
 }
 
@@ -1026,12 +1715,26 @@ function hookSessionIdentity(ctx) {
   return ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
 }
 
+function hookInvocationRunId(ctx, sessionId = hookSessionIdentity(ctx)) {
+  const runId = cleanInboundField(ctx?.runId);
+  if (runId) return runId;
+  // Direct/non-group transports historically have one in-flight turn per
+  // session and may not expose a run id. Group routes fail closed because
+  // same-session concurrency is normal there.
+  return groupConversationSession(ctx?.sessionKey) ? "" : sessionId;
+}
+
 /** Record or clear one exact pre-prompt identity handoff. */
 export function rememberCurrentContextSpeaker(snapshot) {
   const sessionId = typeof snapshot?.sessionId === "string"
     ? snapshot.sessionId.trim()
     : "";
   if (!sessionId) return false;
+  const runId = typeof snapshot?.runId === "string"
+    ? snapshot.runId.trim()
+    : "";
+  const invocationKey = invocationStateKey(sessionId, runId);
+  if (!invocationKey) return false;
   const sessionKey = typeof snapshot?.sessionKey === "string"
     ? snapshot.sessionKey.trim()
     : "";
@@ -1045,7 +1748,7 @@ export function rememberCurrentContextSpeaker(snapshot) {
     return false;
   }
   if (!speaker) {
-    const existing = currentContextSpeakerBySession.get(sessionId);
+    const existing = currentContextSpeakerByInvocation.get(invocationKey);
     // A repeated assembly pass can operate on the already-projected message
     // shape. Retain the earlier trusted handoff only for the same exact turn;
     // before_agent_reply clears any prior turn before its first assembly.
@@ -1053,10 +1756,10 @@ export function rememberCurrentContextSpeaker(snapshot) {
       existing?.sessionKey === sessionKey
       && existing.promptHash === promptHash
     ) return false;
-    currentContextSpeakerBySession.delete(sessionId);
+    currentContextSpeakerByInvocation.delete(invocationKey);
     return false;
   }
-  const existing = currentContextSpeakerBySession.get(sessionId);
+  const existing = currentContextSpeakerByInvocation.get(invocationKey);
   if (
     existing?.sessionKey === sessionKey
     && existing.promptHash === promptHash
@@ -1066,7 +1769,7 @@ export function rememberCurrentContextSpeaker(snapshot) {
       || existing.speaker.platform !== speaker.platform
     )
   ) {
-    currentContextSpeakerBySession.set(sessionId, {
+    currentContextSpeakerByInvocation.set(invocationKey, {
       ...existing,
       conflict: true,
       capturedAt: Date.now(),
@@ -1075,8 +1778,8 @@ export function rememberCurrentContextSpeaker(snapshot) {
   }
   // Refresh insertion order as well as value so a busy active session is not
   // the first entry evicted merely because it was initially seen long ago.
-  currentContextSpeakerBySession.delete(sessionId);
-  currentContextSpeakerBySession.set(sessionId, {
+  currentContextSpeakerByInvocation.delete(invocationKey);
+  currentContextSpeakerByInvocation.set(invocationKey, {
     sessionKey,
     promptHash,
     speaker: { ...speaker },
@@ -1084,32 +1787,40 @@ export function rememberCurrentContextSpeaker(snapshot) {
     conflict: false,
     capturedAt: Date.now(),
   });
-  while (currentContextSpeakerBySession.size > MAX_CURRENT_CONTEXT_SPEAKERS) {
-    currentContextSpeakerBySession.delete(
-      currentContextSpeakerBySession.keys().next().value,
+  while (currentContextSpeakerByInvocation.size > MAX_CURRENT_CONTEXT_SPEAKERS) {
+    currentContextSpeakerByInvocation.delete(
+      currentContextSpeakerByInvocation.keys().next().value,
     );
   }
   return true;
 }
 
 /** Retrieve only the speaker bound to this session key and exact current body. */
-export function findCurrentContextSpeaker(sessionId, sessionKey, currentBody) {
-  const entry = currentContextSpeakerBySession.get(sessionId);
+export function findCurrentContextSpeaker(
+  sessionId,
+  runId,
+  sessionKey,
+  currentBody,
+) {
+  const invocationKey = invocationStateKey(sessionId, runId);
+  if (!invocationKey) return null;
+  const entry = currentContextSpeakerByInvocation.get(invocationKey);
   if (!entry) return null;
   if (
     Date.now() - entry.capturedAt > CURRENT_CONTEXT_SPEAKER_TTL_MS
     || entry.sessionKey !== sessionKey
     || entry.promptHash !== currentSpeakerPromptHash(currentBody)
   ) {
-    currentContextSpeakerBySession.delete(sessionId);
+    currentContextSpeakerByInvocation.delete(invocationKey);
     return null;
   }
   if (entry.conflict) return null;
   return { ...entry.speaker, proofSource: entry.source };
 }
 
-export function forgetCurrentContextSpeaker(sessionId) {
-  currentContextSpeakerBySession.delete(sessionId);
+export function forgetCurrentContextSpeaker(sessionId, runId) {
+  const invocationKey = invocationStateKey(sessionId, runId);
+  if (invocationKey) currentContextSpeakerByInvocation.delete(invocationKey);
 }
 
 /** Channel-owned identity available before an invoked agent turn begins. */
@@ -1152,10 +1863,10 @@ export function currentInvokedGroupSpeaker(ctx) {
 
 export function trustedSpeakerConflict(left, right) {
   if (!left || !right) return false;
-  if (left.senderId !== right.senderId || left.platform !== right.platform) {
-    return true;
-  }
-  return Boolean(left.name && right.name && left.name !== right.name);
+  // Display names and nicknames can legitimately change between hooks. Actor
+  // identity is the immutable platform member id; prefer the inbound hook's
+  // current label without treating a cosmetic rename as an identity conflict.
+  return left.senderId !== right.senderId || left.platform !== right.platform;
 }
 
 /**
@@ -1383,7 +2094,7 @@ async function discordGetMessage(channel, messageId, token, log) {
       method: "GET",
       headers: {
         Authorization: `Bot ${token}`,
-        "User-Agent": "VirtualContextOpenClawPlugin/5.4.8",
+        "User-Agent": "VirtualContextOpenClawPlugin/5.5.0",
       },
       signal: AbortSignal.timeout(5000),
     },
@@ -1466,7 +2177,15 @@ async function fetchDiscordReplyTarget(
       log?.warn?.(
         `[vc:reply] target was edited after the current reply; quotation withheld`,
       );
-      return null;
+      return {
+        messageId: target,
+        body: "",
+        senderId,
+        senderName,
+        actorId: senderId ? `actor:discord:${senderId}` : "",
+        source: "discord-rest-edited-target",
+        status: "unavailable",
+      };
     }
     return {
       messageId: target,
@@ -1495,12 +2214,19 @@ export async function resolveVerifiedReplyTarget(
   log,
 ) {
   if (!inbound) return null;
-  const targetId = cleanInboundField(inbound.replyToId);
-  if (!targetId) return null;
+  const nativeTargetId = cleanInboundField(inbound.replyToId);
   const promptTargetId = cleanInboundField(provenance?.reply_target_message_id);
-  if (promptTargetId && promptTargetId !== targetId) return null;
+  const targetId = nativeTargetId || promptTargetId;
+  if (!targetId) return null;
+  if (nativeTargetId && promptTargetId && promptTargetId !== nativeTargetId) {
+    log?.warn?.(
+      `[vc:reply] ignored untrusted prompt target conflict; verifying native event`,
+    );
+  }
 
-  const hookBody = boundedReplyBody(inbound.replyToBody);
+  const hookBody = nativeTargetId
+    ? boundedReplyBody(inbound.replyToBody)
+    : "";
   if (hookBody) {
     return {
       messageId: targetId,
@@ -1512,6 +2238,11 @@ export async function resolveVerifiedReplyTarget(
     };
   }
   if (inbound.platform !== "discord") return null;
+  // Some shipped OpenClaw Discord mappers omit native reply fields. In that
+  // shape the host wrapper may only nominate a target: fetching the current
+  // Discord message must independently prove its author, channel, reference
+  // type, and message_reference.message_id before any quotation or edge is
+  // accepted. Prompt metadata alone never becomes durable provenance.
   return fetchDiscordReplyTarget(
     inbound.originChannelId || provenance?.origin_channel_id,
     inbound.messageId,
@@ -1526,7 +2257,9 @@ export async function resolveVerifiedReplyTarget(
 /** Model-facing, explicitly-linked quotation for the current native reply. */
 export function buildCurrentReplyTargetBoundary(target, unresolvedMessageId = "") {
   if (!target?.messageId || !target?.body) {
-    const messageId = cleanInboundField(unresolvedMessageId);
+    const messageId = cleanInboundField(
+      target?.messageId ?? unresolvedMessageId,
+    );
     if (!messageId) return "";
     return [
       '<current-reply-target source="channel-bound-native-reply" authority="attribution-only" status="unavailable">',
@@ -1607,6 +2340,9 @@ function readFullSessionJSONL(sessionKey, sessionId, log) {
     }
 
     log?.info?.(`[vc] JSONL parsed — ${messages.length} messages, ${skipped} non-message entries skipped`);
+    // Keep native row metadata intact until the caller has replaced (rather
+    // than duplicated) the exact current row. Speaker labels are applied only
+    // after that identity-preserving merge.
     return messages.length > 0 ? messages : null;
   } catch (err) {
     log?.error?.(`[vc] JSONL read failed: ${err}`);
@@ -2410,6 +3146,514 @@ export async function vcGet(baseUrl, path, vcKey, convId, timeoutMs = 8000, log 
   return res.json();
 }
 
+async function requireExactSourceCapability({
+  baseUrl, vcKey, convId, log, timeoutMs = 5000,
+}) {
+  const result = await vcGet(
+    baseUrl,
+    "/api/v1/context/capabilities",
+    vcKey,
+    convId,
+    timeoutMs,
+    log,
+  );
+  if (
+    Number(result?.exact_source_admission_version)
+    !== EXACT_SOURCE_ADMISSION_VERSION
+  ) {
+    throw new Error(
+      `cloud exact-source capability mismatch: expected=` +
+      `${EXACT_SOURCE_ADMISSION_VERSION} actual=` +
+      `${result?.exact_source_admission_version ?? "missing"}`,
+    );
+  }
+  return result;
+}
+
+const COMPLETION_OUTBOX_VERSION = 2;
+const COMPLETION_OUTBOX_DRAIN_LIMIT = 32;
+// Age is the authoritative retry budget.  At the five-minute capped backoff a
+// seven-day record can legitimately need just over 2,000 attempts; a small
+// attempt cap silently shortened the advertised durability window to an hour.
+const COMPLETION_OUTBOX_MAX_ATTEMPTS = 4096;
+const COMPLETION_OUTBOX_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const COMPLETION_OUTBOX_BASE_BACKOFF_MS = 250;
+const COMPLETION_OUTBOX_MAX_BACKOFF_MS = 5 * 60_000;
+const completionOutboxWorkers = new Map();
+
+function completionDeploymentScope(baseUrl, vcKey) {
+  let normalizedBaseUrl;
+  try {
+    const parsed = new URL(baseUrl);
+    parsed.hash = "";
+    parsed.search = "";
+    normalizedBaseUrl = parsed.toString().replace(/\/$/, "");
+  } catch {
+    normalizedBaseUrl = String(baseUrl ?? "").trim().replace(/\/$/, "");
+  }
+  const vcKeyHash = createHash("sha256")
+    .update(String(vcKey ?? ""), "utf8")
+    .digest("hex");
+  const deploymentId = createHash("sha256")
+    .update(`${normalizedBaseUrl}\0${vcKeyHash}`, "utf8")
+    .digest("hex");
+  return {
+    deployment_id: deploymentId,
+    base_url: normalizedBaseUrl,
+    vc_key_hash: vcKeyHash,
+  };
+}
+
+function completionOutboxDirectory(deploymentId) {
+  return join(
+    homedir(), ".openclaw", "state", "virtual-context", "completion-outbox",
+    deploymentId,
+  );
+}
+
+function fsyncDirectory(directory) {
+  const descriptor = openSync(directory, "r");
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+function durableAtomicWrite(finalPath, serialized) {
+  const directory = dirname(finalPath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporaryPath = join(
+    directory,
+    `.${finalPath.split("/").at(-1)}.${Date.now()}.` +
+      `${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  let descriptor;
+  try {
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(descriptor, serialized, { encoding: "utf8" });
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, finalPath);
+    fsyncDirectory(directory);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch {}
+    }
+    try { unlinkSync(temporaryPath); } catch {}
+    throw error;
+  }
+}
+
+function durableUnlink(path) {
+  try {
+    unlinkSync(path);
+    fsyncDirectory(dirname(path));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function completionOutboxFingerprint(convId, payload) {
+  return createHash("sha256")
+    .update(JSON.stringify({ conv_id: convId, payload }), "utf8")
+    .digest("hex");
+}
+
+function completionOutboxPath(deploymentId, key) {
+  return join(completionOutboxDirectory(deploymentId), `${key}.json`);
+}
+
+function completionDeadLetterDirectory(deploymentId) {
+  return join(
+    homedir(), ".openclaw", "state", "virtual-context",
+    "completion-dead-letter", deploymentId,
+  );
+}
+
+function deadLetterCompletion(record, rejection) {
+  const directory = completionDeadLetterDirectory(record.deployment_id);
+  const finalPath = join(directory, `${record.key}.json`);
+  const deadLetter = {
+    ...record,
+    dead_lettered_at: new Date().toISOString(),
+    rejection: {
+      status: rejection?.status ?? "permanent_conflict",
+      reason: rejection?.reason ?? "unspecified",
+      retryable: Boolean(rejection?.retryable),
+      correlation_id: rejection?.correlation_id ?? "",
+    },
+  };
+  durableAtomicWrite(finalPath, `${JSON.stringify(deadLetter)}\n`);
+  // The dead-letter rename is fsynced before the live outbox copy is removed;
+  // a crash can cause a harmless duplicate, never loss of both records.
+  durableUnlink(completionOutboxPath(record.deployment_id, record.key));
+}
+
+function deadLetterConflictingCompletion(existing, conflicting) {
+  const directory = completionDeadLetterDirectory(existing.deployment_id);
+  const finalPath = join(
+    directory,
+    `${existing.key}-${conflicting.fingerprint}.json`,
+  );
+  durableAtomicWrite(finalPath, `${JSON.stringify({
+    ...conflicting,
+    dead_lettered_at: new Date().toISOString(),
+    rejection: {
+      status: "source_fingerprint_conflict",
+      reason: "same source message produced a different exact completion",
+      retryable: false,
+    },
+    existing_record: existing,
+  })}\n`);
+}
+
+function queueExactCompletion(convId, payload, { baseUrl, vcKey }) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  if (!validatedExactSourceAdmission(payload?.exact_source_admission)) {
+    throw new Error(
+      "exact completion outbox requires a valid prepare generation token",
+    );
+  }
+  const sourceMessageId = cleanInboundField(
+    payload?.source_attestation?.message_id ?? payload?.source_message_id,
+  );
+  if (!sourceMessageId) {
+    throw new Error("exact completion outbox requires source_message_id");
+  }
+  const key = createHash("sha256")
+    .update(
+      `${deployment.deployment_id}\0${convId}\0${sourceMessageId}`,
+      "utf8",
+    )
+    .digest("hex");
+  const fingerprint = completionOutboxFingerprint(convId, payload);
+  const enqueueOrdinal = readCompletionOutbox({
+    baseUrl,
+    vcKey,
+    log: null,
+  }).reduce(
+    (maximum, queued) => Number.isSafeInteger(queued?.enqueue_ordinal)
+      ? Math.max(maximum, queued.enqueue_ordinal)
+      : maximum,
+    0,
+  ) + 1;
+  const record = {
+    version: COMPLETION_OUTBOX_VERSION,
+    ...deployment,
+    key,
+    conv_id: convId,
+    source_message_id: sourceMessageId,
+    fingerprint,
+    enqueued_at: new Date().toISOString(),
+    // Date has only millisecond precision. Persist an insertion ordinal so a
+    // later record with a numerically smaller Discord snowflake cannot become
+    // the conversation head after a retry/restart in the same millisecond.
+    enqueue_ordinal: enqueueOrdinal,
+    payload,
+  };
+  const directory = completionOutboxDirectory(deployment.deployment_id);
+  const finalPath = completionOutboxPath(deployment.deployment_id, key);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (existsSync(finalPath)) {
+    const existing = JSON.parse(readFileSync(finalPath, "utf8"));
+    if (
+      existing?.version !== COMPLETION_OUTBOX_VERSION
+      || existing?.key !== key
+      || existing?.fingerprint !== fingerprint
+    ) {
+      deadLetterConflictingCompletion(existing, record);
+      throw new Error(
+        `completion outbox conflict for source_message_id=${sourceMessageId}`,
+      );
+    }
+    return existing;
+  }
+  durableAtomicWrite(finalPath, `${JSON.stringify(record)}\n`);
+  return record;
+}
+
+function readCompletionOutbox({ baseUrl, vcKey, log }) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  const directory = completionOutboxDirectory(deployment.deployment_id);
+  if (!existsSync(directory)) return [];
+  const records = [];
+  for (const filename of readdirSync(directory).sort()) {
+    if (!/^[a-f0-9]{64}\.json$/.test(filename)) continue;
+    try {
+      const record = JSON.parse(readFileSync(join(directory, filename), "utf8"));
+      const expected = completionOutboxFingerprint(
+        record?.conv_id,
+        record?.payload,
+      );
+      if (
+        record?.version === 1
+        && record?.deployment_id === deployment.deployment_id
+        && record?.base_url === deployment.base_url
+        && record?.vc_key_hash === deployment.vc_key_hash
+        && record?.key === filename.slice(0, -5)
+        && record?.fingerprint === expected
+      ) {
+        // V1 did not carry a monotonic prepare generation. Retrying it after
+        // delete/recreate could place the old answer in the successor
+        // conversation. Preserve the full record in dead-letter storage and
+        // remove only the live retry copy.
+        deadLetterCompletion(record, {
+          status: "protocol_generation_fence_missing",
+          reason: "outbox record predates exact-source generation fencing",
+          retryable: false,
+        });
+        log?.error?.(
+          `[vc:outbox] DEAD-LETTER legacy unfenced source=` +
+          `${record.source_message_id ?? "?"}`,
+        );
+        continue;
+      }
+      if (
+        record?.version !== COMPLETION_OUTBOX_VERSION
+        || record?.deployment_id !== deployment.deployment_id
+        || record?.base_url !== deployment.base_url
+        || record?.vc_key_hash !== deployment.vc_key_hash
+        || record?.key !== filename.slice(0, -5)
+        || record?.fingerprint !== expected
+        || !record?.source_message_id
+        || !validatedExactSourceAdmission(
+          record?.payload?.exact_source_admission,
+        )
+        || (
+          record?.enqueue_ordinal !== undefined
+          && (
+            !Number.isSafeInteger(record.enqueue_ordinal)
+            || record.enqueue_ordinal < 0
+          )
+        )
+      ) {
+        throw new Error("schema or fingerprint mismatch");
+      }
+      records.push(record);
+    } catch (error) {
+      log?.error?.(
+        `[vc:outbox] QUARANTINED unreadable record=${filename}: ${error}`,
+      );
+    }
+  }
+  return records.sort((left, right) => {
+    const leftHasOrdinal = Number.isSafeInteger(left.enqueue_ordinal);
+    const rightHasOrdinal = Number.isSafeInteger(right.enqueue_ordinal);
+    if (leftHasOrdinal && rightHasOrdinal) {
+      if (left.enqueue_ordinal !== right.enqueue_ordinal) {
+        return left.enqueue_ordinal - right.enqueue_ordinal;
+      }
+    } else if (leftHasOrdinal !== rightHasOrdinal) {
+      // Version-1 records predate the ordinal. They were necessarily already
+      // durable when an ordinal-bearing record was appended, so keep every
+      // legacy record ahead of every new record during the rolling upgrade.
+      return leftHasOrdinal ? 1 : -1;
+    }
+    const leftTime = Date.parse(left.enqueued_at ?? "") || 0;
+    const rightTime = Date.parse(right.enqueued_at ?? "") || 0;
+    if (leftTime !== rightTime) return leftTime - rightTime;
+    const leftSource = /^\d+$/.test(String(left.source_message_id ?? ""))
+      ? BigInt(left.source_message_id)
+      : 0n;
+    const rightSource = /^\d+$/.test(String(right.source_message_id ?? ""))
+      ? BigInt(right.source_message_id)
+      : 0n;
+    if (leftSource !== rightSource) return leftSource < rightSource ? -1 : 1;
+    return String(left.key).localeCompare(String(right.key));
+  });
+}
+
+function retainCompletionFailure(record, error, log) {
+  const now = Date.now();
+  const enqueuedAt = Date.parse(record?.enqueued_at ?? "") || now;
+  const attempts = Math.max(0, Number(record?.attempts) || 0) + 1;
+  if (
+    attempts >= COMPLETION_OUTBOX_MAX_ATTEMPTS
+    || now - enqueuedAt >= COMPLETION_OUTBOX_MAX_AGE_MS
+  ) {
+    deadLetterCompletion(record, {
+      status: "retry_budget_exhausted",
+      reason: String(error?.message ?? error ?? "delivery failed").slice(0, 500),
+      retryable: true,
+    });
+    log?.error?.(
+      `[vc:outbox] DEAD-LETTER source=${record.source_message_id} ` +
+      `after attempts=${attempts}`,
+    );
+    return { dead_lettered: true };
+  }
+  const exponential = Math.min(
+    COMPLETION_OUTBOX_MAX_BACKOFF_MS,
+    COMPLETION_OUTBOX_BASE_BACKOFF_MS * (2 ** Math.min(attempts - 1, 16)),
+  );
+  const jitter = Math.floor(exponential * (Math.random() * 0.2));
+  const retained = {
+    ...record,
+    attempts,
+    last_attempt_at: new Date(now).toISOString(),
+    next_attempt_at: new Date(now + exponential + jitter).toISOString(),
+    last_error: String(error?.message ?? error ?? "delivery failed").slice(0, 500),
+  };
+  durableAtomicWrite(
+    completionOutboxPath(record.deployment_id, record.key),
+    `${JSON.stringify(retained)}\n`,
+  );
+  return retained;
+}
+
+function completionOrderingKey(record) {
+  return String(record?.conv_id ?? "");
+}
+
+function completionOutboxHeads(records) {
+  const heads = new Map();
+  for (const record of records) {
+    const orderingKey = completionOrderingKey(record);
+    if (!heads.has(orderingKey)) heads.set(orderingKey, record);
+  }
+  return [...heads.values()];
+}
+
+async function deliverCompletionOutboxRecord(
+  record, { baseUrl, vcKey, log, debug },
+) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  if (
+    record?.deployment_id !== deployment.deployment_id
+    || record?.base_url !== deployment.base_url
+    || record?.vc_key_hash !== deployment.vc_key_hash
+  ) {
+    throw new Error("completion outbox deployment scope mismatch");
+  }
+  if (!validatedExactSourceAdmission(record?.payload?.exact_source_admission)) {
+    throw new Error("completion outbox generation token is invalid");
+  }
+  // Re-probe at delivery time, including after process restarts and retries.
+  // This prevents an exact record from falling into an older cloud's legacy
+  // ingest path after a rollback.
+  await requireExactSourceCapability({
+    baseUrl,
+    vcKey,
+    convId: record.conv_id,
+    log,
+  });
+  const ingestResult = await vcPost(
+    baseUrl,
+    EXACT_SOURCE_INGEST_PATH,
+    vcKey,
+    record.conv_id,
+    record.payload,
+    15000,
+    log,
+    { correlationId: `completion:${record.source_message_id}` },
+  );
+  if (ingestResult?.status === "permanent_conflict") {
+    deadLetterCompletion(record, ingestResult);
+    log?.error?.(
+      `[vc:outbox] DEAD-LETTER source=${record.source_message_id} ` +
+      `reason=${ingestResult?.reason ?? "unspecified"} ` +
+      `correlation=${ingestResult?.correlation_id ?? "?"}`,
+    );
+    return { ...ingestResult, dead_lettered: true };
+  }
+  if (
+    !["accepted", "idempotent"].includes(ingestResult?.status)
+    || ingestResult?.canonical_persisted !== true
+    || cleanInboundField(ingestResult?.source_message_id)
+      !== record.source_message_id
+  ) {
+    throw new Error(
+      `cloud rejected exact completion status=${ingestResult?.status ?? "?"} ` +
+      `reason=${ingestResult?.reason ?? "unspecified"} ` +
+      `response_source=${ingestResult?.source_message_id ?? "?"}`,
+    );
+  }
+  durableUnlink(completionOutboxPath(record.deployment_id, record.key));
+  log?.info?.(
+    `[vc:outbox] acknowledged source=${record.source_message_id} ` +
+    `conversation=${ingestResult.conversation_id ?? record.conv_id} ` +
+    `status=${ingestResult.status}`,
+  );
+  if (debug) {
+    log?.info?.(
+      `[vc:debug] outbox ingest response: ` +
+      `${JSON.stringify(ingestResult).slice(0, 500)}`,
+    );
+  }
+  return ingestResult;
+}
+
+function scheduleCompletionOutboxDrain(options) {
+  const deployment = completionDeploymentScope(options.baseUrl, options.vcKey);
+  let worker = completionOutboxWorkers.get(deployment.deployment_id);
+  if (!worker) {
+    worker = { promise: null, timer: null, options };
+    completionOutboxWorkers.set(deployment.deployment_id, worker);
+  }
+  worker.options = options;
+  if (worker.promise) return worker.promise;
+  if (worker.timer) {
+    // A newly queued record for another conversation may be immediately due
+    // even while one failed conversation is sleeping in backoff. Wake the
+    // worker now; the per-conversation head selection below still preserves
+    // FIFO for the sleeping conversation.
+    clearTimeout(worker.timer);
+    worker.timer = null;
+  }
+
+  const run = async () => {
+    const blockedOrderingKeys = new Set();
+    let processed = 0;
+    while (processed < COMPLETION_OUTBOX_DRAIN_LIMIT) {
+      const now = Date.now();
+      const dueHeads = completionOutboxHeads(
+        readCompletionOutbox(worker.options),
+      ).filter((record) => {
+        const next = Date.parse(record.next_attempt_at ?? "") || 0;
+        return next <= now
+          && !blockedOrderingKeys.has(completionOrderingKey(record));
+      });
+      if (dueHeads.length === 0) break;
+      for (const record of dueHeads) {
+        if (processed >= COMPLETION_OUTBOX_DRAIN_LIMIT) break;
+        processed += 1;
+        try {
+          await deliverCompletionOutboxRecord(record, worker.options);
+        } catch (error) {
+          retainCompletionFailure(record, error, worker.options.log);
+          blockedOrderingKeys.add(completionOrderingKey(record));
+          worker.options.log?.warn?.(
+            `[vc:outbox] retained source=${record.source_message_id} ` +
+            `after delivery failure: ${error}`,
+          );
+        }
+      }
+      await Promise.resolve();
+    }
+  };
+
+  worker.promise = run().finally(() => {
+    worker.promise = null;
+    const remaining = readCompletionOutbox(worker.options);
+    if (remaining.length === 0) {
+      completionOutboxWorkers.delete(deployment.deployment_id);
+      return;
+    }
+    const now = Date.now();
+    // Only the oldest record in each conversation can become runnable. A
+    // newer record without next_attempt_at must not create a 10ms spin loop
+    // behind an older record that is correctly waiting in backoff.
+    const nextAt = Math.min(...completionOutboxHeads(remaining).map(
+      (record) => Date.parse(record.next_attempt_at ?? "") || now,
+    ));
+    const delay = Math.max(10, nextAt - now);
+    worker.timer = setTimeout(() => {
+      worker.timer = null;
+      void scheduleCompletionOutboxDrain(worker.options);
+    }, delay);
+    worker.timer.unref?.();
+  });
+  return worker.promise;
+}
+
 // Per-conversation tool-definition cache. The server binds a request-local
 // speaker enum into eligible tool schemas from the conversation's current
 // roster snapshot; hardcoded definitions remain the fail-open baseline
@@ -2500,6 +3744,168 @@ export default {
       );
     }
 
+    // OpenClaw 2026.7.1 calls agent_end before llm_output.  Buffer only the
+    // successful run identity here; never retain or inspect agent_end's shared
+    // messages snapshot for Discord exact admission.  The run-keyed llm_output
+    // hook completes the pair a moment later.
+    const exactGroupEndByInvocation = new Map();
+    const EXACT_GROUP_OUTPUT_WAIT_MS = 30_000;
+
+    function releaseExactGroupInvocation(sessionId, runId) {
+      const key = invocationStateKey(sessionId, runId);
+      const state = key ? exactGroupEndByInvocation.get(key) : null;
+      if (state?.timer) clearTimeout(state.timer);
+      if (key) exactGroupEndByInvocation.delete(key);
+      forgetPendingUserTurn(sessionId, runId);
+      forgetExactSourceCapability(sessionId, runId);
+      forgetExactSourceRefusal(sessionId, runId);
+      forgetModelOutput(sessionId, runId);
+      forgetInboundTurn(runId);
+    }
+
+    function rememberExactGroupEnd(sessionId, runId, sessionKey) {
+      const key = invocationStateKey(sessionId, runId);
+      if (!key || exactGroupEndByInvocation.has(key)) return false;
+      const timer = setTimeout(() => {
+        if (!exactGroupEndByInvocation.has(key)) return;
+        log.error?.(
+          `[vc:identity] ingest SKIPPED — matching llm_output timed out; ` +
+          `session=${sessionId} run=${runId}`,
+        );
+        releaseExactGroupInvocation(sessionId, runId);
+      }, EXACT_GROUP_OUTPUT_WAIT_MS);
+      timer.unref?.();
+      exactGroupEndByInvocation.set(key, {
+        sessionId,
+        runId,
+        sessionKey,
+        timer,
+        finalizing: false,
+      });
+      return true;
+    }
+
+    async function finalizeExactGroupInvocation(sessionId, runId) {
+      const key = invocationStateKey(sessionId, runId);
+      const state = key ? exactGroupEndByInvocation.get(key) : null;
+      const output = findModelOutput(sessionId, runId);
+      if (!state || state.finalizing || !output) return false;
+      const assistantMessage = output.deliveredText || output.assistantText || "";
+      if (!assistantMessage) return false;
+      state.finalizing = true;
+
+      const pendingTurn = findPendingUserTurn(sessionId, runId);
+      const userMessage = pendingTurn?.text;
+      const userProvenance = pendingTurn?.provenance ?? {};
+      const attestation = userProvenance?.source_attestation;
+      const exactSourceAdmission = validatedExactSourceAdmission(
+        pendingTurn?.exactSourceAdmission,
+      );
+      const handoffFailures = [];
+      if (typeof userMessage !== "string" || userMessage.length === 0) {
+        handoffFailures.push("user_message");
+      }
+      const exactAdmission = requiresExactDiscordAdmission(
+        state.sessionKey,
+        sessionId,
+      );
+      if (exactAdmission && (!attestation || typeof attestation !== "object")) {
+        handoffFailures.push("source_attestation");
+      } else if (exactAdmission) {
+        if (!exactSourceAdmission) {
+          handoffFailures.push("exact_source_admission");
+        }
+        if (attestation.platform !== "discord") handoffFailures.push("platform");
+        if (
+          cleanInboundField(attestation.message_id)
+          !== cleanInboundField(userProvenance.source_message_id)
+        ) handoffFailures.push("message_id");
+        if (
+          cleanInboundField(attestation.channel_id)
+          !== cleanInboundField(userProvenance.origin_channel_id)
+        ) handoffFailures.push("channel_id");
+        if (
+          cleanInboundField(userProvenance.sender_actor_id)
+          !== `actor:discord:${cleanInboundField(attestation.author_id)}`
+        ) handoffFailures.push("author_id");
+        if (!cleanInboundField(attestation.guild_id)) {
+          handoffFailures.push("guild_id");
+        }
+        if (
+          exactSourceBodyHash(userMessage)
+          !== cleanInboundField(attestation.canonical_body_sha256)
+        ) handoffFailures.push("canonical_body_sha256");
+      }
+      if (handoffFailures.length > 0) {
+        log.error?.(
+          `[vc:identity] ingest SKIPPED — exact pending handoff unavailable; ` +
+          `session=${sessionId} run=${runId} ` +
+          `missing_or_conflicting=${handoffFailures.join(",")}`,
+        );
+        releaseExactGroupInvocation(sessionId, runId);
+        return false;
+      }
+
+      const identity = selectConvId(state.sessionKey, sessionId);
+      const ingestPayload = {
+        assistant_message: assistantMessage,
+        user_message: userMessage,
+        ...userProvenance,
+        ...(exactAdmission ? {
+          exact_source_admission: exactSourceAdmission,
+        } : {}),
+      };
+      if (!exactAdmission) {
+        try {
+          const ingestResult = await vcPost(
+            baseUrl,
+            "/api/v1/context/ingest",
+            vcKey,
+            identity.convId,
+            ingestPayload,
+            15000,
+            log,
+          );
+          log.info?.(
+            `[vc] run-bound group ingest OK — ` +
+            `conversation=${ingestResult.conversation_id ?? "?"} ` +
+            `status=${ingestResult.status ?? "?"}`,
+          );
+        } catch (error) {
+          log.error?.(
+            `[vc] run-bound group ingest failed session=${sessionId} ` +
+            `run=${runId}: ${error}`,
+          );
+        } finally {
+          releaseExactGroupInvocation(sessionId, runId);
+        }
+        return true;
+      }
+      let queued;
+      try {
+        queued = queueExactCompletion(identity.convId, ingestPayload, {
+          baseUrl,
+          vcKey,
+        });
+      } catch (error) {
+        log.error?.(
+          `[vc:outbox] CRITICAL queue failure session=${sessionId} ` +
+          `run=${runId}: ${error}`,
+        );
+        releaseExactGroupInvocation(sessionId, runId);
+        return false;
+      }
+
+      // The durable outbox owns retries once the in-memory identity handoff is
+      // released. No later hook can reuse either half of this pair.
+      releaseExactGroupInvocation(sessionId, runId);
+      // All exact deliveries, including the first attempt, pass through one
+      // ordering worker. Direct delivery here could overtake an older retained
+      // turn for the same conversation.
+      await scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
+      return true;
+    }
+
     // Conversation identity mode. Defensive even with schema validation: anything
     // other than the literal "stable" behaves as "session" (exact legacy behavior)
     // and unexpected values log a config warning once here at register.
@@ -2540,12 +3946,18 @@ export default {
       return identity;
     }
 
+    function requiresExactDiscordAdmission(sessionKey, sessionId) {
+      return requiresExactDiscordAttestation(sessionKey)
+        && selectConvId(sessionKey, sessionId).isStable;
+    }
+
     if (!vcKey) {
       log.warn?.("[vc] no vcKey configured — plugin disabled");
       return;
     }
 
-    log.info?.(`[vc] register() v5.4.8 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    log.info?.(`[vc] register() v5.5.0 — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    void scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
 
     // ── Config compatibility checks ──
     const defaults = ocConfig.agents?.defaults ?? {};
@@ -2693,14 +4105,43 @@ export default {
     // Capture the channel-owned per-turn ids before the agent pipeline removes
     // them. This hook is deliberately synchronous and stores only a bounded
     // routing snapshot; it performs no network call, memory write, or card
-    // update. The snapshot is unusable unless a later prompt build presents the
-    // same platform message id, session key, channel, and sender actor.
+    // update. The shipped hook has no run id despite its public type.
     api.on("message_received", (event, ctx) => {
       const remembered = rememberInboundTurn(event, ctx);
+      if (!remembered) {
+        const diagnostic = inboundTurnAdmissionDiagnostic(event, ctx);
+        if (diagnostic) {
+          const reason = diagnostic.missing.length
+            ? `missing=${diagnostic.missing.join(",")}`
+            : "conflicting-or-duplicate-routing-envelope";
+          warnIdentityOnce(
+            log,
+            `inbound:${diagnostic.sessionKey}:${reason}`,
+            `[vc:identity] source attestation disabled for inbound Discord ` +
+            `message=${diagnostic.messageId || "?"} ${reason}`,
+          );
+        }
+      }
       if (debug && remembered) {
         log.info?.(
           `[vc:identity] captured inbound routing ` +
-          `message=${event?.messageId ?? ctx?.messageId ?? "?"}`,
+          `message=${event?.metadata?.messageId ?? "?"}`,
+        );
+      }
+    });
+
+    // Bridge the raw inbound envelope to the resolved (possibly guild-wide)
+    // dispatch session. The host exposes the same native account, channel,
+    // sender and timestamp here, still before a model run exists. Exact tuple
+    // agreement is mandatory and ambiguity leaves the envelope unusable.
+    api.on("before_dispatch", (event, ctx) => {
+      const remembered = rememberInboundDispatch(event, ctx, ocConfig);
+      if (!remembered && groupConversationSession(event?.sessionKey)) {
+        warnIdentityOnce(
+          log,
+          `dispatch:${event?.sessionKey}:${event?.timestamp ?? "?"}`,
+          `[vc:identity] source attestation disabled: native dispatch ` +
+          `envelope was missing or ambiguous`,
         );
       }
     });
@@ -2725,20 +4166,16 @@ export default {
       // local ingest tracker.
       if (isExcludedTrigger(ctx)) return;
       const sessionId = hookSessionIdentity(ctx);
+      const turnRunId = hookInvocationRunId(ctx, sessionId);
       // This hook fires once at the start of each invoked turn, before context
       // engine assembly. Clear any aborted/unfinished prior-turn handoff.
-      forgetCurrentContextSpeaker(sessionId);
+      forgetCurrentContextSpeaker(sessionId, turnRunId);
       const promptText = (event?.cleanedBody ?? "").trim();
       const invokedSpeaker = currentInvokedGroupSpeaker(ctx);
       if (invokedSpeaker && promptText) {
-        claimInboundTurnForInvocation(
-          sessionId,
-          ctx?.sessionKey,
-          invokedSpeaker.senderId,
-          promptText,
-        );
         rememberCurrentContextSpeaker({
           sessionId,
+          runId: turnRunId,
           sessionKey: ctx?.sessionKey,
           prompt: promptText,
           speaker: invokedSpeaker,
@@ -2752,6 +4189,39 @@ export default {
       // DIAG: log every invocation so we know who's calling
       log.info?.(`[vc:DIAG-bar] entry trigger=${ctx?.trigger ?? "?"} sessionKey=${ctx?.sessionKey ?? "?"} sessionId=${ctx?.sessionId ?? "?"} channel=${ctx?.channel ?? ctx?.messageProvider ?? "?"} channelId=${ctx?.channelId ?? "?"} promptHead=${JSON.stringify(promptText.slice(0,60))}`);
       if (!/^VC[A-Z]/i.test(promptText)) {
+        if (providerFilter) {
+          const currentModel = resolveSessionModel(ctx?.sessionKey ?? "");
+          if (currentModel && !providerFilter.has(currentModel)) return;
+        }
+        if (requiresExactDiscordAdmission(
+          ctx?.sessionKey ?? "",
+          sessionId,
+        )) {
+          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
+          try {
+            await requireExactSourceCapability({
+              baseUrl,
+              vcKey,
+              convId: identity.convId,
+              log: debug ? log : null,
+            });
+            rememberExactSourceCapability(sessionId, turnRunId);
+          } catch (error) {
+            forgetExactSourceCapability(sessionId, turnRunId);
+            forgetPendingUserTurn(sessionId, turnRunId);
+            forgetInboundTurn(turnRunId);
+            log.error?.(
+              `[vc:identity] exact source preflight failed; refusing model ` +
+              `turn session=${sessionId} run=${turnRunId || "?"}: ${error}`,
+            );
+            return {
+              handled: true,
+              reply: (await loadSuppressionMarker(log))({
+                text: "Virtual Context exact-source admission is temporarily unavailable. Please retry this message shortly.",
+              }),
+            };
+          }
+        }
         log.info?.(`[vc:DIAG-bar] not a VC command, falling through`);
         return;
       }
@@ -2761,7 +4231,7 @@ export default {
       // VCREINGEST is local-only — no cloud round-trip
       if (/^VCREINGEST\b/i.test(promptText)) {
         resetSessionIngest(sessionId);
-        vcCommandSessions.add(sessionId);
+        markVcCommandInvocation(sessionId, turnRunId);
         log.info?.(`[vc] before_agent_reply: VCREINGEST — reset ingest tracker for session=${sessionId}`);
         return {
           handled: true,
@@ -2786,7 +4256,7 @@ export default {
           debug ? log : null
         );
         if (prepareResult?.vc_command) {
-          vcCommandSessions.add(sessionId);
+          markVcCommandInvocation(sessionId, turnRunId);
           const replyText = renderVcCommandMessage(prepareResult);
           log.info?.(`[vc:DIAG-bar] returning handled reply: vc_command=${prepareResult.vc_command} replyTextHead=${JSON.stringify(replyText.slice(0,80))}`);
           log.info?.(`[vc] before_agent_reply: VC command ${prepareResult.vc_command} — handled directly (skipping LLM)`);
@@ -2802,6 +4272,10 @@ export default {
     });
 
     api.on("before_prompt_build", async (event, ctx) => {
+      // A prior completion may have reached the cloud even when this process
+      // timed out before receiving its acknowledgement. Drain is idempotent by
+      // immutable source message id and never blocks this prompt path.
+      void scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
       const sessionId = hookSessionIdentity(ctx);
       const sessionKey = ctx?.sessionKey ?? "";
       if (isExcludedTrigger(ctx)) {
@@ -2813,27 +4287,151 @@ export default {
       const explicitRunId = typeof ctx?.runId === "string" && ctx.runId.trim()
         ? ctx.runId.trim()
         : null;
+      const stateRunId = explicitRunId
+        ?? (groupConversationSession(sessionKey) ? null : sessionId);
+      const exactDiscordAdmission = requiresExactDiscordAdmission(
+        sessionKey,
+        sessionId,
+      );
       const correlationId = explicitRunId ?? sessionId;
       const promptText = (event.prompt ?? "").trim();
+      const stickyExactRefusal = exactDiscordAdmission
+        ? findExactSourceRefusal(sessionId, stateRunId)
+        : null;
+      if (stickyExactRefusal) {
+        log.warn?.(
+          `[vc:identity] reusing run-scoped exact-source refusal ` +
+          `session=${sessionId} run=${stateRunId || "?"}`,
+        );
+        return stickyExactRefusal;
+      }
+      // VC commands must always reach prepare. Ordinary turns on an excluded
+      // provider must return before exact-capability preflight: exclusion
+      // means this plugin is off for the turn, not that the model call should
+      // be refused because VC is unavailable.
+      const isVcCommand = /^VC[A-Z]/i.test(promptText);
+      if (providerFilter && !isVcCommand) {
+        const currentModel = resolveSessionModel(sessionKey);
+        if (currentModel && !providerFilter.has(currentModel)) {
+          const { transition, lastPassed } = noteFilterResult(
+            filterPassState,
+            sessionKey,
+            currentModel,
+            false,
+          );
+          if (transition) {
+            (log.warn ?? log.info)?.(
+              `[vc] WARN provider filter now SKIPPING session=${sessionId} (${currentModel}) — ` +
+              `was passing as ${lastPassed}. VC prepare/ingest are OFF for this session until ` +
+              `its model returns to the allowlist (check model fallback / provider auth).`
+            );
+          } else {
+            log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
+          }
+          return;
+        }
+        if (currentModel) {
+          noteFilterResult(filterPassState, sessionKey, currentModel, true);
+        }
+        if (!currentModel && debug) {
+          log.info?.(
+            `[vc:debug] model not yet in session store, proceeding optimistically`,
+          );
+        }
+      }
+      if (isVcCommand) {
+        log.info?.(`[vc] VC command detected in prompt — bypassing provider filter`);
+      }
       const continuityTurnKey = preparedContinuityTurnKey(event.prompt);
+      const promptConversationInfo = parseCurrentConversationInfo(event.prompt);
       const promptProvenance = currentTurnProvenance(event.prompt, sessionKey);
+      const agentScopeId = sessionAgentScopeId(sessionKey);
+      const platform = groupConversationPlatform(sessionKey);
+      const boundInboundTurn = bindInboundTurnToInvocation({
+        runId: explicitRunId,
+        sessionId,
+        sessionKey,
+        conversationInfo: promptConversationInfo,
+        config: ocConfig,
+      });
+      const sourceAccountId = boundAccountForAgent(
+        ocConfig,
+        agentScopeId,
+        platform,
+        ctx?.accountId
+          ?? boundInboundTurn?.accountId
+          ?? inboundAccountForRun(explicitRunId),
+      );
+      if (platform === "discord" && !sourceAccountId) {
+        warnIdentityOnce(
+          log,
+          `binding:${sessionKey || "?"}`,
+          `[vc:identity] source attestation disabled: Discord account ` +
+          `binding is missing or ambiguous for agent=${agentScopeId || "?"}`,
+        );
+      }
       const inboundTurn = findInboundTurnForPrompt(
         explicitRunId,
         sessionId,
         sessionKey,
         promptProvenance,
+        sourceAccountId,
       );
-      // Prefer the body captured at the invoked-turn hook. It is bound to this
-      // exact inbound message and excludes host-generated reaction notices that can
-      // be prepended later during prompt assembly. The legacy wrapper-aware
-      // derivation remains the fallback when no exact routing snapshot joins.
+      if (
+        exactDiscordAdmission
+        && (!inboundTurn || !inboundTurn.invokedBody)
+      ) {
+        warnIdentityOnce(
+          log,
+          `body:${sessionKey}:${explicitRunId || "?"}`,
+          `[vc:identity] prepare skipped: exact dispatch-bound Discord body ` +
+          `was unavailable`,
+        );
+        forgetInboundTurn(explicitRunId);
+        const refusal = {
+          prependContext: buildCodexPreparedContext(
+            "Virtual Context could not prove the exact current Discord turn. " +
+            "Tell the user to retry shortly; do not answer the substantive request.",
+          ).text,
+        };
+        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+        return refusal;
+      }
+      const promptCurrentBody = currentTurnForIngest(event.prompt);
+      const promptBodyWithoutLocalMedia = promptCurrentBody.replace(
+        /^(?:\[media attached:[^\]\r\n]*\]\r?\n)+/,
+        "",
+      );
+      if (
+        exactDiscordAdmission
+        && promptCurrentBody
+        && promptBodyWithoutLocalMedia !== inboundTurn.invokedBody
+      ) {
+        warnIdentityOnce(
+          log,
+          `body-conflict:${sessionKey}:${explicitRunId || "?"}`,
+          `[vc:identity] prepare skipped: dispatch-bound Discord body ` +
+          `conflicted with the current prompt projection`,
+        );
+        forgetInboundTurn(explicitRunId);
+        const refusal = {
+          prependContext: buildCodexPreparedContext(
+            "Virtual Context found conflicting current-turn identity evidence. " +
+            "Tell the user to retry shortly; do not answer the substantive request.",
+          ).text,
+        };
+        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+        return refusal;
+      }
+      // The routing snapshot proves who/where/which message. The invocation
+      // dispatch hook contributes OpenClaw's body-for-agent projection. Group
+      // Discord never falls back to shared prompt text; that text can contain
+      // another member's historical body.
       const currentBody = inboundTurn?.invokedBody
-        || currentTurnForIngest(event.prompt);
+        || promptCurrentBody;
       const inboundSpeaker = inboundTurn
         ? {
-            name: typeof promptProvenance.sender_name === "string"
-              ? promptProvenance.sender_name.trim()
-              : "",
+            name: inboundTurn.senderName,
             actorId: inboundTurn.actorId,
             senderId: inboundTurn.senderId,
             platform: inboundTurn.platform,
@@ -2842,6 +4440,7 @@ export default {
         : null;
       const contextEngineSpeaker = findCurrentContextSpeaker(
         sessionId,
+        explicitRunId,
         sessionKey,
         currentBody,
       );
@@ -2884,13 +4483,17 @@ export default {
         log,
       );
       const trustedPromptProvenance = { ...promptProvenance };
+      if (inboundTurn?.messageId) {
+        trustedPromptProvenance.source_message_id = inboundTurn.messageId;
+        // A prompt wrapper can only nominate a reply. The native Discord
+        // lookup below must verify it before it becomes durable provenance.
+        delete trustedPromptProvenance.reply_target_message_id;
+      }
       if (inboundTurn?.originChannelId) {
         trustedPromptProvenance.origin_channel_id = inboundTurn.originChannelId;
       }
-      if (inboundTurn?.replyConflict) {
+      if (inboundTurn) {
         delete trustedPromptProvenance.reply_target_message_id;
-      } else if (inboundTurn?.replyToId) {
-        trustedPromptProvenance.reply_target_message_id = inboundTurn.replyToId;
       }
       const turnProvenance = {
         ...(currentGroupSpeaker
@@ -2945,7 +4548,7 @@ export default {
       const currentSpeakerBoundary = buildCurrentSpeakerBoundary(currentGroupSpeaker);
       const currentReplyTargetBoundary = buildCurrentReplyTargetBoundary(
         verifiedReplyTarget,
-        inboundTurn?.replyConflict ? "" : inboundTurn?.replyToId,
+        "",
       );
       const currentAttributionBoundary = [
         currentSpeakerBoundary,
@@ -2972,6 +4575,41 @@ export default {
         });
       };
 
+      if (
+        exactDiscordAdmission
+        && !hasExactSourceCapability(sessionId, stateRunId)
+      ) {
+        const identity = selectConvId(sessionKey, sessionId);
+        try {
+          await requireExactSourceCapability({
+            baseUrl,
+            vcKey,
+            convId: identity.convId,
+            log: debug ? log : null,
+          });
+          rememberExactSourceCapability(sessionId, stateRunId);
+        } catch (error) {
+          forgetPendingUserTurn(sessionId, stateRunId);
+          forgetExactSourceCapability(sessionId, stateRunId);
+          forgetInboundTurn(explicitRunId);
+          log.error?.(
+            `[vc:identity] prepare refused: exact source capability was not ` +
+            `proven session=${sessionId} run=${stateRunId || "?"}: ${error}`,
+          );
+          const unavailable = buildCodexPreparedContext(
+            "Virtual Context exact-source admission is temporarily unavailable. " +
+            "Tell the user to retry shortly; do not answer the substantive request.",
+          ).text;
+          const refusal = {
+            prependContext: speakerGuardOnlyResult
+              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
+              : unavailable,
+          };
+          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+          return refusal;
+        }
+      }
+
       // This must run before VC prepare and on EVERY prompt-build pass. The
       // Codex Discord harness rebuilds the prompt after the first hook result;
       // if only the first pass is guarded, the second pass replaces it with VC
@@ -2994,12 +4632,30 @@ export default {
         // via a VC command, the provider filter, or an empty answer — would be
         // sent as this turn's user half.
         const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
-        if (!pendingUserTurn.has(sessionId) || pendingUserTurnMessage.get(sessionId) !== replyOnlyId) {
+        const pendingReplyOnly = findPendingUserTurn(
+          sessionId,
+          stateRunId,
+        );
+        if (!pendingReplyOnly || pendingReplyOnly.messageId !== replyOnlyId) {
           const replyOnlyBody = currentBody;
           if (replyOnlyBody) {
-            pendingUserTurn.set(sessionId, replyOnlyBody);
-            pendingUserTurnProvenance.set(sessionId, turnProvenance);
-            pendingUserTurnMessage.set(sessionId, replyOnlyId);
+            const replyOnlyAttestation = exactDiscordAdmission
+              ? buildSourceAttestation(
+                  inboundTurn,
+                  replyOnlyBody,
+                  turnProvenance.reply_target_message_id,
+                )
+              : null;
+            rememberPendingUserTurn(sessionId, stateRunId, {
+              text: replyOnlyBody,
+              provenance: {
+                ...turnProvenance,
+                ...(replyOnlyAttestation
+                  ? { source_attestation: replyOnlyAttestation }
+                  : {}),
+              },
+              messageId: replyOnlyId,
+            });
           }
         }
         log.warn?.(
@@ -3018,7 +4674,7 @@ export default {
       if (/^VCREINGEST$/i.test(promptText)) {
         resetSessionIngest(sessionId);
         log.info?.(`[vc] VCREINGEST — reset ingest tracker for session=${sessionId}`);
-        vcCommandSessions.add(sessionId);
+        markVcCommandInvocation(sessionId, stateRunId);
         return { prependContext: `Respond with ONLY the following text, exactly as shown. No commentary, no additions:\n\nSession ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
       }
 
@@ -3058,41 +4714,6 @@ export default {
         );
       }
 
-      // VC commands (VCSTATUS, VCLABEL, etc.) must always reach prepare regardless
-      // of provider filter. The provider filter uses the *configured* model from
-      // sessions.json, but model fallback happens later — so the filter may see
-      // "anthropic/claude-opus-4-6" even when the actual runtime model is GPT-5.4.
-      const isVcCommand = /^VC[A-Z]/i.test(promptText);
-
-      // Check provider filter against the session's current model
-      if (providerFilter && !isVcCommand) {
-        const currentModel = resolveSessionModel(sessionKey);
-        if (currentModel && !providerFilter.has(currentModel)) {
-          const { transition, lastPassed } = noteFilterResult(filterPassState, sessionKey, currentModel, false);
-          if (transition) {
-            (log.warn ?? log.info)?.(
-              `[vc] WARN provider filter now SKIPPING session=${sessionId} (${currentModel}) — ` +
-              `was passing as ${lastPassed}. VC prepare/ingest are OFF for this session until ` +
-              `its model returns to the allowlist (check model fallback / provider auth).`
-            );
-          } else {
-            log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
-          }
-          return;
-        }
-        if (currentModel) {
-          noteFilterResult(filterPassState, sessionKey, currentModel, true);
-        }
-        // If model unknown (new session), proceed — better to prepare and not need it
-        // than to skip and send an unenriched payload
-        if (!currentModel && debug) {
-          log.info?.(`[vc:debug] model not yet in session store, proceeding optimistically`);
-        }
-      }
-      if (isVcCommand) {
-        log.info?.(`[vc] VC command detected in prompt — bypassing provider filter`);
-      }
-
       const contextRuntime = ctx?.agentRuntime?.id ?? ctx?.runtime?.id;
       const runtime = typeof contextRuntime === "string" && contextRuntime.trim()
         ? {
@@ -3126,13 +4747,11 @@ export default {
       // If nothing survives, the prompt contained no admissible user content.
       // Never fall back to the raw host wrapper: that is the pollution path
       // this boundary exists to close.
-      let messagesWithCurrentTurn = [...event.messages];
-      if (currentBody) {
-        messagesWithCurrentTurn.push({
-          role: "user",
-          content: [{ type: "text", text: currentBody }],
-        });
-      }
+      let messagesWithCurrentTurn = mergeCurrentUserMessage(
+        event.messages,
+        currentBody,
+        inboundTurn,
+      );
 
       // ── Initial JSONL ingest ──
       // On the first prepare call for a session not yet in the tracker,
@@ -3142,15 +4761,19 @@ export default {
       let isInitialIngest = false;
       if (!isSessionIngested(sessionId)) {
         const fullMessages = readFullSessionJSONL(sessionKey, sessionId, log);
-        if (fullMessages && fullMessages.length > messagesWithCurrentTurn.length) {
-          log.info?.(`[vc] initial ingest — sending ${fullMessages.length} JSONL messages (was ${messagesWithCurrentTurn.length} windowed)`);
-          messagesWithCurrentTurn = [...fullMessages];
-          if (currentBody) {
-            messagesWithCurrentTurn.push({
-              role: "user",
-              content: [{ type: "text", text: currentBody }],
-            });
-          }
+        const fullMessagesWithCurrent = fullMessages
+          ? mergeCurrentUserMessage(fullMessages, currentBody, inboundTurn)
+          : null;
+        if (
+          fullMessagesWithCurrent
+          && fullMessagesWithCurrent.length > messagesWithCurrentTurn.length
+        ) {
+          log.info?.(`[vc] initial ingest — sending ${fullMessagesWithCurrent.length} JSONL messages (was ${messagesWithCurrentTurn.length} windowed)`);
+          messagesWithCurrentTurn = labelFullSessionSpeakers(
+            fullMessagesWithCurrent,
+            sessionKey,
+            log,
+          );
           isInitialIngest = true;
         } else {
           // JSONL not available or smaller than windowed — mark as ingested anyway
@@ -3169,31 +4792,71 @@ export default {
 
       // Carry this turn's user text to agent_end so the pair can be rebuilt if
       // the cloud loses the half it recorded here.
-      for (let i = messagesWithCurrentTurn.length - 1; i >= 0; i--) {
-        const m = messagesWithCurrentTurn[i];
-        if (m?.role !== "user") continue;
-        const text = speakerMessageText(m.content);
-        if (text) {
-          pendingUserTurn.set(sessionId, text);
-          pendingUserTurnProvenance.set(sessionId, turnProvenance);
-          pendingUserTurnMessage.set(sessionId, parseConversationInfo(event.prompt)?.message_id ?? "");
+      let admittedTurnProvenance = turnProvenance;
+      if (exactDiscordAdmission) {
+        const exactCurrentRows = messagesWithCurrentTurn.filter((message) => {
+          const marker = message?.[CURRENT_NATIVE_TURN];
+          return message?.role === "user"
+            && marker?.messageId === inboundTurn?.messageId
+            && marker?.senderId === inboundTurn?.senderId
+            && marker?.sourceTimestamp === inboundTurn?.sourceTimestamp
+            && marker?.bodyHash === exactSourceBodyHash(currentBody);
+        });
+        if (currentBody && exactCurrentRows.length === 1) {
+          const text = speakerMessageText(exactCurrentRows[0].content);
+          const sourceAttestation = text
+            ? buildSourceAttestation(
+                inboundTurn,
+                text,
+                turnProvenance.reply_target_message_id,
+              )
+            : null;
+          if (sourceAttestation) {
+            admittedTurnProvenance = {
+              ...turnProvenance,
+              source_attestation: sourceAttestation,
+            };
+            rememberPendingUserTurn(sessionId, stateRunId, {
+              text,
+              provenance: admittedTurnProvenance,
+              messageId: sourceAttestation.message_id,
+            });
+          }
+        } else if (inboundTurn) {
+          log.warn?.(
+            `[vc:identity] exact current row unavailable; refusing completion ` +
+            `handoff session=${sessionId} run=${stateRunId || "?"} ` +
+            `matches=${exactCurrentRows.length}`,
+          );
         }
-        break;
+      } else if (currentBody) {
+        // Legacy DM, group-DM, Telegram, and explicit session-mode routes still
+        // need the request-owned user half at ingest.  Carry it by run/session
+        // instead of asking whichever cloud worker receives completion to
+        // guess from mutable process history.
+        rememberPendingUserTurn(sessionId, stateRunId, {
+          text: currentBody,
+          provenance: turnProvenance,
+          messageId: cleanInboundField(turnProvenance.source_message_id),
+        });
       }
 
       const prepareBody = {
         messages: messagesWithCurrentTurn,
         model: ctx?.model ?? undefined,
-        ...(currentBody ? turnProvenance : {}),
+        ...(currentBody ? admittedTurnProvenance : {}),
       };
       // Conversation identity: stable scopes get the sk: id; the predecessor
       // forward-link hint goes on prepare ONLY, and only when the selected
       // identity is stable (it then necessarily differs from the session UUID).
       const identity = selectConvId(sessionKey, sessionId);
       const predecessor = identity.isStable && identity.convId !== sessionId ? sessionId : undefined;
+      const preparePath = prepareBody.source_attestation
+        ? EXACT_SOURCE_PREPARE_PATH
+        : "/api/v1/context/prepare";
 
       if (debug) {
-        log.info?.(`[vc:debug] prepare request — url=${baseUrl}/api/v1/context/prepare vcconv=${identity.convId}${predecessor ? ` predecessor=${predecessor}` : ""} messages=${prepareBody.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
+        log.info?.(`[vc:debug] prepare request — url=${baseUrl}${preparePath} vcconv=${identity.convId}${predecessor ? ` predecessor=${predecessor}` : ""} messages=${prepareBody.messages?.length ?? 0} model=${prepareBody.model ?? "?"}`);
         log.info?.(`[vc:debug] prepare first message: ${JSON.stringify(prepareBody.messages?.[0])?.slice(0, 300)}`);
         log.info?.(`[vc:debug] prepare last message: ${JSON.stringify(prepareBody.messages?.[prepareBody.messages.length - 1])?.slice(0, 300)}`);
       }
@@ -3203,7 +4866,7 @@ export default {
         const prepareTimeoutMs = selectPrepareTimeout({ isVcCommand, isInitialIngest });
         prepareResult = await vcPost(
           baseUrl,
-          "/api/v1/context/prepare",
+          preparePath,
           vcKey,
           identity.convId,
           prepareBody,
@@ -3215,6 +4878,29 @@ export default {
           },
         );
       } catch (err) {
+        if (prepareBody.source_attestation) {
+          forgetPendingUserTurn(sessionId, stateRunId);
+          forgetExactSourceCapability(sessionId, stateRunId);
+          forgetInboundTurn(explicitRunId);
+          log.error?.(
+            `[vc:identity] exact prepare failed closed: ${err} ` +
+            `session=${sessionId} run=${stateRunId || "?"}`,
+          );
+          if (debug) {
+            log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
+          }
+          const unavailable = buildCodexPreparedContext(
+            "Virtual Context exact-source admission is temporarily unavailable. " +
+            "Tell the user to retry shortly; do not answer the substantive request.",
+          ).text;
+          const refusal = {
+            prependContext: speakerGuardOnlyResult
+              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
+              : unavailable,
+          };
+          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+          return refusal;
+        }
         log.error?.(
           `[vc] prepare failed: ${err} — ` +
           (speakerGuardOnlyResult
@@ -3224,6 +4910,66 @@ export default {
         if (debug) log.error?.(`[vc:debug] prepare error detail: ${err.stack ?? err}`);
         rememberSpeakerGuardFallback();
         return speakerGuardOnlyResult ?? undefined;
+      }
+
+      const meta = prepareResult.metadata ?? {};
+      const exactSourceAdmission = prepareBody.source_attestation
+        ? validatedExactSourceAdmission(meta.exact_source_admission)
+        : null;
+      if (
+        prepareBody.source_attestation
+        && (
+          Number(meta.exact_source_admission_version)
+            !== EXACT_SOURCE_ADMISSION_VERSION
+          || !exactSourceAdmission
+        )
+      ) {
+        forgetPendingUserTurn(sessionId, stateRunId);
+        forgetExactSourceCapability(sessionId, stateRunId);
+        forgetInboundTurn(explicitRunId);
+        log.error?.(
+          `[vc:identity] prepare response refused: exact source capability ` +
+          `mismatch expected=${EXACT_SOURCE_ADMISSION_VERSION} ` +
+          `actual=${meta.exact_source_admission_version ?? "missing"} ` +
+          `generation_token=${exactSourceAdmission ? "valid" : "invalid"}`,
+        );
+        const unavailable = buildCodexPreparedContext(
+          "Virtual Context exact-source admission is temporarily unavailable. " +
+          "Tell the user to retry shortly; do not answer the substantive request.",
+        ).text;
+        const refusal = {
+          prependContext: speakerGuardOnlyResult
+            ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
+            : unavailable,
+        };
+        rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+        return refusal;
+      }
+      if (exactSourceAdmission) {
+        const pending = findPendingUserTurn(sessionId, stateRunId);
+        if (!pending) {
+          forgetExactSourceCapability(sessionId, stateRunId);
+          forgetInboundTurn(explicitRunId);
+          log.error?.(
+            `[vc:identity] prepare response refused: pending exact user turn ` +
+            `was unavailable session=${sessionId} run=${stateRunId || "?"}`,
+          );
+          const unavailable = buildCodexPreparedContext(
+            "Virtual Context exact-source admission is temporarily unavailable. " +
+            "Tell the user to retry shortly; do not answer the substantive request.",
+          ).text;
+          const refusal = {
+            prependContext: speakerGuardOnlyResult
+              ? `${speakerGuardOnlyResult.prependContext}\n\n${unavailable}`
+              : unavailable,
+          };
+          rememberExactSourceRefusal(sessionId, stateRunId, refusal);
+          return refusal;
+        }
+        rememberPendingUserTurn(sessionId, stateRunId, {
+          ...pending,
+          exactSourceAdmission,
+        });
       }
 
       // Mark session as ingested after successful initial ingest
@@ -3241,17 +4987,16 @@ export default {
         // Render cloud's command response via the message/error/bracket fallback chain.
         const cmdMessage = renderVcCommandMessage(prepareResult);
         log.info?.(`[vc] VC command: ${prepareResult.vc_command} — injecting via prependContext, skipping LLM`);
-        vcCommandSessions.add(sessionId);
+        markVcCommandInvocation(sessionId, stateRunId);
 
         return { prependContext: `Respond with ONLY the following text, exactly as shown. No commentary, no additions:\n\n${cmdMessage}` };
       }
 
       // Clear command flag for normal turns
-      vcCommandSessions.delete(sessionId);
+      consumeVcCommandInvocation(sessionId, stateRunId);
 
       const body = prepareResult.body;
       const passthrough = prepareResult.is_passthrough ?? false;
-      const meta = prepareResult.metadata ?? {};
 
       log.info?.(
         `[vc] prepare OK — conversation=${prepareResult.conversation_id ?? "?"} ` +
@@ -3485,8 +5230,28 @@ export default {
       captureModelBoundary("llm_input", event, ctx);
     });
 
-    api.on("llm_output", (event, ctx) => {
+    api.on("llm_output", async (event, ctx) => {
       captureModelBoundary("llm_output", event, ctx);
+      const sessionId = cleanInboundField(event?.sessionId)
+        || hookSessionIdentity(ctx);
+      const eventRunId = cleanInboundField(event?.runId);
+      const contextRunId = cleanInboundField(ctx?.runId);
+      if (eventRunId && contextRunId && eventRunId !== contextRunId) {
+        log.error?.(
+          `[vc:identity] llm_output ignored — conflicting run ids ` +
+          `event=${eventRunId} context=${contextRunId}`,
+        );
+        return;
+      }
+      const exactRunId = eventRunId || contextRunId;
+      if (!rememberModelOutput(sessionId, exactRunId, event)) {
+        log.warn?.(
+          `[vc:identity] llm_output carried no reply text; ` +
+          `session=${sessionId} run=${exactRunId || "?"}`,
+        );
+        return;
+      }
+      await finalizeExactGroupInvocation(sessionId, exactRunId);
     });
 
     // ── agent_end: ingest the completed turn ──
@@ -3495,19 +5260,29 @@ export default {
       // Obtained before the guard below because the release itself is keyed by
       // it; nothing can be cleaned up if this throws.
       const sessionId = hookSessionIdentity(ctx);
+      const contextRunId = hookInvocationRunId(ctx, sessionId);
+      const eventRunId = cleanInboundField(event?.runId);
+      const runIdConflict = Boolean(
+        eventRunId && contextRunId && eventRunId !== contextRunId,
+      );
+      const exactRunId = eventRunId || contextRunId;
+      let groupOutputDeferred = false;
 
       // The user half is captured at prompt-build and consumed by a completed
       // ingest. Every exit from this hook has to release it, or it outlives the
       // turn it belongs to and can be attached to a later reply.
       const releasePendingTurn = () => {
-        pendingUserTurn.delete(sessionId);
-        pendingUserTurnProvenance.delete(sessionId);
-        pendingUserTurnMessage.delete(sessionId);
+        forgetPendingUserTurn(sessionId, exactRunId);
+        forgetModelOutput(sessionId, exactRunId);
       };
 
       try {
         const sessionKey = ctx?.sessionKey ?? "";
-        forgetCurrentContextSpeaker(sessionId);
+        const groupConversationCompletion = groupConversationSession(sessionKey);
+        const runBoundGroupCompletion = Boolean(
+          groupConversationCompletion && exactRunId,
+        );
+        forgetCurrentContextSpeaker(sessionId, ctx?.runId);
         forgetContinuityAdoption(
           sessionId,
           ctx?.runId === undefined ? null : ctx.runId,
@@ -3525,11 +5300,36 @@ export default {
           return;
         }
 
+        if (runIdConflict) {
+          log.error?.(
+            `[vc:identity] ingest SKIPPED — conflicting run ids ` +
+            `event=${eventRunId} context=${contextRunId}`,
+          );
+          return;
+        }
+
+        if (event?.success === false || (
+          runBoundGroupCompletion && event?.success !== true
+        )) {
+          log.warn?.(
+            `[vc:identity] ingest SKIPPED — run did not complete successfully; ` +
+            `session=${sessionId} run=${exactRunId || "?"}`,
+          );
+          return;
+        }
+
         // Skip ingest for VC command turns — command was fully handled by prepare
-        if (vcCommandSessions.has(sessionId)) {
+        if (consumeVcCommandInvocation(sessionId, exactRunId)) {
           log.info?.(`[vc] skipping ingest — VC command turn`);
-          vcCommandSessions.delete(sessionId);
           releasePendingTurn();
+          return;
+        }
+
+        if (groupConversationCompletion && !exactRunId) {
+          log.error?.(
+            `[vc:identity] ingest SKIPPED — group completion lacks runId; ` +
+            `session=${sessionId}`,
+          );
           return;
         }
 
@@ -3540,6 +5340,23 @@ export default {
             releasePendingTurn();
             return;
           }
+        }
+
+        if (runBoundGroupCompletion) {
+          if (!rememberExactGroupEnd(sessionId, exactRunId, sessionKey)) {
+            const existingKey = invocationStateKey(sessionId, exactRunId);
+            groupOutputDeferred = Boolean(
+              existingKey && exactGroupEndByInvocation.has(existingKey),
+            );
+            log.error?.(
+              `[vc:identity] ingest SKIPPED — duplicate or invalid agent_end; ` +
+              `session=${sessionId} run=${exactRunId || "?"}`,
+            );
+            return;
+          }
+          groupOutputDeferred = true;
+          await finalizeExactGroupInvocation(sessionId, exactRunId);
+          return;
         }
 
         // Read the payload once: a getter could return a different value on a
@@ -3669,18 +5486,28 @@ export default {
         log.info?.(`[vc] ingest — session=${sessionId} conv=${identity.convId} assistant_message=${assistantMessage.length} chars`);
         if (debug) log.info?.(`[vc:debug] ingest request — assistant_message preview: ${assistantMessage.slice(0, 300)}`);
 
-        const userMessage = pendingUserTurn.get(sessionId);
-        const userProvenance = pendingUserTurnProvenance.get(sessionId) ?? {};
+        const pendingTurn = findPendingUserTurn(sessionId, exactRunId);
+        const userMessage = pendingTurn?.text;
+        const userProvenance = pendingTurn?.provenance ?? {};
+
+        const ingestPayload = {
+          assistant_message: assistantMessage,
+          ...(userMessage ? { user_message: userMessage } : {}),
+          ...userProvenance,
+        };
+
         releasePendingTurn();
 
         try {
-          const ingestResult = await vcPost(baseUrl, "/api/v1/context/ingest", vcKey, identity.convId, {
-            assistant_message: assistantMessage,
-            // Repairs the pair when the cloud lost the user half it recorded at
-            // prepare; ignored when it still has it.
-            ...(userMessage ? { user_message: userMessage } : {}),
-            ...userProvenance,
-          }, 15000, log);
+          const ingestResult = await vcPost(
+            baseUrl,
+            "/api/v1/context/ingest",
+            vcKey,
+            identity.convId,
+            ingestPayload,
+            15000,
+            log,
+          );
           log.info?.(
             `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
             `status=${ingestResult.status ?? "?"} ` +
@@ -3694,8 +5521,10 @@ export default {
       } finally {
         // No exit may strand the pending user turn: it would be attached
         // to a later reply.
-        releasePendingTurn();
-        forgetInboundTurn(ctx?.runId);
+        if (!groupOutputDeferred) {
+          releasePendingTurn();
+          forgetInboundTurn(exactRunId);
+        }
       }
     });
 

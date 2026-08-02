@@ -16,6 +16,15 @@ const DISCORD_GROUP_KEY = `agent:vast:discord:guild:${DISCORD_GUILD}`;
 const DISCORD_CHANNEL_KEY =
   `agent:vast:discord:channel:${DISCORD_CHANNEL}`;
 
+function exactAdmission(owner = "conv") {
+  return {
+    version: 2,
+    owner_conversation_id: owner,
+    conversation_generation: 0,
+    lifecycle_epoch: 1,
+  };
+}
+
 const createdHomes = [];
 const originalFetch = globalThis.fetch;
 
@@ -74,6 +83,11 @@ function contentText(content) {
 
 function installFetch() {
   const fetchSpy = vi.fn(async (url, options = {}) => {
+    if (String(url).includes("/api/v1/context/capabilities")) {
+      return new Response(JSON.stringify({
+        exact_source_admission_version: 2,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
     const body = JSON.parse(options.body ?? "{}");
     let payload;
     if (String(url).includes("/api/v1/tools/")) {
@@ -83,7 +97,14 @@ function installFetch() {
     } else if (body.messages?.some((message) => contentText(message.content).includes("VCSTATUS"))) {
       payload = { vc_command: "status", message: "status ok" };
     } else {
-      payload = { conversation_id: "conv", body: { messages: body.messages ?? [] }, metadata: {} };
+      payload = {
+        conversation_id: "conv",
+        body: { messages: body.messages ?? [] },
+        metadata: {
+          exact_source_admission_version: 2,
+          exact_source_admission: exactAdmission(),
+        },
+      };
     }
     return new Response(JSON.stringify(payload), {
       status: 200,
@@ -104,7 +125,15 @@ function installContinuityFetch(prefixes) {
   let prepareIndex = 0;
   const fetchSpy = vi.fn(async (url, options = {}) => {
     const request = JSON.parse(options.body ?? "{}");
-    if (!String(url).includes("/api/v1/context/prepare")) {
+    if (String(url).includes("/api/v1/context/capabilities")) {
+      return new Response(JSON.stringify({
+        exact_source_admission_version: 2,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (
+      !String(url).includes("/api/v1/context/prepare")
+      && !String(url).includes("/api/v1/tools/__vc_exact_source_prepare_v2")
+    ) {
       return new Response(
         JSON.stringify({ conversation_id: "conv", status: "ok" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -134,6 +163,8 @@ function installContinuityFetch(prefixes) {
         ],
       },
       metadata: {
+        exact_source_admission_version: 2,
+        exact_source_admission: exactAdmission(`sk:${DISCORD_GROUP_KEY}`),
         recent_conversation_native: {
           message_count: prior.length,
           message_hashes: prior.map((message) =>
@@ -237,7 +268,55 @@ function discordPrompt(content) {
   ].join("\n");
 }
 
+function discordSnowflakeTimestamp(messageId) {
+  return Number((BigInt(messageId) >> 22n) + 1_420_070_400_000n);
+}
+
 describe("convIdentity hook routing", () => {
+  it("keeps run-bound legacy completion ingestion for non-Discord groups", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    const runCtx = {
+      sessionId: SID1,
+      sessionKey: "agent:a:telegram:group:-5156869263",
+      model: "openai-codex/gpt-5.5",
+      runId: "telegram-run-1",
+    };
+    await handlers.get("before_prompt_build")(
+      prepareEvent("Telegram group question"),
+      runCtx,
+    );
+    await handlers.get("agent_end")({
+      runId: runCtx.runId,
+      success: true,
+      messages: [{
+        role: "assistant",
+        content: [{ type: "text", text: "Telegram group reply" }],
+      }],
+    }, runCtx);
+    await handlers.get("llm_output")({
+      runId: runCtx.runId,
+      sessionId: runCtx.sessionId,
+      assistantTexts: ["Telegram group reply"],
+      lastAssistant: {
+        role: "assistant",
+        content: [{ type: "text", text: "Telegram group reply" }],
+      },
+    }, runCtx);
+
+    const ingests = fetchSpy.mock.calls.filter(([url]) =>
+      String(url).includes("/api/v1/context/ingest")
+    );
+    expect(ingests).toHaveLength(1);
+    expect(JSON.parse(ingests[0][1].body)).toMatchObject({
+      assistant_message: "Telegram group reply",
+    });
+    expect(log.error.mock.calls.some(([message]) =>
+      String(message).includes("group completion lacks exact runId")
+    )).toBe(false);
+  });
+
   it("delivers and verifies Codex continuity on cold and warm turns", async () => {
     const home = makeHome();
     installContinuityFetch(["ColdBridge", "WarmBridge"]);
@@ -254,16 +333,58 @@ describe("convIdentity hook routing", () => {
     // The observer retains only a bounded per-run routing snapshot; it does
     // not prepare, ingest, or update actor cards for uninvoked messages.
     expect(handlers.has("message_received")).toBe(true);
-    expect(handlers.has("before_dispatch")).toBe(false);
+    expect(handlers.has("before_dispatch")).toBe(true);
 
     for (const [index, prefix] of ["ColdBridge", "WarmBridge"].entries()) {
+      const messageId = String(BigInt(DISCORD_MESSAGE) + BigInt(index));
+      const requestBody = `@Vast Probe ${index + 1}`;
       const runCtx = {
         ...ctx(SID1, DISCORD_CHANNEL_KEY),
         model: "openai/gpt-5.6-sol",
         runId: `run-${index + 1}`,
       };
+      const timestamp = discordSnowflakeTimestamp(messageId);
+      handlers.get("message_received")({
+        content: requestBody,
+        timestamp,
+        messageId,
+        senderId: DISCORD_SENDER,
+        metadata: {
+          provider: "discord",
+          originatingChannel: "discord",
+          originatingTo: `channel:${DISCORD_CHANNEL}`,
+          messageId,
+          senderId: DISCORD_SENDER,
+          senderName: "Optics",
+          guildId: DISCORD_GUILD,
+        },
+      }, {
+        channelId: "discord",
+        accountId: "vast",
+        conversationId: `channel:${DISCORD_CHANNEL}`,
+        messageId,
+        senderId: DISCORD_SENDER,
+      });
+      handlers.get("before_dispatch")({
+        content: requestBody,
+        body: requestBody,
+        channel: "discord",
+        sessionKey: DISCORD_CHANNEL_KEY,
+        senderId: DISCORD_SENDER,
+        timestamp,
+      }, {
+        channelId: "discord",
+        accountId: "vast",
+        conversationId: `channel:${DISCORD_CHANNEL}`,
+        sessionKey: DISCORD_CHANNEL_KEY,
+        senderId: DISCORD_SENDER,
+      });
+      await handlers.get("before_agent_reply")(
+        { cleanedBody: requestBody },
+        runCtx,
+      );
       const event = prepareEvent(
-        discordPrompt(`@Vast Probe ${index + 1}`),
+        discordPrompt(requestBody).replace(DISCORD_MESSAGE, messageId),
       );
       const result = await handlers.get("before_prompt_build")(event, runCtx);
 
