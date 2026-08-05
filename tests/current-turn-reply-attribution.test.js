@@ -20,10 +20,13 @@ const SESSION_KEY = `agent:vast:discord:channel:${CHANNEL_ID}`;
 const OTHER_SESSION_KEY = `agent:bast:discord:channel:${CHANNEL_ID}`;
 const CURRENT_MESSAGE_ID = "1532432883887767746";
 const TARGET_MESSAGE_ID = "1532423627536863272";
+const PARENT_MESSAGE_ID = "1532423304170874910";
 const CURRENT_SENDER_ID = "940968368398270464";
 const VAST_ID = "1485681229608259666";
+const PARENT_SENDER_ID = "838593018549501962";
 const CURRENT_BODY = "Cant fool me with your reverse-psychology";
 const TARGET_BODY = "No. Keep the reality check.";
+const PARENT_BODY = "Should we blast tren";
 
 function exactAdmission(owner = "conv") {
   return {
@@ -82,6 +85,7 @@ function isIngestHref(href) {
 
 function installFetch({
   targetEditedTimestamp = null,
+  replyParent = null,
   expectedDiscordTokens = ["Bot vast-discord-token"],
 } = {}) {
   const calls = [];
@@ -99,6 +103,39 @@ function installFetch({
         expectedDiscordTokens[discordCallIndex],
       );
       discordCallIndex += 1;
+      if (replyParent && href.endsWith(`/messages/${replyParent.id}`)) {
+        if (replyParent.fetchError) throw replyParent.fetchError;
+        return new Response(JSON.stringify({
+          id: replyParent.id,
+          channel_id: CHANNEL_ID,
+          content: replyParent.body,
+          timestamp: new Date(snowflakeTimestamp(replyParent.id)).toISOString(),
+          edited_timestamp: replyParent.editedTimestamp ?? null,
+          author: {
+            id: replyParent.senderId,
+            username: replyParent.senderName,
+            global_name: replyParent.senderName,
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const target = {
+        id: TARGET_MESSAGE_ID,
+        channel_id: CHANNEL_ID,
+        content: TARGET_BODY,
+        timestamp: new Date(snowflakeTimestamp(TARGET_MESSAGE_ID)).toISOString(),
+        edited_timestamp: targetEditedTimestamp,
+        author: { id: VAST_ID, username: "Vast", global_name: "Vast" },
+        ...(replyParent ? {
+          message_reference: {
+            type: replyParent.referenceType ?? 0,
+            channel_id: replyParent.referenceChannelId ?? CHANNEL_ID,
+            message_id: replyParent.id,
+          },
+        } : {}),
+      };
       return new Response(JSON.stringify({
         id: CURRENT_MESSAGE_ID,
         channel_id: CHANNEL_ID,
@@ -110,14 +147,7 @@ function installFetch({
           channel_id: CHANNEL_ID,
           message_id: TARGET_MESSAGE_ID,
         },
-        referenced_message: {
-          id: TARGET_MESSAGE_ID,
-          channel_id: CHANNEL_ID,
-          content: TARGET_BODY,
-          timestamp: new Date(snowflakeTimestamp(TARGET_MESSAGE_ID)).toISOString(),
-          edited_timestamp: targetEditedTimestamp,
-          author: { id: VAST_ID, username: "Vast", global_name: "Vast" },
-        },
+        referenced_message: target,
       }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -1323,6 +1353,135 @@ describe("current Discord sender and reply target", () => {
     );
     expect(prepare.source_attestation.canonical_body_sha256).toBe(
       "2621e94b075651cf642c45724446ccc7553e0867c38b29a61ce2db74f8ae96cb",
+    );
+    expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
+      .toHaveLength(1);
+  });
+
+  it("preserves the verified parent of a replied-to bot message", async () => {
+    const home = makeHome();
+    const calls = installFetch({
+      replyParent: {
+        id: PARENT_MESSAGE_ID,
+        body: PARENT_BODY,
+        senderId: PARENT_SENDER_ID,
+        senderName: "TheRealOne",
+      },
+      expectedDiscordTokens: [
+        "Bot vast-discord-token",
+        "Bot vast-discord-token",
+      ],
+    });
+    const { handlers } = await registerPlugin(home);
+    stageNativeInbound({ handlers, home });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext(),
+    );
+
+    expect(result.prependContext).toContain('"target_in_reply_to"');
+    expect(result.prependContext).toContain(PARENT_MESSAGE_ID);
+    expect(result.prependContext).toContain(`actor:discord:${PARENT_SENDER_ID}`);
+    expect(result.prependContext).toContain('"name":"TheRealOne"');
+    expect(result.prependContext).toContain(PARENT_BODY);
+    expect(result.prependContext).toContain(
+      "Attribute content from that parent only to its recorded parent speaker",
+    );
+    expect(result.prependContext).toContain(
+      "Do not transfer the parent's statements",
+    );
+
+    const discordCalls = calls.filter((call) =>
+      call.href.startsWith("https://discord.com/api/")
+    );
+    expect(discordCalls).toHaveLength(2);
+    expect(discordCalls[0].href).toContain(`/messages/${CURRENT_MESSAGE_ID}`);
+    expect(discordCalls[1].href).toContain(`/messages/${PARENT_MESSAGE_ID}`);
+
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    const prepare = JSON.parse(prepareCall.options.body);
+    expect(prepare.reply_target_message_id).toBe(TARGET_MESSAGE_ID);
+    expect(prepare.reply_subject_actor_id).toBe(`actor:discord:${VAST_ID}`);
+    expect(prepare).not.toHaveProperty("target_in_reply_to");
+  });
+
+  it("keeps the verified direct target when parent enrichment fails", async () => {
+    const home = makeHome();
+    const timeout = new Error("parent lookup timed out");
+    timeout.name = "TimeoutError";
+    const calls = installFetch({
+      replyParent: {
+        id: PARENT_MESSAGE_ID,
+        body: PARENT_BODY,
+        senderId: PARENT_SENDER_ID,
+        senderName: "TheRealOne",
+        fetchError: timeout,
+      },
+      expectedDiscordTokens: [
+        "Bot vast-discord-token",
+        "Bot vast-discord-token",
+      ],
+    });
+    const { handlers, log } = await registerPlugin(home);
+    stageNativeInbound({ handlers, home });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext(),
+    );
+
+    expect(result.prependContext).toContain(TARGET_MESSAGE_ID);
+    expect(result.prependContext).toContain(TARGET_BODY);
+    expect(result.prependContext).toContain('"target_in_reply_to"');
+    expect(result.prependContext).toContain('"status":"unavailable"');
+    expect(result.prependContext).not.toContain(PARENT_BODY);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("target parent lookup failed: TimeoutError"),
+    );
+
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    const prepare = JSON.parse(prepareCall.options.body);
+    expect(prepare.reply_target_message_id).toBe(TARGET_MESSAGE_ID);
+    expect(prepare.reply_subject_actor_id).toBe(`actor:discord:${VAST_ID}`);
+  });
+
+  it("does not describe an invalid parent reference as a native reply", async () => {
+    const home = makeHome();
+    const calls = installFetch({
+      replyParent: {
+        id: PARENT_MESSAGE_ID,
+        body: PARENT_BODY,
+        senderId: PARENT_SENDER_ID,
+        senderName: "TheRealOne",
+        referenceType: 1,
+      },
+    });
+    const { handlers } = await registerPlugin(home);
+    stageNativeInbound({ handlers, home });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: prompt(), messages: [] },
+      agentContext(),
+    );
+
+    expect(result.prependContext).toContain(TARGET_MESSAGE_ID);
+    expect(result.prependContext).toContain(TARGET_BODY);
+    expect(result.prependContext).not.toContain("target_in_reply_to");
+    expect(result.prependContext).not.toContain(
+      "The quoted target was itself a native reply",
     );
     expect(calls.filter((call) => call.href.startsWith("https://discord.com/api/")))
       .toHaveLength(1);
