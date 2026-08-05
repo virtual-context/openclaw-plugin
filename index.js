@@ -47,7 +47,7 @@ import {
   registerSpeakerAttributedContextEngine,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.5.2";
+const PLUGIN_VERSION = "5.5.3";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -740,16 +740,53 @@ export function currentTurnForIngest(promptText) {
   return currentTurnBody(promptText);
 }
 
+const _OPENCLAW_MEDIA_ATTACHMENT_LINE_RE =
+  /^\[media attached(?: \d+\/\d+)?: [^\r\n]*\]$/u;
+const _OPENCLAW_MEDIA_REPLY_HINT_RE =
+  /^To send an image back,[^\r\n]*Keep caption in the text body\.$/u;
+
+/**
+ * Remove only OpenClaw's leading inbound-media envelope.
+ *
+ * OpenClaw inserts one or more bracketed attachment lines and, when media is
+ * present, a generated reply-tool hint ahead of the user's actual caption.
+ * Those host-owned lines are not Discord message content.  Recognition is
+ * deliberately structural and anchored at the beginning: a reply hint is
+ * removable only after at least one attachment line, and nothing after that
+ * envelope is interpreted or pattern-matched as user content.
+ */
+export function stripLeadingOpenClawMediaScaffold(body) {
+  const text = typeof body === "string" ? body : "";
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (
+    index < lines.length
+    && _OPENCLAW_MEDIA_ATTACHMENT_LINE_RE.test(lines[index].trim())
+  ) {
+    index += 1;
+  }
+  if (index === 0) return text;
+  while (index < lines.length && !lines[index].trim()) index += 1;
+  if (
+    index < lines.length
+    && _OPENCLAW_MEDIA_REPLY_HINT_RE.test(lines[index].trim())
+  ) {
+    index += 1;
+  }
+  while (index < lines.length && !lines[index].trim()) index += 1;
+  return lines.slice(index).join("\n");
+}
+
 /**
  * Canonical text projection for comparing Discord's dispatch body with
- * OpenClaw's prompt body. OpenClaw may reflow line endings and whitespace
- * between those hook surfaces, so both sides use one normalization contract:
- * NFC Unicode plus one ASCII space for every whitespace run. Immutable
- * message/channel/sender fields prove routing identity separately; this check
- * remains strict about every non-whitespace character and its order.
+ * OpenClaw's prompt body. Both sides first discard the same recognized
+ * host-owned media envelope, then use one text-normalization contract: NFC
+ * Unicode plus one ASCII space for every whitespace run. Immutable message,
+ * channel, and sender fields prove routing identity separately; this check
+ * remains strict about every other character and its order.
  */
 export function discordBodyAdmissionProjection(body) {
-  return (typeof body === "string" ? body : "")
+  return stripLeadingOpenClawMediaScaffold(body)
     .normalize("NFC")
     .replace(/\s+/gu, " ")
     .trim();
@@ -4600,21 +4637,22 @@ export default {
         return;
       }
       const promptCurrentBody = currentTurnForIngest(event.prompt);
-      const promptBodyWithoutLocalMedia = promptCurrentBody.replace(
-        /^(?:\[media attached:[^\]\r\n]*\]\r?\n)+/,
-        "",
-      );
+      const promptWithoutMediaScaffold =
+        stripLeadingOpenClawMediaScaffold(promptCurrentBody);
+      const promptHadMediaScaffold =
+        promptWithoutMediaScaffold !== promptCurrentBody;
       if (
         exactDiscordAdmission
         && promptCurrentBody
-        && discordBodyAdmissionProjection(promptBodyWithoutLocalMedia)
+        && discordBodyAdmissionProjection(promptCurrentBody)
           !== discordBodyAdmissionProjection(inboundTurn.invokedBody)
       ) {
         warnIdentityOnce(
           log,
           `body-conflict:${sessionKey}:${explicitRunId || "?"}`,
           `[vc:identity] VC bypassed: dispatch-bound Discord body ` +
-          `conflicted with the current prompt projection; native model turn continues`,
+          `conflicted with the current prompt projection; native model turn ` +
+          `continues media_envelope=${promptHadMediaScaffold ? "recognized" : "absent"}`,
         );
         forgetPendingUserTurn(sessionId, stateRunId);
         forgetExactSourceCapability(sessionId, stateRunId);

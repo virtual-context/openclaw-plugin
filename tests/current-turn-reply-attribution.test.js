@@ -1760,7 +1760,115 @@ describe("current Discord sender and reply target", () => {
     expect(textOf(prepare.messages.at(-1).content)).not.toContain("/root/");
   });
 
-  it("never blocks an image-only model turn when OpenClaw adds media scaffolding", async () => {
+  it("admits an image and caption after removing the complete OpenClaw media envelope", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    const guildSessionKey = "agent:vast:discord:guild:1524917037191925871";
+    const ctx = agentContext({ sessionKey: guildSessionKey });
+    const caption = (
+      "you've seen my stack in another channel. "
+      + "Anything else should I include?"
+    );
+    const imageEvent = messageHookEvent();
+    imageEvent.content = `<@${VAST_ID}> ${caption}`;
+    imageEvent.replyToId = "";
+    const imageContext = messageHookContext();
+    imageContext.replyToId = "";
+    stageNativeInbound({
+      handlers,
+      home,
+      event: imageEvent,
+      messageContext: imageContext,
+      dispatchSessionKey: guildSessionKey,
+      rowContent: caption,
+      dispatchBody: caption,
+    });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: caption },
+      ctx,
+    );
+    const mediaPrompt = prompt("").replace(
+      CURRENT_BODY,
+      [
+        "[media attached: /root/.openclaw/media/inbound/Screenshot.jpg (image/jpeg)]",
+        "To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath. Keep caption in the text body.",
+        caption,
+      ].join("\n"),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: mediaPrompt, messages: [] },
+      ctx,
+    );
+
+    expect(result?.prependContext).toContain("<current-speaker");
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    expect(prepareCall).toBeTruthy();
+    const prepare = JSON.parse(prepareCall.options.body);
+    expect(prepare).toMatchObject({
+      sender_name: "Send Nudes",
+      sender_actor_id: `actor:discord:${CURRENT_SENDER_ID}`,
+      source_message_id: CURRENT_MESSAGE_ID,
+      source_attestation: {
+        message_id: CURRENT_MESSAGE_ID,
+        author_id: CURRENT_SENDER_ID,
+        channel_id: CHANNEL_ID,
+        guild_id: "1524917037191925871",
+      },
+    });
+    expect(textOf(prepare.messages.at(-1).content)).toBe(caption);
+    expect(textOf(prepare.messages.at(-1).content)).not.toContain("media attached");
+    expect(textOf(prepare.messages.at(-1).content)).not.toContain("To send an image back");
+    expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
+      .not.toContain("conflicted with the current prompt projection");
+
+    await finishRun({ handlers, ctx, answer: "Use the verified speaker's stack." });
+    const ingestCall = calls.find((call) => isIngestHref(call.href));
+    expect(ingestCall).toBeTruthy();
+    const ingest = JSON.parse(ingestCall.options.body);
+    expect(ingest).toMatchObject({
+      user_message: caption,
+      assistant_message: "Use the verified speaker's stack.",
+      sender_name: "Send Nudes",
+      sender_actor_id: `actor:discord:${CURRENT_SENDER_ID}`,
+      source_message_id: CURRENT_MESSAGE_ID,
+    });
+  });
+
+  it("rejects an enveloped prompt when its caption differs from Discord dispatch", async () => {
+    const home = makeHome();
+    const calls = installFetch();
+    const { handlers, log } = await registerPlugin(home);
+    stageNativeInbound({ handlers, home, dispatchBody: CURRENT_BODY });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: CURRENT_BODY },
+      agentContext(),
+    );
+    const mediaPrompt = prompt().replace(
+      CURRENT_BODY,
+      [
+        "[media attached: /root/.openclaw/media/inbound/example.jpg (image/jpeg)]",
+        "To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath. Keep caption in the text body.",
+        "another member's caption",
+      ].join("\n"),
+    );
+
+    const result = await handlers.get("before_prompt_build")(
+      { prompt: mediaPrompt, messages: [] },
+      agentContext(),
+    );
+
+    expect(result).toBeUndefined();
+    expect(calls.some((call) => isPrepareHref(call.href))).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "conflicted with the current prompt projection; native model turn continues media_envelope=recognized",
+      ),
+    );
+  });
+
+  it("keeps an image-only turn attributed after removing OpenClaw media scaffolding", async () => {
     const home = makeHome();
     const calls = installFetch();
     const { handlers, log } = await registerPlugin(home);
@@ -1782,7 +1890,7 @@ describe("current Discord sender and reply target", () => {
       CURRENT_BODY,
       [
         "[media attached: /root/.openclaw/media/inbound/IMG_0588.png (image/png)]",
-        "To send an image back, use the message tool with structured media fields such as media, mediaUrl, path, or filePath. Keep caption in the text body.",
+        "To send an image back, prefer the message tool (media/path/filePath). If you must inline, use MEDIA:https://example.com/image.jpg (spaces ok, quote if needed) or a safe relative path like MEDIA:./image.jpg. Avoid absolute paths (MEDIA:/...) and ~ paths - they are blocked for security. Keep caption in the text body.",
         imageMarker,
       ].join("\n"),
     );
@@ -1792,15 +1900,12 @@ describe("current Discord sender and reply target", () => {
       agentContext(),
     );
 
-    // Undefined means the plugin leaves OpenClaw's native image/model turn
-    // untouched. VC may skip an unattested turn, but it may never replace the
-    // user's request with an identity/context refusal.
-    expect(result).toBeUndefined();
-    expect(calls.some((call) => isPrepareHref(call.href))).toBe(false);
+    expect(result?.prependContext).toContain("<current-speaker");
+    const prepareCall = calls.find((call) => isPrepareHref(call.href));
+    expect(prepareCall).toBeUndefined();
     expect(calls.some((call) => isIngestHref(call.href))).toBe(false);
-    expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("native model turn continues"),
-    );
+    expect(log.warn.mock.calls.map(([message]) => message).join("\n"))
+      .not.toContain("conflicted with the current prompt projection");
   });
 
   it("does not reuse one message snapshot for a different prompt run", async () => {
