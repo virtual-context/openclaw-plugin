@@ -84,6 +84,12 @@ const MAX_EXACT_SOURCE_CAPABILITIES = 512;
 const exactSourceBypassByInvocation = new Map();
 const MAX_EXACT_SOURCE_BYPASSES = 512;
 const EXACT_SOURCE_BYPASS_TTL_MS = 5 * 60_000;
+// Native Discord reply semantics are independent of VC admission. OpenClaw
+// builds one invocation twice, so retain the verified native result only for
+// that exact session+run and never overload a cloud-failure state with it.
+const nativeReplyResultByInvocation = new Map();
+const MAX_NATIVE_REPLY_RESULTS = 512;
+const NATIVE_REPLY_RESULT_TTL_MS = 5 * 60_000;
 const EXACT_SOURCE_ADMISSION_VERSION = 2;
 const EXACT_SOURCE_PREPARE_PATH =
   "/api/v1/tools/__vc_exact_source_prepare_v2";
@@ -196,6 +202,41 @@ function findExactSourceBypass(sessionId, runId) {
 function forgetExactSourceBypass(sessionId, runId) {
   const key = invocationStateKey(sessionId, runId);
   if (key) exactSourceBypassByInvocation.delete(key);
+}
+
+function rememberNativeReplyResult(sessionId, runId, hookResult) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key || !hookResult) return false;
+  nativeReplyResultByInvocation.delete(key);
+  nativeReplyResultByInvocation.set(key, {
+    hookResult: { ...hookResult },
+    capturedAt: Date.now(),
+  });
+  while (nativeReplyResultByInvocation.size > MAX_NATIVE_REPLY_RESULTS) {
+    nativeReplyResultByInvocation.delete(
+      nativeReplyResultByInvocation.keys().next().value,
+    );
+  }
+  return true;
+}
+
+function findNativeReplyResult(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (!key) return null;
+  const entry = nativeReplyResultByInvocation.get(key) ?? null;
+  if (
+    entry
+    && Date.now() - entry.capturedAt > NATIVE_REPLY_RESULT_TTL_MS
+  ) {
+    nativeReplyResultByInvocation.delete(key);
+    return null;
+  }
+  return entry?.hookResult ? { ...entry.hookResult } : null;
+}
+
+function forgetNativeReplyResult(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  if (key) nativeReplyResultByInvocation.delete(key);
 }
 
 function assistantContentBlocks(message) {
@@ -850,9 +891,15 @@ export function isReplyOnlyInvocation(promptText) {
  * JSON encoding keeps the user-supplied request visibly delimited without
  * inventing an XML/Markdown delimiter that the request itself could close.
  */
-export function buildReplyOnlyDirective(promptText) {
+export function buildReplyOnlyDirective(promptText, options = undefined) {
   if (!isReplyOnlyInvocation(promptText)) return "";
-  const targetBody = replyTargetBody(promptText);
+  const hasTrustedTarget = Boolean(
+    options
+    && Object.prototype.hasOwnProperty.call(options, "targetBody"),
+  );
+  const targetBody = hasTrustedTarget
+    ? (typeof options.targetBody === "string" ? options.targetBody.trim() : "")
+    : replyTargetBody(promptText);
   if (!targetBody) return "";
   return [
     "The current user invoked you by replying to a message with only your mention.",
@@ -872,7 +919,12 @@ export function buildReplyOnlyDirective(promptText) {
  * is returned on every build of that message, without leaking into the next
  * Discord turn.
  */
-export function resolveReplyOnlyDirective(promptText, sessionId = "", now = Date.now()) {
+export function resolveReplyOnlyDirective(
+  promptText,
+  sessionId = "",
+  now = Date.now(),
+  options = undefined,
+) {
   for (const [key, entry] of _replyOnlyDirectiveCache) {
     if (entry.expiresAt <= now) _replyOnlyDirectiveCache.delete(key);
   }
@@ -882,7 +934,7 @@ export function resolveReplyOnlyDirective(promptText, sessionId = "", now = Date
     ? info.message_id.trim()
     : "";
   const key = messageId ? `${sessionId}:${messageId}` : "";
-  const fresh = buildReplyOnlyDirective(promptText);
+  const fresh = buildReplyOnlyDirective(promptText, options);
 
   if (fresh) {
     if (key) {
@@ -3997,6 +4049,7 @@ export default {
       forgetPendingUserTurn(sessionId, runId);
       forgetExactSourceCapability(sessionId, runId);
       forgetExactSourceBypass(sessionId, runId);
+      forgetNativeReplyResult(sessionId, runId);
       forgetModelOutput(sessionId, runId);
       forgetInboundTurn(runId);
     }
@@ -4538,6 +4591,17 @@ export default {
       );
       const correlationId = explicitRunId ?? sessionId;
       const promptText = (event.prompt ?? "").trim();
+      const repeatedNativeReply = findNativeReplyResult(
+        sessionId,
+        stateRunId,
+      );
+      if (repeatedNativeReply) {
+        log.warn?.(
+          `[vc:reply] reusing run-scoped native reply result ` +
+          `session=${sessionId} run=${stateRunId || "?"}`,
+        );
+        return repeatedNativeReply;
+      }
       const stickyExactBypass = exactDiscordAdmission
         ? findExactSourceBypass(sessionId, stateRunId)
         : null;
@@ -4796,6 +4860,103 @@ export default {
             prependContext: buildCodexPreparedContext(currentAttributionBoundary).text,
           }
         : null;
+      // Reply semantics belong to the native Discord turn, not to VC. Build
+      // them before any cloud preflight so a VC outage cannot reduce a native
+      // reply + bare mention to an otherwise empty "@Vast" request.
+      if (
+        exactDiscordAdmission
+        && isReplyOnlyInvocation(event.prompt)
+        && !verifiedReplyTarget?.body
+      ) {
+        log.warn?.(
+          `[vc:reply] reply-only target verification unavailable; ` +
+          `native directive suppressed session=${sessionId} ` +
+          `run=${stateRunId || "?"}`,
+        );
+      }
+      const replyOnlyDirective = resolveReplyOnlyDirective(
+        event.prompt,
+        sessionId,
+        Date.now(),
+        verifiedReplyTarget
+          ? { targetBody: verifiedReplyTarget.body }
+          : (exactDiscordAdmission ? { targetBody: "" } : undefined),
+      );
+      // This must run before VC prepare and on EVERY prompt-build pass. The
+      // Codex Discord harness rebuilds the prompt after the first hook result;
+      // if only the first pass is guarded, the second pass replaces it with VC
+      // context and the bare @Vast mention becomes authoritative again.
+      if (replyOnlyDirective) {
+        // Enrichment is skipped for this turn, but the turn still has to be
+        // recorded. Prepare never runs on this path, so unless the user half
+        // is captured here the completed-turn ingest arrives unpaired and the
+        // whole turn — the answer included — is discarded as a fragment.
+        // Only the earliest prompt-build pass carries the untouched body;
+        // later passes fold the host's assembled context into the prompt.
+        //
+        // Keyed by the host message id so a later pass of THIS message keeps the
+        // earlier body, while a value left behind by a previous turn is replaced.
+        // Without that distinction a stale entry — from a turn that exited early
+        // via a VC command, the provider filter, or an empty answer — would be
+        // sent as this turn's user half.
+        const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
+        const pendingReplyOnly = findPendingUserTurn(
+          sessionId,
+          stateRunId,
+        );
+        if (!pendingReplyOnly || pendingReplyOnly.messageId !== replyOnlyId) {
+          const replyOnlyBody = currentBody;
+          if (replyOnlyBody) {
+            const replyOnlyAttestation = exactDiscordAdmission
+              ? buildSourceAttestation(
+                  inboundTurn,
+                  replyOnlyBody,
+                  turnProvenance.reply_target_message_id,
+                )
+              : null;
+            const recordedReplyOnly = rememberPendingUserTurn(
+              sessionId,
+              stateRunId,
+              {
+                text: replyOnlyBody,
+                provenance: {
+                  ...turnProvenance,
+                  ...(replyOnlyAttestation
+                    ? { source_attestation: replyOnlyAttestation }
+                    : {}),
+                },
+                messageId: replyOnlyId,
+              },
+            );
+            if (recordedReplyOnly) {
+              log.info?.(
+                `[vc:reply] recorded run-scoped reply-only user half ` +
+                `session=${sessionId} run=${stateRunId}`,
+              );
+            }
+          }
+        }
+        log.warn?.(
+          `[vc] reply-only invocation — enforcing replied-to request on this ` +
+          `prompt-build pass (VC enrichment skipped). session=${sessionId}`
+        );
+        const nativeReplyResult = {
+          prependContext: speakerGuardOnlyResult
+            ? `${speakerGuardOnlyResult.prependContext}\n\n${replyOnlyDirective}`
+            : replyOnlyDirective,
+        };
+        // OpenClaw rebuilds the prompt for the same invocation. Bind the full
+        // native result to that exact run so the rebuilt pass cannot reach a
+        // VC body/capability guard first. invocationStateKey rejects missing
+        // ids, and agent_end releases the entry, so this cannot cross turns.
+        rememberNativeReplyResult(
+          sessionId,
+          stateRunId,
+          nativeReplyResult,
+        );
+        return nativeReplyResult;
+      }
+
       const rememberSpeakerGuardFallback = () => {
         if (
           !speakerGuardOnlyResult
@@ -4842,65 +5003,6 @@ export default {
           );
           return speakerGuardOnlyResult ?? undefined;
         }
-      }
-
-      // This must run before VC prepare and on EVERY prompt-build pass. The
-      // Codex Discord harness rebuilds the prompt after the first hook result;
-      // if only the first pass is guarded, the second pass replaces it with VC
-      // context and the bare @Vast mention becomes authoritative again.
-      const replyOnlyDirective = resolveReplyOnlyDirective(
-        event.prompt,
-        sessionId,
-      );
-      if (replyOnlyDirective) {
-        // Enrichment is skipped for this turn, but the turn still has to be
-        // recorded. Prepare never runs on this path, so unless the user half
-        // is captured here the completed-turn ingest arrives unpaired and the
-        // whole turn — the answer included — is discarded as a fragment.
-        // Only the earliest prompt-build pass carries the untouched body;
-        // later passes fold the host's assembled context into the prompt.
-        //
-        // Keyed by the host message id so a later pass of THIS message keeps the
-        // earlier body, while a value left behind by a previous turn is replaced.
-        // Without that distinction a stale entry — from a turn that exited early
-        // via a VC command, the provider filter, or an empty answer — would be
-        // sent as this turn's user half.
-        const replyOnlyId = parseConversationInfo(event.prompt)?.message_id ?? "";
-        const pendingReplyOnly = findPendingUserTurn(
-          sessionId,
-          stateRunId,
-        );
-        if (!pendingReplyOnly || pendingReplyOnly.messageId !== replyOnlyId) {
-          const replyOnlyBody = currentBody;
-          if (replyOnlyBody) {
-            const replyOnlyAttestation = exactDiscordAdmission
-              ? buildSourceAttestation(
-                  inboundTurn,
-                  replyOnlyBody,
-                  turnProvenance.reply_target_message_id,
-                )
-              : null;
-            rememberPendingUserTurn(sessionId, stateRunId, {
-              text: replyOnlyBody,
-              provenance: {
-                ...turnProvenance,
-                ...(replyOnlyAttestation
-                  ? { source_attestation: replyOnlyAttestation }
-                  : {}),
-              },
-              messageId: replyOnlyId,
-            });
-          }
-        }
-        log.warn?.(
-          `[vc] reply-only invocation — enforcing replied-to request on this ` +
-          `prompt-build pass (VC enrichment skipped). session=${sessionId}`
-        );
-        return {
-          prependContext: speakerGuardOnlyResult
-            ? `${speakerGuardOnlyResult.prependContext}\n\n${replyOnlyDirective}`
-            : replyOnlyDirective,
-        };
       }
 
       // Handle VCREINGEST locally — resets the ingest tracker for this session.
@@ -5521,6 +5623,7 @@ export default {
       // turn it belongs to and can be attached to a later reply.
       const releasePendingTurn = () => {
         forgetPendingUserTurn(sessionId, exactRunId);
+        forgetNativeReplyResult(sessionId, exactRunId);
         forgetModelOutput(sessionId, exactRunId);
       };
 

@@ -87,6 +87,13 @@ function installFetch({
   targetEditedTimestamp = null,
   replyParent = null,
   expectedDiscordTokens = ["Bot vast-discord-token"],
+  capabilityStatus = 200,
+  currentBody = CURRENT_BODY,
+  currentSenderName = "sendnewds",
+  currentGlobalName = undefined,
+  targetBody = TARGET_BODY,
+  targetSenderId = VAST_ID,
+  targetSenderName = "Vast",
 } = {}) {
   const calls = [];
   let discordCallIndex = 0;
@@ -94,9 +101,18 @@ function installFetch({
     const href = String(url);
     calls.push({ href, options });
     if (href.includes("/api/v1/context/capabilities")) {
+      if (capabilityStatus >= 400) {
+        return new Response("Internal Server Error", {
+          status: capabilityStatus,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
       return new Response(JSON.stringify({
         exact_source_admission_version: 2,
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }), {
+        status: capabilityStatus,
+        headers: { "Content-Type": "application/json" },
+      });
     }
     if (href.startsWith("https://discord.com/api/")) {
       expect(options.headers.Authorization).toBe(
@@ -124,10 +140,14 @@ function installFetch({
       const target = {
         id: TARGET_MESSAGE_ID,
         channel_id: CHANNEL_ID,
-        content: TARGET_BODY,
+        content: targetBody,
         timestamp: new Date(snowflakeTimestamp(TARGET_MESSAGE_ID)).toISOString(),
         edited_timestamp: targetEditedTimestamp,
-        author: { id: VAST_ID, username: "Vast", global_name: "Vast" },
+        author: {
+          id: targetSenderId,
+          username: targetSenderName,
+          global_name: targetSenderName,
+        },
         ...(replyParent ? {
           message_reference: {
             type: replyParent.referenceType ?? 0,
@@ -139,9 +159,15 @@ function installFetch({
       return new Response(JSON.stringify({
         id: CURRENT_MESSAGE_ID,
         channel_id: CHANNEL_ID,
-        content: CURRENT_BODY,
+        content: currentBody,
         timestamp: new Date(CURRENT_TIMESTAMP).toISOString(),
-        author: { id: CURRENT_SENDER_ID, username: "sendnewds" },
+        author: {
+          id: CURRENT_SENDER_ID,
+          username: currentSenderName,
+          ...(currentGlobalName
+            ? { global_name: currentGlobalName }
+            : {}),
+        },
         message_reference: {
           type: 0,
           channel_id: CHANNEL_ID,
@@ -1022,6 +1048,149 @@ describe("current Discord sender and reply target", () => {
         "VC bypassed: exact source capability was not proven; native model turn continues",
       ),
     );
+  });
+
+  it("keeps a bare native reply independent of cloud capability", async () => {
+    const home = makeHome();
+    const mention = `<@${VAST_ID}>`;
+    const targetQuestion =
+      "Aggregates and misfolds should come up on a purity test right?";
+    const staleUntrustedTarget = "What is the weather in Miami?";
+    const calls = installFetch({
+      capabilityStatus: 500,
+      currentBody: mention,
+      currentSenderName: "BigTex",
+      currentGlobalName: "BigTex",
+      targetBody: targetQuestion,
+      targetSenderId: "387316537012518913",
+      targetSenderName: "optics",
+    });
+    const { handlers, log } = await registerPlugin(home);
+    const guildSessionKey =
+      "agent:vast:discord:guild:1524917037191925871";
+    const ctx = agentContext({
+      sessionKey: guildSessionKey,
+      runId: "run-reply-only-capability-outage",
+    });
+    const inbound = messageHookEvent();
+    inbound.content = mention;
+    inbound.metadata.senderName = "BigTex";
+    const inboundContext = messageHookContext();
+    stageNativeInbound({
+      handlers,
+      home,
+      event: inbound,
+      messageContext: inboundContext,
+      dispatchSessionKey: guildSessionKey,
+      rowContent: mention,
+    });
+    await handlers.get("before_agent_reply")(
+      { cleanedBody: mention },
+      ctx,
+    );
+    const productionShapePrompt = [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      JSON.stringify({
+        chat_id: `channel:${CHANNEL_ID}`,
+        message_id: CURRENT_MESSAGE_ID,
+        reply_to_id: TARGET_MESSAGE_ID,
+        has_reply_context: true,
+        sender: { id: CURRENT_SENDER_ID, name: "BigTex" },
+      }, null, 2),
+      "```",
+      "",
+      "Reply target of current user message (untrusted, for context):",
+      "```json",
+      JSON.stringify({
+        sender_label: "stale-user",
+        body: staleUntrustedTarget,
+      }, null, 2),
+      "```",
+      "",
+      mention,
+    ].join("\n");
+    const hookEvent = { prompt: productionShapePrompt, messages: [] };
+
+    const first = await handlers.get("before_prompt_build")(hookEvent, ctx);
+    const rebuiltHookEvent = {
+      prompt: [
+        productionShapePrompt,
+        "",
+        "OpenClaw assembled context for this turn:",
+        first.prependContext,
+      ].join("\n"),
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: mention }],
+      }],
+    };
+    const second = await handlers.get("before_prompt_build")(
+      rebuiltHookEvent,
+      ctx,
+    );
+
+    for (const result of [first, second]) {
+      expect(result?.prependContext).toContain("<current-speaker");
+      expect(result?.prependContext).toContain("BigTex");
+      expect(result?.prependContext).toContain("<current-reply-target");
+      expect(result?.prependContext).toContain("optics");
+      expect(result?.prependContext).toContain(targetQuestion);
+      expect(result?.prependContext).toContain(
+        "Treat the replied-to message below as the current user request",
+      );
+      expect(result?.prependContext).toContain(
+        "Do not greet the user or ask what they need",
+      );
+      expect(result?.prependContext).not.toContain(staleUntrustedTarget);
+      expect(result?.prependContext).not.toContain("stale-user");
+    }
+    expect(calls.some((call) =>
+      call.href.includes(`/messages/${CURRENT_MESSAGE_ID}`)
+    )).toBe(true);
+    expect(calls.filter((call) =>
+      call.href.includes("/api/v1/context/capabilities")
+    )).toHaveLength(0);
+    expect(calls.some((call) => isPrepareHref(call.href))).toBe(false);
+    expect(calls.some((call) => isIngestHref(call.href))).toBe(false);
+    expect(log.error).not.toHaveBeenCalledWith(
+      expect.stringContaining("exact source capability was not proven"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reply-only invocation"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reusing run-scoped native reply result"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("recorded run-scoped reply-only user half"),
+    );
+
+    // The continuity result belongs to this exact run, never the session.
+    const otherRun = await handlers.get("before_prompt_build")({
+      prompt: "unrelated next invocation",
+      messages: [],
+    }, {
+      ...ctx,
+      runId: "run-after-reply-only",
+    });
+    expect(otherRun).toBeUndefined();
+
+    // Every completion path releases it. A failed run is sufficient to drive
+    // agent_end cleanup without creating any cloud persistence side effect.
+    await handlers.get("agent_end")({
+      runId: ctx.runId,
+      success: false,
+      messages: [],
+    }, ctx);
+    const afterRelease = await handlers.get("before_prompt_build")(
+      hookEvent,
+      ctx,
+    );
+    expect(afterRelease).toBeUndefined();
+    expect(log.warn.mock.calls.filter(([message]) =>
+      String(message).includes("reusing run-scoped native reply result")
+    )).toHaveLength(1);
   });
 
   it("keeps a nonblocking VC bypass sticky across duplicate prompt passes", async () => {

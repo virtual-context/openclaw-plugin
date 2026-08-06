@@ -45,6 +45,16 @@ describe("reply-only Discord invocation", () => {
     expect(directive).toContain("Do not greet the user");
   });
 
+  it("uses a verified target body instead of stale host metadata", () => {
+    const directive = buildReplyOnlyDirective(replyPrompt({
+      body: "stale untrusted question",
+    }), {
+      targetBody: "verified Discord question",
+    });
+    expect(directive).toContain("verified Discord question");
+    expect(directive).not.toContain("stale untrusted question");
+  });
+
   it("does not activate when the reply contains its own question", () => {
     const prompt = replyPrompt({ typed: "<@1485681229608259666> Which subreddits does it use?" });
     expect(isReplyOnlyInvocation(prompt)).toBe(false);
