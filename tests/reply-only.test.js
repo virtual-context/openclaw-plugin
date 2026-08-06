@@ -38,6 +38,14 @@ describe("reply-only Discord invocation", () => {
     expect(isReplyOnlyInvocation(prompt)).toBe(true);
   });
 
+  it("recognizes Discord's managed Vast role as a bare invocation", () => {
+    const prompt = replyPrompt({ typed: "<@&1524968904340930633>" });
+    expect(isReplyOnlyInvocation(prompt)).toBe(true);
+    expect(buildReplyOnlyDirective(prompt)).toContain(
+      "Treat the replied-to message below as the current user request",
+    );
+  });
+
   it("builds an explicit instruction to answer the replied-to message", () => {
     const directive = buildReplyOnlyDirective(replyPrompt());
     expect(directive).toContain("Treat the replied-to message below as the current user request");

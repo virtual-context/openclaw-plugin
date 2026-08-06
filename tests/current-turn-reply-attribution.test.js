@@ -1050,9 +1050,12 @@ describe("current Discord sender and reply target", () => {
     );
   });
 
-  it("keeps a bare native reply independent of cloud capability", async () => {
+  it.each([
+    `<@${VAST_ID}>`,
+    `<@!${VAST_ID}>`,
+    "<@&1524968904340930633>",
+  ])("keeps a bare native reply independent of cloud capability: %s", async (mention) => {
     const home = makeHome();
-    const mention = `<@${VAST_ID}>`;
     const targetQuestion =
       "Aggregates and misfolds should come up on a purity test right?";
     const staleUntrustedTarget = "What is the weather in Miami?";

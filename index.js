@@ -47,7 +47,7 @@ import {
   registerSpeakerAttributedContextEngine,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.5.4";
+const PLUGIN_VERSION = "5.5.5";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -850,10 +850,10 @@ function clonePreparedMessages(messages) {
   return JSON.parse(JSON.stringify(messages));
 }
 
-/** True when a body is only a bot mention (or empty) — no request of its own. */
+/** True when a body contains only Discord user/role mentions (or is empty). */
 function isBareMentionOrEmpty(body) {
   const stripped = (typeof body === "string" ? body : "")
-    .replace(/<@!?\d+>/g, " ")   // raw Discord mention
+    .replace(/<@(?:[!&])?\d+>/g, " ") // raw Discord user or any role mention
     .replace(/@[\w.\-]+/g, " ")   // resolved @Name mention
     .replace(/\s+/g, " ")
     .trim();
