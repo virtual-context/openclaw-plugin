@@ -57,6 +57,67 @@ describe("deriveConvIdentity — stable scopes", () => {
   });
 });
 
+describe("deriveConvIdentity — web chat is per-user, not per-conversation", () => {
+  const U1 = "3f9a1c22-0000-4444-8888-abcdefabcdef";
+  const U2 = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb";
+  const C1 = "11111111-aaaa-4bbb-8ccc-dddddddddddd";
+  const C2 = "22222222-eeee-4fff-8000-111111111111";
+  const webKey = (user, conv, agent = "gymbrobot") =>
+    `agent:${agent}:web:direct:${user}:conv:${conv}`;
+
+  it("drops the :conv: tail and stabilizes on the user prefix", () => {
+    expect(deriveConvIdentity(webKey(U1, C1), SID)).toEqual({
+      convId: `sk:agent:gymbrobot:web:direct:${U1}`,
+      isStable: true,
+    });
+  });
+
+  // The property the whole feature exists for.
+  it("every conversation of one user resolves to ONE conversation id", () => {
+    const a = deriveConvIdentity(webKey(U1, C1), SID);
+    const b = deriveConvIdentity(webKey(U1, C2), "a-different-session-uuid");
+    expect(a.convId).toBe(b.convId);
+    expect(a.isStable && b.isStable).toBe(true);
+  });
+
+  it("different users never share a conversation id", () => {
+    expect(deriveConvIdentity(webKey(U1, C1), SID).convId)
+      .not.toBe(deriveConvIdentity(webKey(U2, C1), SID).convId);
+  });
+
+  it("two agents sharing a user id get distinct conv ids", () => {
+    expect(deriveConvIdentity(webKey(U1, C1, "alpha"), SID).convId)
+      .not.toBe(deriveConvIdentity(webKey(U1, C1, "beta"), SID).convId);
+  });
+
+  it("preserves user id casing verbatim", () => {
+    const mixed = "AbCdEf-1234";
+    expect(deriveConvIdentity(webKey(mixed, C1), SID).convId)
+      .toBe(`sk:agent:gymbrobot:web:direct:${mixed}`);
+  });
+
+  // Near misses must stay unparseable. A wildcard here would silently hand a
+  // per-UUID or per-conversation identity to traffic that looks close enough.
+  it.each([
+    ["4-token legacy shape", `agent:gymbrobot:web:${C1}`],
+    ["channel kind", `agent:gymbrobot:web:channel:${C1}`],
+    ["group kind", `agent:gymbrobot:web:group:${U1}:conv:${C1}`],
+    ["no conv tail", `agent:gymbrobot:web:direct:${U1}`],
+    ["empty conv id", `agent:gymbrobot:web:direct:${U1}:conv:`],
+    ["empty user id", `agent:gymbrobot:web:direct::conv:${C1}`],
+    ["wrong tail token", `agent:gymbrobot:web:direct:${U1}:chat:${C1}`],
+    ["extra trailing token", `agent:gymbrobot:web:direct:${U1}:conv:${C1}:x`],
+    ["capitalized kind", `agent:gymbrobot:web:Direct:${U1}:conv:${C1}`],
+    ["capitalized platform", `agent:gymbrobot:Web:direct:${U1}:conv:${C1}`],
+  ])("unparseable, not wildcarded: %s", (_label, key) => {
+    expect(deriveConvIdentity(key, SID)).toEqual({
+      convId: SID,
+      isStable: false,
+      fallbackReason: "unparseable_session_key",
+    });
+  });
+});
+
 describe("deriveConvIdentity — intentional ephemeral (no warning class)", () => {
   it("subagent spawns stay per-session", () => {
     const r = deriveConvIdentity("agent:bastkid-dedicated:subagent:32049344-3585-41b4-8f41-6b522b5c6b9d", SID);

@@ -47,7 +47,7 @@ import {
   registerSpeakerAttributedContextEngine,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.5.5";
+const PLUGIN_VERSION = "5.6.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -2844,8 +2844,11 @@ export function noteFilterResult(state, sessionKey, model, passed) {
  * stable ids (a new scope family requires a table entry and a test).
  *
  * Structural tokens are matched case-sensitively, exactly as OpenClaw emits
- * them; the full sessionKey (including the leading agent namespace) is
- * preserved verbatim so two agents sharing a peer id never collide.
+ * them; the leading agent namespace is always retained so two agents sharing
+ * a peer id never collide. Most scopes use the sessionKey verbatim. The web
+ * scope is the one exception: it carries a per-conversation tail that is
+ * deliberately dropped, so that every conversation a user opens keeps its own
+ * gateway session while sharing one per-user VC conversation.
  *
  * Subagent and cron scopes return non-warning fallback reasons for caller
  * observability; explicit sessions are ephemeral without a fallback reason.
@@ -2880,6 +2883,24 @@ export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
   if (scope.length === 3 && scope[0] === "discord" &&
       ["channel", "guild", "direct", "group"].includes(scope[1]) && scope[2]) {
     return stable(sessionKey);
+  }
+  // Web chat mints agent:<agentId>:web:direct:<userId>:conv:<conversationId>.
+  // Identity stabilizes on the user prefix and drops the :conv:<id> tail, so
+  // every conversation one user opens shares a single VC conversation while
+  // keeping its own gateway session (its own JSONL, its own raw history, no
+  // cross-chat bleed and no collision between concurrent tabs). The tail is
+  // required in the minted key precisely because it is what keeps those
+  // gateway sessions distinct; it carries no identity of its own.
+  //
+  // `direct` rather than a bespoke token: a per-user coach chat is a 1:1
+  // conversation, and `direct` is already in the engine's kind allowlist, so
+  // actor attribution resolves (actor:web:<userId>) instead of coming back
+  // empty. Only this exact 5-token shape matches; anything else under `web`
+  // falls through to the counted unparseable fallback rather than being
+  // wildcarded into a stable id.
+  if (scope.length === 5 && scope[0] === "web" && scope[1] === "direct" &&
+      scope[2] && scope[3] === "conv" && scope[4]) {
+    return stable(`agent:${parts[1]}:web:direct:${scope[2]}`);
   }
   if (scope[0] === "cron" && scope[1]) {
     // Crons are intentionally ephemeral: cron traffic runs on models outside
