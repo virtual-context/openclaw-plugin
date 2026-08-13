@@ -47,7 +47,7 @@ import {
   registerSpeakerAttributedContextEngine,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.6.0";
+const PLUGIN_VERSION = "5.7.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -3059,6 +3059,101 @@ export function buildConversationGroupIndex(groupsCfg, log, options = {}) {
 }
 
 /**
+ * Read per-agent VC keys from disk.
+ *
+ * Config shape: { "<agentId>": "<absolute path to a file holding that key>" }.
+ * Key MATERIAL is never placed in openclaw.json: the config names a file, and
+ * the key is read from it once at register. An agent listed here sends its own
+ * key on every VC call, so its traffic resolves to that key's tenant instead of
+ * the deployment-wide one.
+ *
+ * Every entry is validated independently and a bad entry is SKIPPED with a
+ * loud log rather than failing the plugin: a typo in one agent's path must not
+ * take VC down for every other agent. A skipped entry falls back to the global
+ * key, which is the pre-existing behaviour.
+ *
+ * Pure given (config, logger, reader); exported for unit testing.
+ */
+export function buildAgentKeyIndex(agentKeyFilesCfg, log, readKeyFile) {
+  const index = new Map();
+  if (agentKeyFilesCfg === undefined || agentKeyFilesCfg === null) return index;
+  if (typeof agentKeyFilesCfg !== "object" || Array.isArray(agentKeyFilesCfg)) {
+    log?.warn?.("[vc] agentKeyFiles: expected an object of agentId -> keyfile path — config ignored");
+    return index;
+  }
+  const read = typeof readKeyFile === "function"
+    ? readKeyFile
+    : (path) => readFileSync(path, "utf8");
+
+  for (const [agentId, rawPath] of Object.entries(agentKeyFilesCfg)) {
+    // An agent id containing ':' would never match a parsed session scope and
+    // silently never apply, so reject it here where it is visible.
+    if (typeof agentId !== "string" || !agentId || agentId.includes(":")) {
+      log?.warn?.(`[vc] agentKeyFiles: invalid agent id ${JSON.stringify(agentId)} — entry ignored`);
+      continue;
+    }
+    if (typeof rawPath !== "string" || !rawPath.trim()) {
+      log?.warn?.(`[vc] agentKeyFiles: ${JSON.stringify(agentId)} has no keyfile path — entry ignored`);
+      continue;
+    }
+    let key;
+    try {
+      key = String(read(rawPath.trim())).trim();
+    } catch (err) {
+      log?.error?.(
+        `[vc] agentKeyFiles: cannot read keyfile for ${JSON.stringify(agentId)} — ` +
+        `entry ignored, falling back to the global key (${err?.code ?? err})`,
+      );
+      continue;
+    }
+    // Shape-check rather than trust the file. A truncated or placeholder file
+    // would otherwise authenticate as nothing and 401 every call for that agent.
+    if (!/^vc-[0-9a-f]{40}$/.test(key)) {
+      log?.error?.(
+        `[vc] agentKeyFiles: keyfile for ${JSON.stringify(agentId)} is not a vc-<40hex> key — ` +
+        `entry ignored, falling back to the global key`,
+      );
+      continue;
+    }
+    index.set(agentId, key);
+  }
+  return index;
+}
+
+/**
+ * Choose the VC key for a session.
+ *
+ * The agent id is taken from the session key's `agent:<agentId>:` namespace.
+ * An agent with its own entry uses its own key; everything else uses the
+ * deployment-wide key. Absent/unparseable session keys fall back to the global
+ * key, which is exactly the behaviour before per-agent keys existed.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function selectVcKey(sessionKey, globalKey, agentKeyIndex) {
+  if (!agentKeyIndex || agentKeyIndex.size === 0) return globalKey;
+  const agentId = sessionAgentScopeId(sessionKey);
+  if (!agentId) return globalKey;
+  return agentKeyIndex.get(agentId) ?? globalKey;
+}
+
+/**
+ * Every distinct key this deployment can send, global first.
+ *
+ * The completion outbox is stored in a directory derived from the key hash
+ * (see completionDeploymentScope), so each key has its OWN outbox. A drain
+ * scheduled for one key can never see another key's records. Startup drains
+ * must therefore cover every configured key or an agent's queued completions
+ * would sit undelivered forever, with no error anywhere.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function allConfiguredVcKeys(globalKey, agentKeyIndex) {
+  const keys = [globalKey, ...(agentKeyIndex ? agentKeyIndex.values() : [])];
+  return [...new Set(keys.filter((key) => typeof key === "string" && key))];
+}
+
+/**
  * Build a fully-qualified VC REST URL with vckey + optional vcconv query params.
  * opts.predecessor, when present, is appended (encoded) after vcconv — the
  * forward-link hint sent on stable prepares only (see deriveConvIdentity).
@@ -4018,6 +4113,19 @@ export default {
       : null; // null = all providers
     const debug = cfg.debug === true;
     const modelCallCapture = normalizeModelCallCaptureConfig(cfg.modelCallCapture);
+    // Per-agent keys, read from disk so no key material lives in openclaw.json.
+    // An agent without an entry keeps using the deployment-wide key above.
+    const agentKeyIndex = buildAgentKeyIndex(cfg.agentKeyFiles, log);
+    const vcKeyFor = (sessionKey) => selectVcKey(sessionKey, vcKey, agentKeyIndex);
+    // Each key owns its OWN completion-outbox directory (the directory name is
+    // derived from the key hash), so a drain scheduled for one key can never
+    // see another key's records. Startup drains must cover every configured key
+    // or an agent's queued completions would sit undelivered with no error.
+    const drainAllCompletionOutboxes = () => {
+      for (const key of allConfiguredVcKeys(vcKey, agentKeyIndex)) {
+        void scheduleCompletionOutboxDrain({ baseUrl, vcKey: key, log, debug });
+      }
+    };
     registerSpeakerAttributedContextEngine(api, {
       delegateCompactionToRuntime,
       buildMemorySystemPromptAddition,
@@ -4172,7 +4280,7 @@ export default {
           const ingestResult = await vcPost(
             baseUrl,
             "/api/v1/context/ingest",
-            vcKey,
+            vcKeyFor(state.sessionKey),
             identity.convId,
             ingestPayload,
             15000,
@@ -4197,7 +4305,7 @@ export default {
       try {
         queued = queueExactCompletion(identity.convId, ingestPayload, {
           baseUrl,
-          vcKey,
+          vcKey: vcKeyFor(state.sessionKey),
         });
       } catch (error) {
         log.error?.(
@@ -4214,7 +4322,7 @@ export default {
       // All exact deliveries, including the first attempt, pass through one
       // ordering worker. Direct delivery here could overtake an older retained
       // turn for the same conversation.
-      await scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
+      await scheduleCompletionOutboxDrain({ baseUrl, vcKey: vcKeyFor(state.sessionKey), log, debug });
       return true;
     }
 
@@ -4268,8 +4376,18 @@ export default {
       return;
     }
 
-    log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
-    void scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
+    log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    // Make per-agent key routing visible at boot. A short SHA-256 fingerprint,
+    // never key material. Deliberately not called a tenant id: that equivalence
+    // holds only for a tenant's primary key, not for secondary API keys.
+    for (const [routedAgentId, routedKey] of agentKeyIndex) {
+      log.info?.(
+        `[vc] agent key routing: ${routedAgentId} -> keyfp=` +
+        `${createHash("sha256").update(routedKey, "utf8").digest("hex").slice(0, 12)} ` +
+        `(fingerprint, not a tenant id)`,
+      );
+    }
+    drainAllCompletionOutboxes();
 
     // ── Config compatibility checks ──
     const defaults = ocConfig.agents?.defaults ?? {};
@@ -4332,7 +4450,7 @@ export default {
         const factoryIdentity = selectConvId(ctx?.sessionKey ?? "", factorySession);
         const factoryChannelId = cleanInboundField(ctx?.channelId, 256);
         maybeRefreshToolDefs(
-          baseUrl, vcKey, factoryIdentity.convId, factoryChannelId, log,
+          baseUrl, vcKeyFor(ctx?.sessionKey ?? ""), factoryIdentity.convId, factoryChannelId, log,
         );
         const fetched = cachedToolDef(
           factoryIdentity.convId, def.name, factoryChannelId,
@@ -4351,7 +4469,7 @@ export default {
             const response = await vcPost(
               baseUrl,
               `/api/v1/tools/${def.name}`,
-              vcKey,
+              vcKeyFor(ctx?.sessionKey ?? ""),
               identity.convId,
               { arguments: params },
               15000,
@@ -4410,7 +4528,7 @@ export default {
             const prepareResult = await vcPost(
               baseUrl,
               "/api/v1/context/prepare",
-              vcKey,
+              vcKeyFor(ctx?.sessionKey ?? ""),
               identity.convId,
               { messages: synthMessages },
               60000,
@@ -4566,7 +4684,7 @@ export default {
         const prepareResult = await vcPost(
           baseUrl,
           "/api/v1/context/prepare",
-          vcKey,
+          vcKeyFor(ctx?.sessionKey ?? ""),
           identity.convId,
           { messages: synthMessages },
           60000,
@@ -4592,7 +4710,7 @@ export default {
       // A prior completion may have reached the cloud even when this process
       // timed out before receiving its acknowledgement. Drain is idempotent by
       // immutable source message id and never blocks this prompt path.
-      void scheduleCompletionOutboxDrain({ baseUrl, vcKey, log, debug });
+      drainAllCompletionOutboxes();
       const sessionId = hookSessionIdentity(ctx);
       const sessionKey = ctx?.sessionKey ?? "";
       if (isExcludedTrigger(ctx)) {
@@ -5002,7 +5120,7 @@ export default {
         try {
           await requireExactSourceCapability({
             baseUrl,
-            vcKey,
+            vcKey: vcKeyFor(sessionKey),
             convId: identity.convId,
             log: debug ? log : null,
           });
@@ -5247,7 +5365,7 @@ export default {
         prepareResult = await vcPost(
           baseUrl,
           preparePath,
-          vcKey,
+          vcKeyFor(sessionKey),
           identity.convId,
           prepareBody,
           prepareTimeoutMs,
@@ -5874,7 +5992,7 @@ export default {
           const ingestResult = await vcPost(
             baseUrl,
             "/api/v1/context/ingest",
-            vcKey,
+            vcKeyFor(sessionKey),
             identity.convId,
             ingestPayload,
             15000,
