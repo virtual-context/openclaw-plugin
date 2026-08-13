@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.6.0",
+  "version": "5.7.0",
   "kind": "context-engine",
   "main": "./index.js",
   "activation": {
@@ -67,7 +67,14 @@
         },
         "additionalProperties": false
       },
-      "convIdentity": {
+      "agentKeyFiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Map of agent id -> absolute path to a file containing that agent's VC key. That agent's traffic is sent with that key, and therefore resolves to that key's tenant; every other agent uses vcKey. The config names a FILE so no key material is stored here. Invalid or unreadable entries are skipped with a log and fall back to vcKey."
+    },
+    "convIdentity": {
         "type": "string",
         "enum": [
           "session",
