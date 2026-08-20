@@ -572,6 +572,65 @@ describe("pending ids may not cross a VC credential boundary", () => {
   });
 });
 
+describe("counters are process-wide, not per registration", () => {
+  it("REGRESSION: two registrations in ONE module instance share one counter", async () => {
+    // register() runs once per AGENT CONTEXT, not once per process -- measured
+    // on prod: three calls, one PID. Per-registration stats produce three
+    // independent counters printing three interleaved reports into one journal,
+    // each with its own N. A reader adds them, or mistakes one for the total.
+    //
+    // Every other test here calls vi.resetModules() before registering, which
+    // hands each registration a FRESH module and hides this entirely. This test
+    // deliberately does not, which is the only reason it can see the bug.
+    const home = makeHome();
+    installFetch();
+    vi.resetModules();
+    vi.doMock("node:os", async () => {
+      const actual = await vi.importActual("node:os");
+      return { ...actual, homedir: () => home };
+    });
+    const mod = await import("../index.js");
+
+    const register = () => {
+      const handlers = new Map();
+      const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      mod.default.register({
+        logger: log,
+        pluginConfig: {
+          vcKey: "k", baseUrl: "https://api.example.com",
+          convIdentity: "stable", outboundIdCapture: { mode: "observe" },
+        },
+        config: {}, registerTool: vi.fn(),
+        on: vi.fn((name, handler) => handlers.set(name, handler)),
+      });
+      return { handlers, log };
+    };
+
+    const first = register();
+    const second = register();
+
+    // One event through the first registration...
+    await first.handlers.get("message_sent")(sentEvent(), sentCtx());
+    expect(logText(first.log)).toContain("events=1");
+
+    // ...then 24 through the second. The periodic report fires at 25, and it
+    // can only reach 25 if the counter is shared: per-registration counters
+    // would leave the second at 24 and print nothing at all.
+    for (let i = 0; i < 24; i += 1) {
+      await second.handlers.get("message_sent")(
+        sentEvent({ messageId: `152900000000000${String(1000 + i)}` }), sentCtx(),
+      );
+    }
+
+    const text = logText(second.log);
+    expect(text).toContain("events=25");
+    expect(text).toContain("witnessed=25");
+    expect(text).toContain("registrations=2");
+    // And the first registration never saw a second report of its own.
+    expect(logText(first.log)).not.toContain("events=25");
+  });
+});
+
 describe("a receiver can reject inside a 200", () => {
   function installLatePathFetch(payload, status = 200) {
     const fetchSpy = vi.fn(async (url) => {

@@ -4325,6 +4325,19 @@ export function outboundConvIdFor(sessionKey, { stableMode, groupIndex } = {}) {
   return typeof identity.convId === "string" ? identity.convId : "";
 }
 
+// -- Instrument state, process-wide ------------------------------------------
+// register() is called ONCE PER AGENT CONTEXT, not once per process -- measured
+// on prod: three calls, same PID. A per-registration stats object therefore
+// produces three independent counters printing three interleaved reports, each
+// with its own N and its own report cadence, into one journal. A reader would
+// naturally add them or mistake one for the total.
+//
+// That is the denominator failure this instrument exists to prevent, committed
+// by the instrument itself. The ESM module is instantiated once per process, so
+// module scope is what makes `events` mean "events this process saw".
+const outboundIdStats = newOutboundIdStats();
+let outboundIdRegistrations = 0;
+
 // -- In-memory pending set (fast path) --------------------------------------
 // convId -> Map(identityKey -> {identity, observed_at, captured_at})
 const pendingOutboundIds = new Map();
@@ -5090,12 +5103,17 @@ export function renderOutboundIdReport(stats, context = {}) {
   const mode = context.mode ?? "?";
   const convIdentity = context.convIdentity ?? "?";
   const late = context.latePath ? "configured" : "NOT configured";
+  // Printed because register() runs once per agent context: the counters are
+  // process-wide and shared across all of them, so a reader never has to guess
+  // whether N is one registration's or the process's.
+  const registrations = context.registrations ?? 1;
   if (!stats?.events) {
     return (
       `[vc:outbound-id] NO DATA - the message_sent hook has not fired this ` +
       `boot (events=0). This is NOT "no outbound messages" and NOT health: an ` +
       `unfired instrument and a broken one are the same observation. ` +
-      `mode=${mode} convIdentity=${convIdentity} latePath=${late}`
+      `mode=${mode} convIdentity=${convIdentity} latePath=${late} ` +
+      `registrations=${registrations}`
     );
   }
   return (
@@ -5112,7 +5130,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `refused[${refusals || "none"}] ` +
     `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
     `mode=${mode} convIdentity=${convIdentity} latePath=${late} ` +
-    `capture_rate=UNKNOWN | ` +
+    `registrations=${registrations} capture_rate=UNKNOWN | ` +
     `LIMITATIONS: this measures PRESENCE, not correctness. ` +
     `capture_rate is UNKNOWN and not merely unreported: events= is a ` +
     `NUMERATOR WITH NO DENOMINATOR. This process cannot count how many ` +
@@ -5466,7 +5484,7 @@ export default {
 
     // ── Outbound message-id capture (SPEC-outbound-message-id.md) ──
     const outboundIdCfg = normalizeOutboundIdConfig(cfg.outboundIdCapture);
-    const outboundIdStats = newOutboundIdStats();
+    if (outboundIdCfg.enabled) outboundIdRegistrations += 1;
 
     // Conversation gate. See outboundConvIdFor.
     const resolveOutboundConvId = (sessionKey) =>
@@ -7363,6 +7381,7 @@ export default {
               mode: outboundIdCfg.mode,
               convIdentity: stableMode ? "stable" : "session",
               latePath: outboundIdCfg.latePath,
+              registrations: outboundIdRegistrations,
             }));
           }
         } catch (error) {
