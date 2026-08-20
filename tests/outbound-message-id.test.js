@@ -253,22 +253,31 @@ describe("wire projection (I-1, I-3)", () => {
     const body = outboundIdWireProjection([
       { identity: identity(), observed_at: "2026-08-20T00:00:00.000Z" },
     ]);
-    expect(Object.keys(body)).toEqual(["observed_outbound_messages"]);
+    expect(Object.keys(body)).toEqual(["_vc_agent_outbound_ids"]);
     // Match FIELD NAMES, not substrings of the serialized blob: "account_id"
     // contains "count", so a substring ruler fails on a correct payload and
     // would have been "fixed" by weakening the check that matters.
     const fieldNames = [
       ...Object.keys(body),
-      ...body.observed_outbound_messages.flatMap((row) => Object.keys(row)),
+      ...body._vc_agent_outbound_ids.flatMap((row) => Object.keys(row)),
     ];
     // An ALLOWLIST, not a blacklist. A finite forbidden-words list passes
     // anything nobody thought of -- `expected_count`, `denominator` -- which is
     // precisely the field that would let a receiver infer completeness.
     expect(new Set(fieldNames)).toEqual(new Set([
-      "observed_outbound_messages",
+      "_vc_agent_outbound_ids",
       "platform", "account_id", "channel_id", "message_id", "observed_at",
     ]));
-    expect(Object.keys(body.observed_outbound_messages[0]).sort()).toEqual([
+    // With a scope supplied, agent_scope_id joins the allowlist and nothing else does.
+    const scoped = outboundIdWireProjection(
+      [{ identity: identity(), observed_at: "2026-08-20T00:00:00.000Z" }], "vast",
+    );
+    expect(Object.keys(scoped._vc_agent_outbound_ids[0]).sort()).toEqual([
+      "account_id", "agent_scope_id", "channel_id", "message_id",
+      "observed_at", "platform",
+    ]);
+    expect(scoped._vc_agent_outbound_ids[0].agent_scope_id).toBe("vast");
+    expect(Object.keys(body._vc_agent_outbound_ids[0]).sort()).toEqual([
       "account_id", "channel_id", "message_id", "observed_at", "platform",
     ]);
   });
@@ -288,7 +297,7 @@ describe("wire projection (I-1, I-3)", () => {
     ]);
     // Assert the CONTENT, not the count: `slice(-2)` also yields length 2
     // while dropping the very id that was witnessed twice.
-    expect(body.observed_outbound_messages.map((row) => row.message_id).sort())
+    expect(body._vc_agent_outbound_ids.map((row) => row.message_id).sort())
       .toEqual(["2", MESSAGE].sort());
   });
 

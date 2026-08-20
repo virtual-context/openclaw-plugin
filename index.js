@@ -4128,6 +4128,10 @@ const OUTBOUND_ID_REPORT_EARLY_THROUGH = 5;
 // late-path one, never more. The protection is the namespace, the two epoch
 // fences, and suppression requiring an exact positive match.
 const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "_vc_agent_outbound_ids";
+// The SAME key on the legacy ingest path. These were two different names until
+// the engine named its reader key; carrying two means whoever forwards the body
+// carries one and silently drops the other, which is how a fix ships inert.
+const OUTBOUND_ID_WIRE_KEY = OUTBOUND_ID_EXACT_PAYLOAD_KEY;
 // Discord's per-message character limit. Used ONLY to compute a lower bound on
 // how many payloads were split across several platform messages -- see
 // chunkedLowerBound. It is a threshold for an estimate that is labelled as an
@@ -4301,7 +4305,7 @@ export function outboundIdRecordKey(deploymentId, convId, identity) {
  *
  * Pure function; exported for unit testing.
  */
-export function outboundIdWireProjection(entries) {
+export function outboundIdWireProjection(entries, agentScopeId = "") {
   const observed = [];
   const seen = new Set();
   for (const entry of entries ?? []) {
@@ -4316,10 +4320,14 @@ export function outboundIdWireProjection(entries) {
       account_id: identity.account_id,
       channel_id: identity.channel_id,
       message_id: identity.message_id,
+      // Sent explicitly rather than left to the receiver's fallback: it
+      // defaults to its own configured scope, and this gateway runs several
+      // agents, so a fallback could file an identity under the wrong one.
+      ...(agentScopeId ? { agent_scope_id: agentScopeId } : {}),
       ...(entry?.observed_at ? { observed_at: entry.observed_at } : {}),
     });
   }
-  return observed.length > 0 ? { observed_outbound_messages: observed } : {};
+  return observed.length > 0 ? { [OUTBOUND_ID_WIRE_KEY]: observed } : {};
 }
 
 /**
@@ -4487,7 +4495,9 @@ function outboundIdQueuePath(deploymentId, key) {
  * startup must drain EVERY configured key or an agent's ids sit forever with
  * no error anywhere.
  */
-function queueOutboundId(convId, identity, { baseUrl, vcKey, observedAt }) {
+function queueOutboundId(
+  convId, identity, { baseUrl, vcKey, observedAt, agentScopeId = "" },
+) {
   const deployment = completionDeploymentScope(baseUrl, vcKey);
   const key = outboundIdRecordKey(deployment.deployment_id, convId, identity);
   // I-4: a metadata failure drops the metadata and nothing else. Never throw
@@ -4501,6 +4511,7 @@ function queueOutboundId(convId, identity, { baseUrl, vcKey, observedAt }) {
     key,
     conv_id: convId,
     identity,
+    agent_scope_id: agentScopeId,
     observed_at: observedAt,
     enqueued_at: new Date().toISOString(),
   };
@@ -4836,7 +4847,7 @@ async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }
     record.conv_id,
     // Single-element additive set. One record per request keeps the retry
     // domain per-identity: a rejected id can never hold a different id back.
-    outboundIdWireProjection([record]),
+    outboundIdWireProjection([record], record.agent_scope_id ?? ""),
     10000,
     log,
     { correlationId: `outbound-id:${String(record.key).slice(0, 16)}` },
@@ -5665,7 +5676,7 @@ export default {
      */
     async function ingestWithOutboundIds(path, sessionKey, convId, ingestPayload) {
       const fields = outboundIdIngestFields(convId, sessionKey);
-      const carried = fields.observed_outbound_messages?.length ?? 0;
+      const carried = fields[OUTBOUND_ID_WIRE_KEY]?.length ?? 0;
       if (carried === 0) {
         return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
           ingestPayload, 15000, log);
@@ -5720,6 +5731,7 @@ export default {
         try {
           const queued = queueOutboundId(convId, identity, {
             baseUrl, vcKey: drainOptions.vcKey, observedAt,
+            agentScopeId: sessionAgentScopeId(sessionKey),
           });
           if (queued.refused) outboundIdStats.queueRefused += 1;
           else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
@@ -5757,7 +5769,7 @@ export default {
      */
     function outboundIdExactFields(convId, sessionKey) {
       const fields = outboundIdIngestFields(convId, sessionKey);
-      const observed = fields.observed_outbound_messages;
+      const observed = fields[OUTBOUND_ID_WIRE_KEY];
       if (!observed?.length) return {};
       outboundIdStats.carriedExact += observed.length;
       return { [OUTBOUND_ID_EXACT_PAYLOAD_KEY]: observed };
@@ -5768,7 +5780,7 @@ export default {
       const entries = pendingOutboundIdsForConversation(
         pendingOutboundIds, outboundPendingKey(convId, sessionKey),
       );
-      return outboundIdWireProjection(entries);
+      return outboundIdWireProjection(entries, sessionAgentScopeId(sessionKey));
     }
 
     if (!vcKey) {
