@@ -4712,17 +4712,29 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
 // costs nothing, and being the component that breaks on a rename is exactly
 // the drift this feature has already been bitten by once.
 const OUTBOUND_ID_PERMANENT_REASONS = new Set([
-  // Current wire vocabulary.
+  // LIVE reasons the receiver can return today.
   "malformed_identity",
   "unresolvable_tenant_scope",
   "conversation_deleted",
   "ambiguous_alias_resolution",
   "fence_rejection",
-  // The engine's earlier internal names, still accepted.
+  // Distinct from fence_rejection ON PURPOSE, and the distinction is the whole
+  // point: a fenced identity is one stale record and the system is working,
+  // while an unknown epoch start means EVERY identity for that conversation
+  // declines forever. Different remedies, so they must never be collapsed into
+  // one name again.
+  "epoch_start_unknown",
+  // Names the receiver used earlier and may use again. Superset by design --
+  // being the component that breaks on a rename is the failure mode here, and
+  // it has already nearly happened twice.
+  //
+  // DO NOT PRUNE THIS BLOCK to tidy it. Removing a name the receiver still
+  // sends makes that reason UNRECOGNISED, which is retried rather than dropped
+  // -- safe, but it burns the queue's age budget silently and the retained
+  // count then lies about why.
   "malformed",
   "not_canonical",
   "unknown_conversation",
-  "epoch_start_unknown",
   "predates_epoch",
 ]);
 

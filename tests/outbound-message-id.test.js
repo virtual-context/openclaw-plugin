@@ -626,12 +626,15 @@ describe("late-path response classification", () => {
 
   it("names every permanent decline the engine can return", () => {
     for (const reason of [
-      // current wire vocabulary
+      // live reasons the receiver returns today
       "malformed_identity", "unresolvable_tenant_scope", "conversation_deleted",
       "ambiguous_alias_resolution", "fence_rejection",
-      // the engine's earlier internal names, still accepted
-      "malformed", "not_canonical", "unknown_conversation",
-      "epoch_start_unknown", "predates_epoch",
+      // distinct from fence_rejection on purpose: an unknown epoch start means
+      // EVERY identity for that conversation declines forever, which needs a
+      // different remedy than one stale record being correctly fenced
+      "epoch_start_unknown",
+      // names used earlier and possibly again; superset by design
+      "malformed", "not_canonical", "unknown_conversation", "predates_epoch",
     ]) {
       const verdict = classifyOutboundIdResponse({ [reason]: 1 });
       expect(verdict).toMatchObject({ ok: false, reason, permanent: true });
