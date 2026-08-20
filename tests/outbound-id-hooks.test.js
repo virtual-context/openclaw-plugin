@@ -770,18 +770,16 @@ describe("a diagnostic may never stop the plugin loading", () => {
   });
 });
 
-describe("Discord guild channels do not get the fast path", () => {
-  it("DOCUMENTS THE GAP: an exact-admission turn carries no ids on its ingest", async () => {
+describe("Discord guild channels reach the store via the exact path", () => {
+  it("carries ids under the sibling key, NOT the legacy ingest field", async () => {
     // agent:<a>:discord:channel:<id> requires exact source attestation, so its
-    // completion goes through queueExactCompletion. That payload is
-    // FINGERPRINTED, and re-queuing the same source message with a different
-    // fingerprint dead-letters the record and loses the turn - so a
-    // time-varying id set must never be folded into it.
+    // completion goes through queueExactCompletion rather than the legacy
+    // ingest. Ids therefore ride the _vc_agent_outbound_ids sibling key, which
+    // is EXCLUDED from completionOutboxFingerprint -- covering it would make a
+    // re-queue with a changed set dead-letter the record and lose a real turn.
     //
-    // The consequence is not cosmetic: the incident that motivated this feature
-    // happened in a guild channel, so for that exact scope THE LATE PATH IS THE
-    // ONLY ROUTE. This test exists so that fact cannot quietly stop being true
-    // in either direction.
+    // This scope is the one the incident came from, so the assertion that
+    // matters is that the legacy field never appears here.
     const home = makeHome();
     const fetchSpy = installFetch();
     const { handlers } = await registerPlugin(home, {

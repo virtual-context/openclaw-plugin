@@ -16,6 +16,7 @@ import {
   enforceOutboundIdQueueBounds,
   outboundIdFailureIsPermanent,
   classifyOutboundIdResponse,
+  completionOutboxFingerprint,
   newOutboundIdStats,
   noteOutboundIdRefusal,
   renderOutboundIdReport,
@@ -535,6 +536,57 @@ describe("queue bounds report their N (leg 4)", () => {
   });
 });
 
+describe("the exact-completion fingerprint ignores outbound ids", () => {
+  const KEY = "_vc_agent_outbound_ids";
+  const base = {
+    assistant_message: "a reply",
+    user_message: "a question",
+    exact_source_admission: { version: 2, conversation_generation: 0 },
+  };
+  const ids = (n) => Array.from({ length: n }, (_, i) => ({
+    platform: "discord", account_id: "vast",
+    channel_id: CHANNEL, message_id: `15290000000000000${10 + i}`,
+    observed_at: "2026-08-20T00:00:00.000Z",
+  }));
+
+  it("REGRESSION: present, absent and CHANGED all fingerprint identically", () => {
+    // queueExactCompletion dead-letters a re-queue whose fingerprint differs,
+    // and its caller then returns without queuing the completion AT ALL. Since
+    // identities are witnessed asynchronously, the same source message can be
+    // queued twice with different sets -- so covering them would convert an
+    // ordinary retry into a LOST TURN carrying a real person's message.
+    const absent = completionOutboxFingerprint("sk:c", base);
+    const present = completionOutboxFingerprint("sk:c", { ...base, [KEY]: ids(1) });
+    const changed = completionOutboxFingerprint("sk:c", { ...base, [KEY]: ids(3) });
+    const emptied = completionOutboxFingerprint("sk:c", { ...base, [KEY]: [] });
+    expect(present).toBe(absent);
+    expect(changed).toBe(absent);
+    expect(emptied).toBe(absent);
+  });
+
+  it("POSITIVE CONTROL: it still covers everything else", () => {
+    // Without this, a fingerprint that ignored the whole payload would pass
+    // the test above.
+    const baseline = completionOutboxFingerprint("sk:c", base);
+    expect(completionOutboxFingerprint("sk:c", {
+      ...base, assistant_message: "a different reply",
+    })).not.toBe(baseline);
+    expect(completionOutboxFingerprint("sk:c", {
+      ...base, user_message: "a different question",
+    })).not.toBe(baseline);
+    expect(completionOutboxFingerprint("sk:other", base)).not.toBe(baseline);
+    expect(completionOutboxFingerprint("sk:c", {
+      ...base, exact_source_admission: { version: 2, conversation_generation: 1 },
+    })).not.toBe(baseline);
+  });
+
+  it("handles a non-object payload without throwing", () => {
+    for (const payload of [null, undefined, "x", 7]) {
+      expect(completionOutboxFingerprint("sk:c", payload)).toMatch(/^[a-f0-9]{64}$/);
+    }
+  });
+});
+
 describe("late-path response classification", () => {
   it("treats accepted and duplicate as success -- a duplicate is a no-op, not a failure", () => {
     for (const body of [
@@ -547,6 +599,10 @@ describe("late-path response classification", () => {
 
   it("names every permanent decline the engine can return", () => {
     for (const reason of [
+      // current wire vocabulary
+      "malformed_identity", "unresolvable_tenant_scope", "conversation_deleted",
+      "ambiguous_alias_resolution", "fence_rejection",
+      // the engine's earlier internal names, still accepted
       "malformed", "not_canonical", "unknown_conversation",
       "epoch_start_unknown", "predates_epoch",
     ]) {
@@ -556,10 +612,12 @@ describe("late-path response classification", () => {
     }
   });
 
-  it("write_failed is the ONLY retryable decline", () => {
-    const verdict = classifyOutboundIdResponse({ write_failed: 1 });
-    expect(verdict).toMatchObject({ ok: false, reason: "write_failed", permanent: false });
-    expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(false);
+  it("the store-unavailable class is the ONLY retryable decline", () => {
+    for (const reason of ["store_unavailable", "write_failed"]) {
+      const verdict = classifyOutboundIdResponse({ [reason]: 1 });
+      expect(verdict).toMatchObject({ ok: false, reason, permanent: false });
+      expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(false);
+    }
   });
 
   it("REGRESSION: a response with no recognisable outcome is NOT success", () => {

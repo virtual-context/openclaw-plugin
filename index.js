@@ -3642,9 +3642,21 @@ function durableUnlink(path) {
   }
 }
 
-function completionOutboxFingerprint(convId, payload) {
+/** Exported: the exclusion below is a load-bearing property, not a detail. */
+export function completionOutboxFingerprint(convId, payload) {
+  // The outbound-id set is EXCLUDED from the covered payload, and that
+  // exclusion is what makes the fast path safe on this route.
+  //
+  // queueExactCompletion dead-letters a re-queue whose fingerprint differs and
+  // its caller then returns WITHOUT queuing the completion at all. Since
+  // identities are witnessed asynchronously, the same source message can be
+  // queued twice with different sets -- so covering them would turn an
+  // ordinary retry into a lost turn. Excluded, the covered payload is
+  // byte-identical whether identities are present, absent, or changed.
+  const { [OUTBOUND_ID_EXACT_PAYLOAD_KEY]: _identities, ...covered } =
+    payload && typeof payload === "object" ? payload : {};
   return createHash("sha256")
-    .update(JSON.stringify({ conv_id: convId, payload }), "utf8")
+    .update(JSON.stringify({ conv_id: convId, payload: covered }), "utf8")
     .digest("hex");
 }
 
@@ -4098,6 +4110,19 @@ const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
 const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
 const OUTBOUND_ID_MAX_CARRIED_PER_INGEST = 32;
 const OUTBOUND_ID_REPORT_EVERY = 25;
+// The sibling key the engine reads with get_agent_outbound_ids. It rides
+// OUTSIDE the attested region, which is what lets guild channels have a fast
+// path at all -- their completion payload is fingerprinted, and a
+// time-varying field inside that region would dead-letter the record and lose
+// a real turn.
+//
+// TRUST NOTE, stated here because it would otherwise be inferred wrongly:
+// riding outside the attested region means these identities are NOT covered by
+// the attestation's integrity. That is not a regression -- the late path is
+// equally unattested -- but a fast-path identity is exactly as trusted as a
+// late-path one, never more. The protection is the namespace, the two epoch
+// fences, and suppression requiring an exact positive match.
+const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "_vc_agent_outbound_ids";
 // Discord's per-message character limit. Used ONLY to compute a lower bound on
 // how many payloads were split across several platform messages -- see
 // chunkedLowerBound. It is a threshold for an estimate that is labelled as an
@@ -4655,7 +4680,19 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
  * All three A7 outcomes (deleted, ambiguous, unresolvable) are in here, which
  * is why nothing in A7 ever retries on this side.
  */
+// BOTH vocabularies, deliberately. The engine renamed to these names after I
+// had shipped against its earlier internal ones, and whether either set
+// reaches me verbatim depends on a wrapper neither of us owns. Accepting both
+// costs nothing, and being the component that breaks on a rename is exactly
+// the drift this feature has already been bitten by once.
 const OUTBOUND_ID_PERMANENT_REASONS = new Set([
+  // Current wire vocabulary.
+  "malformed_identity",
+  "unresolvable_tenant_scope",
+  "conversation_deleted",
+  "ambiguous_alias_resolution",
+  "fence_rejection",
+  // The engine's earlier internal names, still accepted.
   "malformed",
   "not_canonical",
   "unknown_conversation",
@@ -4667,7 +4704,7 @@ const OUTBOUND_ID_PERMANENT_REASONS = new Set([
 const OUTBOUND_ID_ACCEPTED_OUTCOMES = ["accepted", "duplicate"];
 
 /** The only retryable decline. Everything else named is permanent. */
-const OUTBOUND_ID_RETRYABLE_REASONS = new Set(["write_failed"]);
+const OUTBOUND_ID_RETRYABLE_REASONS = new Set(["store_unavailable", "write_failed"]);
 
 /**
  * Interpret a late-path response.
@@ -4695,7 +4732,9 @@ export function classifyOutboundIdResponse(result) {
   if (OUTBOUND_ID_ACCEPTED_OUTCOMES.some((key) => count(key) > 0)) {
     return { ok: true, reason: "", permanent: false };
   }
-  for (const reason of [...OUTBOUND_ID_PERMANENT_REASONS, "write_failed"]) {
+  for (const reason of [
+    ...OUTBOUND_ID_PERMANENT_REASONS, ...OUTBOUND_ID_RETRYABLE_REASONS,
+  ]) {
     if (count(reason) > 0) {
       return {
         ok: false,
@@ -5128,6 +5167,7 @@ export function newOutboundIdStats() {
     metadataRejected: 0,
     chunkedLowerBound: 0,
     sendingHookEvents: 0,
+    carriedExact: 0,
     evictedPending: 0,
     refusedByReason: new Map(),
     firstEventAt: null,
@@ -5186,7 +5226,8 @@ export function renderOutboundIdReport(stats, context = {}) {
     `success=${stats.successTrue} withMessageId=${stats.withMessageId} ` +
     `withSessionKey=${stats.withSessionKey} withRunId=${stats.withRunId} ` +
     `witnessed=${stats.witnessed} duplicates=${stats.duplicates} ` +
-    `carried=${stats.carried} queued=${stats.queued} ` +
+    `carried=${stats.carried} carriedExact=${stats.carriedExact} ` +
+    `queued=${stats.queued} ` +
     `queuedDuplicate=${stats.queuedDuplicate} ` +
     `queueRefused=${stats.queueRefused} unbackedFast=${stats.unbackedFast} ` +
     `metadataRejected=${stats.metadataRejected} ` +
@@ -5459,6 +5500,11 @@ export default {
         ...userProvenance,
         ...(exactAdmission ? {
           exact_source_admission: exactSourceAdmission,
+          // Guild channels reach the store ONLY through this path -- their
+          // completion is fingerprinted and queued, never sent down the legacy
+          // ingest. The key is excluded from completionOutboxFingerprint, so
+          // adding it cannot change what a re-queue compares.
+          ...outboundIdExactFields(identity.convId, state.sessionKey),
         } : {}),
       };
       if (!exactAdmission) {
@@ -5689,6 +5735,18 @@ export default {
     function outboundPendingKey(convId, sessionKey) {
       const deployment = completionDeploymentScope(baseUrl, vcKeyFor(sessionKey));
       return `${deployment.deployment_id}\u0000${convId}`;
+    }
+
+    /**
+     * The same witnessed set, under the sibling key the exact-source path reads.
+     * Emitted only when non-empty: an empty list is UNKNOWN, not "none" (I-1).
+     */
+    function outboundIdExactFields(convId, sessionKey) {
+      const fields = outboundIdIngestFields(convId, sessionKey);
+      const observed = fields.observed_outbound_messages;
+      if (!observed?.length) return {};
+      outboundIdStats.carriedExact += observed.length;
+      return { [OUTBOUND_ID_EXACT_PAYLOAD_KEY]: observed };
     }
 
     function outboundIdIngestFields(convId, sessionKey) {
