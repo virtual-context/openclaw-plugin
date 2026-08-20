@@ -4205,7 +4205,13 @@ export function isExactOutboundIdentity(identity) {
     // unchanged. That rejects non-strings, empties, over-long values, control
     // characters (which is what keeps the NUL separator injective), and any
     // value that would have been silently trimmed into a different identity.
-    if (typeof raw !== "string" || cleanInboundField(raw, maxLength) !== raw) {
+    // The `raw` guard is not redundant with the round-trip: cleanInboundField
+    // maps "" to "", so an empty field round-trips successfully and would be
+    // accepted as exact. An empty component collapses the namespace - two
+    // different bots, or two different channels, sharing one identity - which
+    // is the false-positive that costs a real person their words.
+    if (typeof raw !== "string" || raw === ""
+      || cleanInboundField(raw, maxLength) !== raw) {
       return false;
     }
   }
@@ -4520,9 +4526,14 @@ function readOutboundIdQueue({ baseUrl, vcKey, log }) {
  * Pure function; exported for unit testing.
  */
 export function outboundIdDueRecords(records, now) {
-  return (records ?? []).filter(
-    (record) => (Date.parse(record?.next_attempt_at ?? "") || 0) <= now,
-  );
+  return (records ?? []).filter((record) => {
+    const parsed = typeof record?.next_attempt_at === "string"
+      ? Date.parse(record.next_attempt_at)
+      : Number.NaN;
+    // No backoff recorded, or an unreadable one, means due now. Erring toward
+    // "attempt it" is safe: the failure path re-arms a real backoff.
+    return Number.isFinite(parsed) ? parsed <= now : true;
+  });
 }
 
 /**
@@ -4540,8 +4551,26 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
   let droppedAged = 0;
   const live = [];
   for (const record of records ?? []) {
-    const enqueuedAt = Date.parse(record?.enqueued_at ?? "") || now;
-    if (now - enqueuedAt >= maxAgeMs) {
+    // `Date.parse(...) || now` would be wrong twice over: it maps a VALID
+    // epoch-0 timestamp onto "just enqueued", and it lets a record whose
+    // timestamp cannot be parsed at all live past the age bound forever. An
+    // unparseable timestamp is treated as maximally old and dropped, because
+    // under I-1 a dropped id is an unknown while an unbounded record is a
+    // record that can outlive its own conversation.
+    // Date.parse COERCES its argument, so a numeric 12345 parses as the year
+    // 12345 and the record becomes effectively immortal. Require a string.
+    const parsed = typeof record?.enqueued_at === "string"
+      ? Date.parse(record.enqueued_at)
+      : Number.NaN;
+    // Unparseable is treated as maximally old and dropped; a future timestamp
+    // (clock skew, or a hand-edited record) is clamped to now so it ages from
+    // here rather than outliving the bound. Both directions exist to make the
+    // age bound actually bound something: a record that outlives its own
+    // conversation can attach an identity claim to a successor.
+    const age = Number.isFinite(parsed)
+      ? Math.max(0, now - parsed)
+      : Number.POSITIVE_INFINITY;
+    if (age >= maxAgeMs) {
       remove?.(record);
       droppedAged += 1;
       continue;
@@ -4715,9 +4744,12 @@ function scheduleOutboundIdDrain(options) {
     // Every record is independent, so the next wake is the soonest of ALL of
     // them - not the soonest head. A head-based wake here would be the same
     // ordering coupling 5.1 rejects, reintroduced through the timer.
-    const nextAt = Math.min(...records.map(
-      (record) => Date.parse(record.next_attempt_at ?? "") || now,
-    ));
+    const nextAt = Math.min(...records.map((record) => {
+      const parsed = typeof record.next_attempt_at === "string"
+        ? Date.parse(record.next_attempt_at)
+        : Number.NaN;
+      return Number.isFinite(parsed) ? parsed : now;
+    }));
     const delay = Math.max(250, nextAt - now);
     worker.timer = setTimeout(() => {
       worker.timer = null;
