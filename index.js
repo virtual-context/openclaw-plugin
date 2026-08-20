@@ -4091,6 +4091,8 @@ const OUTBOUND_ID_MAX_BACKOFF_MS = 5 * 60_000;
 // Stays tight until core@vc rules on a real receiver-side fence (spec 5.4).
 const OUTBOUND_ID_MAX_AGE_MS = 30 * 60_000;
 const OUTBOUND_ID_MAX_RECORDS = 512;
+// Clock skew tolerated before a future-dated record is dropped as malformed.
+const OUTBOUND_ID_MAX_SKEW_MS = 60_000;
 const OUTBOUND_ID_PENDING_TTL_MS = 15 * 60_000;
 const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
 const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
@@ -4503,13 +4505,32 @@ function readOutboundIdQueue({ baseUrl, vcKey, log }) {
       `of scanned=${scanned} (metadata only; no turn is affected)`,
     );
   }
-  records.sort((left, right) => {
+  return { records: outboundIdQueueOrder(records), scanned, discarded };
+}
+
+/**
+ * FEWEST ATTEMPTS FIRST, then oldest, then key.
+ *
+ * Exported because ordering here is a fairness property, not a formatting
+ * choice, and a property that is only observable through the filesystem is a
+ * property nobody tests. Sorting purely by age let a cohort of 64 slow records
+ * be re-selected on every pass -- their short backoffs expire during the pass
+ * itself -- so records beyond the drain limit could go unattempted
+ * indefinitely. There is no per-conversation head, but strict age ordering
+ * recreated starvation by another route.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundIdQueueOrder(records) {
+  return [...(records ?? [])].sort((left, right) => {
+    const leftAttempts = Math.max(0, Number(left.attempts) || 0);
+    const rightAttempts = Math.max(0, Number(right.attempts) || 0);
+    if (leftAttempts !== rightAttempts) return leftAttempts - rightAttempts;
     const leftTime = Date.parse(left.enqueued_at ?? "") || 0;
     const rightTime = Date.parse(right.enqueued_at ?? "") || 0;
     if (leftTime !== rightTime) return leftTime - rightTime;
     return String(left.key).localeCompare(String(right.key));
   });
-  return { records, scanned, discarded };
 }
 
 /**
@@ -4562,14 +4583,18 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
     const parsed = typeof record?.enqueued_at === "string"
       ? Date.parse(record.enqueued_at)
       : Number.NaN;
-    // Unparseable is treated as maximally old and dropped; a future timestamp
-    // (clock skew, or a hand-edited record) is clamped to now so it ages from
-    // here rather than outliving the bound. Both directions exist to make the
-    // age bound actually bound something: a record that outlives its own
-    // conversation can attach an identity claim to a successor.
-    const age = Number.isFinite(parsed)
-      ? Math.max(0, now - parsed)
-      : Number.POSITIVE_INFINITY;
+    // Unparseable is treated as maximally old and DROPPED. So is a timestamp
+    // more than a minute in the future: `Math.max(0, now - parsed)` looked like
+    // a clamp but nothing was persisted, so age simply read 0 on every scan
+    // until the wall clock caught up -- the record was immortal, and an
+    // immortal record can outlive its own conversation and later promote an
+    // unknown into positive evidence for a recreated one. Dropping is the
+    // I-1-safe direction; the minute of tolerance absorbs ordinary clock skew
+    // without letting a year-ahead stamp survive a year.
+    const skewMs = Number.isFinite(parsed) ? parsed - now : 0;
+    const age = !Number.isFinite(parsed) || skewMs > OUTBOUND_ID_MAX_SKEW_MS
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, now - parsed);
     if (age >= maxAgeMs) {
       remove?.(record);
       droppedAged += 1;
@@ -4664,6 +4689,31 @@ async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }
  * the completion outbox's (I-5). Every due record is attempted each pass; a
  * failure retains only ITS OWN record.
  */
+/**
+ * The only sanctioned way to launch a drain.
+ *
+ * `void somePromise()` does not swallow a rejection, it detaches it: the
+ * worker can reject from a bare readdirSync, an unlink, or the finally-block
+ * reread, and the hook's synchronous try/catch cannot see any of that. Under
+ * the host's unhandled-rejection policy a METADATA filesystem failure could
+ * then terminate the gateway process -- I-4 inverted about as far as it goes.
+ */
+function startOutboundIdDrain(options) {
+  try {
+    const promise = scheduleOutboundIdDrain(options);
+    if (promise && typeof promise.catch === "function") {
+      promise.catch((error) => options?.log?.warn?.(
+        `[vc:outbound-id] drain failed (metadata only, no turn affected): ` +
+        `${error}`,
+      ));
+    }
+  } catch (error) {
+    options?.log?.warn?.(
+      `[vc:outbound-id] drain could not start (metadata only): ${error}`,
+    );
+  }
+}
+
 function scheduleOutboundIdDrain(options) {
   if (!options?.latePath) return Promise.resolve();
   const deployment = completionDeploymentScope(options.baseUrl, options.vcKey);
@@ -4733,9 +4783,26 @@ function scheduleOutboundIdDrain(options) {
     }
   };
 
-  worker.promise = run().finally(() => {
+  worker.promise = run().catch((error) => {
+    // The outer promise must never reject: every caller detaches it.
+    worker.options.log?.warn?.(
+      `[vc:outbound-id] drain pass aborted (metadata only): ${error}`,
+    );
+  }).finally(() => {
     worker.promise = null;
-    const { records } = readOutboundIdQueue(worker.options);
+    let records;
+    try {
+      ({ records } = readOutboundIdQueue(worker.options));
+    } catch (error) {
+      // A failed reread must not strand the worker entry: with it left in the
+      // map and no timer armed, no later drain could ever be scheduled for
+      // this deployment and its records would sit forever.
+      outboundIdWorkers.delete(deployment.deployment_id);
+      worker.options.log?.warn?.(
+        `[vc:outbound-id] could not reread queue; worker released: ${error}`,
+      );
+      return;
+    }
     if (records.length === 0) {
       outboundIdWorkers.delete(deployment.deployment_id);
       return;
@@ -4753,7 +4820,7 @@ function scheduleOutboundIdDrain(options) {
     const delay = Math.max(250, nextAt - now);
     worker.timer = setTimeout(() => {
       worker.timer = null;
-      void scheduleOutboundIdDrain(worker.options);
+      startOutboundIdDrain(worker.options);
     }, delay);
     worker.timer.unref?.();
   });
@@ -4777,17 +4844,36 @@ function scheduleOutboundIdDrain(options) {
  *
  * Pure apart from the directory read; exported for unit testing.
  */
-export function inventoryOutboundIdQueues(configuredDeploymentIds, now) {
+export function inventoryOutboundIdQueues(
+  configuredDeploymentIds, now, { deliveryArmed = false } = {},
+) {
   const root = join(
     homedir(), ".openclaw", "state", "virtual-context", "outbound-id-queue",
   );
   const configured = new Set(configuredDeploymentIds ?? []);
   const scopes = [];
-  if (!existsSync(root)) return { scopes, configuredCount: configured.size };
-  for (const entry of readdirSync(root).sort()) {
+  let entries;
+  try {
+    if (!existsSync(root)) {
+      return { scopes, configuredCount: configured.size, rootScanError: "" };
+    }
+    entries = readdirSync(root).sort();
+  } catch (error) {
+    // This is a DIAGNOSTIC. It is called synchronously during registration, so
+    // an unguarded throw here would stop the plugin from loading at all: a
+    // metadata report taking down memory for every conversation on the host.
+    return {
+      scopes,
+      configuredCount: configured.size,
+      rootScanError: String(error?.message ?? error).slice(0, 200),
+    };
+  }
+  for (const entry of entries) {
     if (!/^[a-f0-9]{64}$/.test(entry)) continue;
     let records = 0;
+    let ageUnknownRecords = 0;
     let oldestAgeMs = 0;
+    let scanError = "";
     try {
       for (const filename of readdirSync(join(root, entry))) {
         if (!/^[a-f0-9]{64}\.json$/.test(filename)) continue;
@@ -4796,19 +4882,39 @@ export function inventoryOutboundIdQueues(configuredDeploymentIds, now) {
           const parsed = JSON.parse(
             readFileSync(join(root, entry, filename), "utf8"),
           );
-          const enqueuedAt = Date.parse(parsed?.enqueued_at ?? "") || now;
-          oldestAgeMs = Math.max(oldestAgeMs, now - enqueuedAt);
-        } catch { /* counted by records; age stays unknown for this one */ }
+          // Not `|| now`: that reported a valid epoch-0 and every malformed
+          // stamp as age zero, so the oldest-age column read healthy for
+          // exactly the records that are least healthy.
+          const enqueuedAt = typeof parsed?.enqueued_at === "string"
+            ? Date.parse(parsed.enqueued_at)
+            : Number.NaN;
+          if (Number.isFinite(enqueuedAt)) {
+            oldestAgeMs = Math.max(oldestAgeMs, now - enqueuedAt);
+          } else {
+            ageUnknownRecords += 1;
+          }
+        } catch { ageUnknownRecords += 1; }
       }
-    } catch { /* unreadable directory is still reported, with records=0 */ }
+    } catch (error) {
+      // An unreadable directory previously became `records=0`, which reads
+      // identically to an empty one. Report the failure instead.
+      scanError = String(error?.message ?? error).slice(0, 200);
+    }
     scopes.push({
       deployment_id: entry,
-      drainable: configured.has(entry),
+      // `drainable` used to mean only "a configured key hashes to this", which
+      // is not the question an operator is asking. A scope is drainable only
+      // if delivery is actually armed, the credential is present, and the
+      // directory could be read.
+      credential_matched: configured.has(entry),
+      drainable: configured.has(entry) && deliveryArmed && !scanError,
       records,
+      age_unknown_records: ageUnknownRecords,
       oldest_age_ms: oldestAgeMs,
+      scan_error: scanError,
     });
   }
-  return { scopes, configuredCount: configured.size };
+  return { scopes, configuredCount: configured.size, rootScanError: "" };
 }
 
 /**
@@ -4819,11 +4925,25 @@ export function inventoryOutboundIdQueues(configuredDeploymentIds, now) {
  */
 export function renderOutboundIdInventory(inventory) {
   const scopes = inventory?.scopes ?? [];
-  const orphaned = scopes.filter((scope) => !scope.drainable);
+  if (inventory?.rootScanError) {
+    return (
+      `[vc:outbound-id] queue inventory - SCAN FAILED (${inventory.rootScanError}). ` +
+      `Nothing is known about the queue on this host. This is not an empty ` +
+      `queue and it is not health.`
+    );
+  }
+  const orphaned = scopes.filter((scope) => !scope.credential_matched);
   const orphanRecords = orphaned.reduce((sum, scope) => sum + scope.records, 0);
   const drainableRecords = scopes
     .filter((scope) => scope.drainable)
     .reduce((sum, scope) => sum + scope.records, 0);
+  const heldRecords = scopes
+    .filter((scope) => scope.credential_matched && !scope.drainable)
+    .reduce((sum, scope) => sum + scope.records, 0);
+  const scanFailures = scopes.filter((scope) => scope.scan_error).length;
+  const ageUnknown = scopes.reduce(
+    (sum, scope) => sum + (scope.age_unknown_records ?? 0), 0,
+  );
   const oldestOrphan = orphaned.reduce(
     (max, scope) => Math.max(max, scope.oldest_age_ms), 0,
   );
@@ -4837,10 +4957,20 @@ export function renderOutboundIdInventory(inventory) {
   return (
     `[vc:outbound-id] queue inventory - scopes=${scopes.length} ` +
     `configured=${inventory?.configuredCount ?? 0} ` +
-    `drainable_scopes=${scopes.length - orphaned.length} ` +
+    `drainable_scopes=${scopes.filter((scope) => scope.drainable).length} ` +
     `drainable_records=${drainableRecords} ` +
+    `held_records=${heldRecords} scan_failures=${scanFailures} ` +
+    `age_unknown_records=${ageUnknown} ` +
     `orphaned_scopes=${orphaned.length} orphaned_records=${orphanRecords} ` +
     `oldest_orphan_age_ms=${oldestOrphan}` +
+    (heldRecords > 0
+      ? ` | HELD: the credential matches but delivery is not armed, so these ` +
+        `are stored and undelivered. Not lost, and not delivered either.`
+      : "") +
+    (scanFailures > 0
+      ? ` | ${scanFailures} scope(s) could NOT be read; their counts are ` +
+        `unknown rather than zero.`
+      : "") +
     (orphaned.length > 0
       ? ` | ORPHANED: no configured VC key hashes to these directories, so no ` +
         `worker can ever drain them. Most likely a key rotation or a removed ` +
@@ -4868,6 +4998,7 @@ export function newOutboundIdStats() {
     queuedDuplicate: 0,
     queueRefused: 0,
     unbackedFast: 0,
+    metadataRejected: 0,
     evictedPending: 0,
     refusedByReason: new Map(),
     firstEventAt: null,
@@ -4924,6 +5055,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `carried=${stats.carried} queued=${stats.queued} ` +
     `queuedDuplicate=${stats.queuedDuplicate} ` +
     `queueRefused=${stats.queueRefused} unbackedFast=${stats.unbackedFast} ` +
+    `metadataRejected=${stats.metadataRejected} ` +
     `evictedPending=${stats.evictedPending} ` +
     `refused[${refusals || "none"}] ` +
     `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
@@ -5178,21 +5310,16 @@ export default {
       };
       if (!exactAdmission) {
         try {
-          const ingestResult = await vcPost(
-            baseUrl,
+          // Fast path. Deliberately NOT applied to the exact-completion
+          // payload above: queueExactCompletion fingerprints the whole payload
+          // and dead-letters a re-queue whose fingerprint differs, so folding a
+          // time-varying id set into it would create a brand new way to lose a
+          // real user's turn.
+          const ingestResult = await ingestWithOutboundIds(
             "/api/v1/context/ingest",
-            vcKeyFor(state.sessionKey),
+            state.sessionKey,
             identity.convId,
-            // Fast path. Deliberately NOT applied to the exact-completion
-            // payload above: queueExactCompletion fingerprints the whole
-            // payload and dead-letters a re-queue whose fingerprint differs,
-            // so folding a time-varying id set into it would create a brand
-            // new way to lose a real user's turn. The ids ride only the
-            // fire-and-forget legacy ingest, where a changed body costs
-            // nothing.
-            { ...ingestPayload, ...outboundIdIngestFields(identity.convId) },
-            15000,
-            log,
+            ingestPayload,
           );
           log.info?.(
             `[vc] run-bound group ingest OK — ` +
@@ -5288,9 +5415,13 @@ export default {
       outboundConvIdFor(sessionKey, { stableMode, groupIndex });
 
     const drainAllOutboundIdQueues = () => {
-      if (!outboundIdCfg.latePath) return;
+      // BOTH conditions. Checking only latePath meant that switching a
+      // deployment to "observe" would deliver everything previously queued and
+      // activate suppression -- the opposite of a measurement-only rollout, and
+      // the one mode whose entire purpose is having no network effect.
+      if (!outboundIdCfg.carry || !outboundIdCfg.latePath) return;
       for (const key of allConfiguredVcKeys(vcKey, agentKeyIndex)) {
-        void scheduleOutboundIdDrain({
+        startOutboundIdDrain({
           baseUrl, vcKey: key, latePath: outboundIdCfg.latePath, log, debug,
         });
       }
@@ -5303,6 +5434,46 @@ export default {
      * a duplicate is safe by contract (I-3). Consuming here would make a failed
      * ingest destroy the only observation, with nothing recording the loss.
      */
+    /**
+     * Send an ingest, and if the request carrying outbound-id metadata fails,
+     * RETRY THE TURN WITHOUT IT.
+     *
+     * This is I-4 made operational rather than asserted. The metadata was being
+     * merged into the only completion request for the turn, so an old receiver,
+     * a schema rejection, or any metadata-specific validation failure took the
+     * human's disclosure down with it: the exact "metadata failure degrades the
+     * turn" this feature is forbidden to cause.
+     *
+     * The retry is unconditional on failure rather than conditioned on the
+     * error looking metadata-related, because a receiver that rejects for a
+     * reason we cannot parse is UNKNOWN, and the safe response to unknown here
+     * is to try the turn again clean. The bare payload is byte-identical to
+     * what would have been sent with the feature off.
+     */
+    async function ingestWithOutboundIds(path, sessionKey, convId, ingestPayload) {
+      const fields = outboundIdIngestFields(convId, sessionKey);
+      const carried = fields.observed_outbound_messages?.length ?? 0;
+      if (carried === 0) {
+        return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
+          ingestPayload, 15000, log);
+      }
+      try {
+        const result = await vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
+          { ...ingestPayload, ...fields }, 15000, log);
+        outboundIdStats.carried += carried;
+        return result;
+      } catch (error) {
+        outboundIdStats.metadataRejected += carried;
+        log.warn?.(
+          `[vc:outbound-id] ingest carrying ids failed; RETRYING THE TURN ` +
+          `WITHOUT METADATA — ids=${carried} error=${error}. The ids become ` +
+          `UNKNOWN to the engine; the turn is not.`,
+        );
+        return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
+          ingestPayload, 15000, log);
+      }
+    }
+
     /**
      * Durable half of the capture. Runs BEFORE anything is carried on an
      * ingest, because the fast path is a permitted duplicate and never an
@@ -5322,24 +5493,57 @@ export default {
         baseUrl, vcKey: vcKeyFor(sessionKey),
         latePath: outboundIdCfg.latePath, log, debug,
       };
-      const queued = queueOutboundId(convId, identity, {
-        baseUrl, vcKey: drainOptions.vcKey, observedAt,
-      });
-      if (queued.refused) outboundIdStats.queueRefused += 1;
-      else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
-      else outboundIdStats.queued += 1;
-      void scheduleOutboundIdDrain(drainOptions);
+      // Deferred off the hook's own stack. message_sent is a SYNCHRONOUS
+      // fire-and-forget callback on the delivery path, and queueOutboundId does
+      // mkdir + open + write + fsync + rename + directory fsync. Doing that
+      // inline makes storage pressure into delivery latency for unrelated
+      // turns, and a try/catch bounds errors but not latency.
+      //
+      // This is a mitigation, not a cure: the write still blocks the loop when
+      // it runs, it is just no longer inside the hook. The real fix is an async
+      // or off-thread write, and it is not urgent while delivery stays disarmed
+      // -- nothing is enqueued at all unless carry AND latePath are set.
+      setImmediate(() => {
+        try {
+          const queued = queueOutboundId(convId, identity, {
+            baseUrl, vcKey: drainOptions.vcKey, observedAt,
+          });
+          if (queued.refused) outboundIdStats.queueRefused += 1;
+          else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
+          else outboundIdStats.queued += 1;
+          startOutboundIdDrain(drainOptions);
+        } catch (error) {
+          outboundIdStats.queueRefused += 1;
+          log.warn?.(
+            `[vc:outbound-id] durable enqueue failed (metadata only, no turn ` +
+            `affected): ${error}`,
+          );
+        }
+      }).unref?.();
     }
 
-    function outboundIdIngestFields(convId) {
+    /**
+     * Scope pending ids by (deployment, conversation), never by conversation
+     * alone.
+     *
+     * conversationGroups can map members that route through DIFFERENT
+     * agentKeyFiles onto one grouped conv id, while credentials are selected
+     * per member session key. Keyed on convId alone, an identity witnessed
+     * under key A could ride an ingest authenticated by key B, and with two
+     * agents sharing a Discord account and channel the full I-2 tuple would
+     * match and suppress a real reply IN THE WRONG TENANT.
+     */
+    function outboundPendingKey(convId, sessionKey) {
+      const deployment = completionDeploymentScope(baseUrl, vcKeyFor(sessionKey));
+      return `${deployment.deployment_id}\u0000${convId}`;
+    }
+
+    function outboundIdIngestFields(convId, sessionKey) {
       if (!outboundIdCfg.carry || !convId) return {};
       const entries = pendingOutboundIdsForConversation(
-        pendingOutboundIds, convId,
+        pendingOutboundIds, outboundPendingKey(convId, sessionKey),
       );
-      const fields = outboundIdWireProjection(entries);
-      const carried = fields.observed_outbound_messages?.length ?? 0;
-      if (carried > 0) outboundIdStats.carried += carried;
-      return fields;
+      return outboundIdWireProjection(entries);
     }
 
     if (!vcKey) {
@@ -5374,12 +5578,17 @@ export default {
       // Report EVERY queue directory on disk, including ones no current key can
       // reach. A rotated key file leaves records that no worker can schedule,
       // and their silence is indistinguishable from delivery.
-      log.info?.(renderOutboundIdInventory(inventoryOutboundIdQueues(
-        allConfiguredVcKeys(vcKey, agentKeyIndex).map(
-          (key) => completionDeploymentScope(baseUrl, key).deployment_id,
-        ),
-        Date.now(),
-      )));
+      try {
+        log.info?.(renderOutboundIdInventory(inventoryOutboundIdQueues(
+          allConfiguredVcKeys(vcKey, agentKeyIndex).map(
+            (key) => completionDeploymentScope(baseUrl, key).deployment_id,
+          ),
+          Date.now(),
+          { deliveryArmed: outboundIdCfg.carry && Boolean(outboundIdCfg.latePath) },
+        )));
+      } catch (error) {
+        log.warn?.(`[vc:outbound-id] inventory failed (diagnostic only): ${error}`);
+      }
       drainAllOutboundIdQueues();
     }
 
@@ -6983,17 +7192,14 @@ export default {
         releasePendingTurn();
 
         try {
-          const ingestResult = await vcPost(
-            baseUrl,
+          // Fast path: an opportunistic, non-consuming snapshot of ids already
+          // witnessed for this conversation, and a failure carrying them
+          // retries the turn clean rather than taking it down.
+          const ingestResult = await ingestWithOutboundIds(
             "/api/v1/context/ingest",
-            vcKeyFor(sessionKey),
+            sessionKey,
             identity.convId,
-            // Fast path: an opportunistic, non-consuming snapshot of ids
-            // already witnessed for this conversation. The durable queue still
-            // owns delivery, so a failure here loses nothing.
-            { ...ingestPayload, ...outboundIdIngestFields(identity.convId) },
-            15000,
-            log,
+            ingestPayload,
           );
           log.info?.(
             `[vc] ingest OK — conversation=${ingestResult.conversation_id ?? "?"} ` +
@@ -7060,7 +7266,10 @@ export default {
             );
           } else {
             const { added, evicted } = rememberPendingOutboundId(
-              pendingOutboundIds, convId, { identity, observed_at: observedAt }, now,
+              pendingOutboundIds,
+              outboundPendingKey(convId, sessionKey),
+              { identity, observed_at: observedAt },
+              now,
             );
             outboundIdStats.evictedPending += evicted;
             if (added) outboundIdStats.witnessed += 1;

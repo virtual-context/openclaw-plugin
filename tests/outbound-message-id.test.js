@@ -12,6 +12,7 @@ import {
   forgetPendingOutboundIds,
   prunePendingOutboundIds,
   outboundIdDueRecords,
+  outboundIdQueueOrder,
   enforceOutboundIdQueueBounds,
   outboundIdFailureIsPermanent,
   newOutboundIdStats,
@@ -188,6 +189,13 @@ describe("identity keys are injective (codex P1-5)", () => {
     expect(a).toBe(outboundIdRecordKey("dep1", "sk:conv", identity()));
     expect(a).not.toBe(outboundIdRecordKey("dep2", "sk:conv", identity()));
     expect(a).not.toBe(outboundIdRecordKey("dep1", "sk:other", identity()));
+    // The identity must actually participate. Without this, a key function
+    // that ignored the tuple entirely still passed every assertion above.
+    for (const field of ["platform", "account_id", "channel_id", "message_id"]) {
+      expect(a).not.toBe(
+        outboundIdRecordKey("dep1", "sk:conv", identity({ [field]: "zzz" })),
+      );
+    }
     expect(a).toMatch(/^[a-f0-9]{64}$/);
     expect(outboundIdRecordKey("dep1", "", identity())).toBe("");
   });
@@ -251,11 +259,13 @@ describe("wire projection (I-1, I-3)", () => {
       ...Object.keys(body),
       ...body.observed_outbound_messages.flatMap((row) => Object.keys(row)),
     ];
-    for (const forbidden of [
-      "complete", "final", "count", "total", "all", "is_full", "partial",
-    ]) {
-      expect(fieldNames).not.toContain(forbidden);
-    }
+    // An ALLOWLIST, not a blacklist. A finite forbidden-words list passes
+    // anything nobody thought of -- `expected_count`, `denominator` -- which is
+    // precisely the field that would let a receiver infer completeness.
+    expect(new Set(fieldNames)).toEqual(new Set([
+      "observed_outbound_messages",
+      "platform", "account_id", "channel_id", "message_id", "observed_at",
+    ]));
     expect(Object.keys(body.observed_outbound_messages[0]).sort()).toEqual([
       "account_id", "channel_id", "message_id", "observed_at", "platform",
     ]);
@@ -274,7 +284,10 @@ describe("wire projection (I-1, I-3)", () => {
       { identity: identity() },
       { identity: identity({ message_id: "2" }) },
     ]);
-    expect(body.observed_outbound_messages).toHaveLength(2);
+    // Assert the CONTENT, not the count: `slice(-2)` also yields length 2
+    // while dropping the very id that was witnessed twice.
+    expect(body.observed_outbound_messages.map((row) => row.message_id).sort())
+      .toEqual(["2", MESSAGE].sort());
   });
 
   it("refuses on the same ruler the store uses, so the two cannot disagree", () => {
@@ -381,6 +394,31 @@ describe("delta queue is non-blocking (spec 5.3, codex P0-1)", () => {
     expect(outboundIdDueRecords(records, now)).toHaveLength(3);
   });
 
+  it("REGRESSION: fewest attempts first, so a slow cohort cannot starve the rest", () => {
+    // Records are attempted oldest-first up to a per-pass limit. With strict
+    // age ordering, a cohort of failing records whose short backoffs expire
+    // during the pass gets re-selected every pass, and records beyond the limit
+    // are never attempted at all. That is starvation without a formal head.
+    const ordered = outboundIdQueueOrder([
+      { key: "old-failing", attempts: 7, enqueued_at: "2026-08-20T00:00:00.000Z" },
+      { key: "new-fresh", enqueued_at: "2026-08-20T09:00:00.000Z" },
+      { key: "old-fresh", enqueued_at: "2026-08-20T01:00:00.000Z" },
+      { key: "old-retried-once", attempts: 1, enqueued_at: "2026-08-20T00:30:00.000Z" },
+    ]);
+    expect(ordered.map((r) => r.key))
+      .toEqual(["old-fresh", "new-fresh", "old-retried-once", "old-failing"]);
+  });
+
+  it("orders deterministically and does not mutate its input", () => {
+    const input = [
+      { key: "b", enqueued_at: "2026-08-20T00:00:00.000Z" },
+      { key: "a", enqueued_at: "2026-08-20T00:00:00.000Z" },
+    ];
+    expect(outboundIdQueueOrder(input).map((r) => r.key)).toEqual(["a", "b"]);
+    expect(input.map((r) => r.key)).toEqual(["b", "a"]);
+    expect(outboundIdQueueOrder(undefined)).toEqual([]);
+  });
+
   it("a record with no next_attempt_at is due immediately", () => {
     expect(outboundIdDueRecords([record({ key: "a" })], 0)).toHaveLength(1);
   });
@@ -445,14 +483,30 @@ describe("queue bounds report their N (leg 4)", () => {
     expect(removed).toEqual(["epoch"]);
   });
 
-  it("clamps a future timestamp so it ages from now instead of outliving the bound", () => {
+  it("REGRESSION: a far-future timestamp is DROPPED, not silently immortal", () => {
+    // Math.max(0, now - parsed) looked like a clamp but persisted nothing, so
+    // age read 0 on EVERY scan until the wall clock caught up. Scanning
+    // repeatedly is the part that makes this test discriminate: a single call
+    // passes against the immortal implementation too.
+    for (const nowMs of [1_000, 500_000, 1_500_000]) {
+      const removed = [];
+      const out = enforceOutboundIdQueueBounds(
+        [{ key: "future", enqueued_at: at(2_000_000) }], nowMs,
+        (r) => removed.push(r.key), null, { maxAgeMs: 30_000, maxRecords: 100 },
+      );
+      expect(out.droppedAged).toBe(1);
+      expect(out.live).toEqual([]);
+      expect(removed).toEqual(["future"]);
+    }
+  });
+
+  it("tolerates ordinary clock skew rather than dropping on a few seconds", () => {
     const removed = [];
     const out = enforceOutboundIdQueueBounds(
-      [{ key: "future", enqueued_at: at(2_000_000) }], 1_000,
+      [{ key: "skewed", enqueued_at: at(1_005_000) }], 1_000_000,
       (r) => removed.push(r.key), null, { maxAgeMs: 30_000, maxRecords: 100 },
     );
     expect(out.droppedAged).toBe(0);
-    expect(out.live.map((r) => r.key)).toEqual(["future"]);
     expect(removed).toEqual([]);
   });
 
@@ -562,8 +616,16 @@ describe("queue inventory surfaces orphaned scopes (codex P1-6)", () => {
     const line = renderOutboundIdInventory({
       configuredCount: 1,
       scopes: [
-        { deployment_id: "a".repeat(64), drainable: true, records: 2, oldest_age_ms: 100 },
-        { deployment_id: "b".repeat(64), drainable: false, records: 7, oldest_age_ms: 90_000 },
+        {
+          deployment_id: "a".repeat(64), credential_matched: true,
+          drainable: true, records: 2, oldest_age_ms: 100,
+          age_unknown_records: 0, scan_error: "",
+        },
+        {
+          deployment_id: "b".repeat(64), credential_matched: false,
+          drainable: false, records: 7, oldest_age_ms: 90_000,
+          age_unknown_records: 0, scan_error: "",
+        },
       ],
     });
     expect(line).toContain("orphaned_scopes=1");
@@ -577,12 +639,49 @@ describe("queue inventory surfaces orphaned scopes (codex P1-6)", () => {
   it("does not print an orphan warning when there are none", () => {
     const line = renderOutboundIdInventory({
       configuredCount: 1,
-      scopes: [
-        { deployment_id: "a".repeat(64), drainable: true, records: 0, oldest_age_ms: 0 },
-      ],
+      scopes: [{
+        deployment_id: "a".repeat(64), credential_matched: true, drainable: true,
+        records: 0, oldest_age_ms: 0, age_unknown_records: 0, scan_error: "",
+      }],
     });
     expect(line).toContain("orphaned_scopes=0");
     expect(line).not.toContain("ORPHANED:");
+  });
+
+  it("distinguishes HELD from ORPHANED: a matched credential with delivery disarmed", () => {
+    // Collapsing these into one "not drainable" bucket told an operator their
+    // records were unreachable when they are merely stored and undelivered.
+    const line = renderOutboundIdInventory({
+      configuredCount: 1,
+      scopes: [{
+        deployment_id: "a".repeat(64), credential_matched: true, drainable: false,
+        records: 4, oldest_age_ms: 10, age_unknown_records: 0, scan_error: "",
+      }],
+    });
+    expect(line).toContain("held_records=4");
+    expect(line).toContain("orphaned_scopes=0");
+    expect(line).toContain("Not lost, and not delivered either");
+  });
+
+  it("reports an unreadable scope as unknown rather than as zero records", () => {
+    const line = renderOutboundIdInventory({
+      configuredCount: 1,
+      scopes: [{
+        deployment_id: "a".repeat(64), credential_matched: true, drainable: false,
+        records: 0, oldest_age_ms: 0, age_unknown_records: 0, scan_error: "EACCES",
+      }],
+    });
+    expect(line).toContain("scan_failures=1");
+    expect(line).toContain("unknown rather than zero");
+  });
+
+  it("a failed root scan says so instead of rendering an empty queue", () => {
+    const line = renderOutboundIdInventory({
+      configuredCount: 1, scopes: [], rootScanError: "EACCES",
+    });
+    expect(line).toContain("SCAN FAILED");
+    expect(line).toContain("not an empty queue");
+    expect(line).toContain("not health");
   });
 
   it("an empty disk reads as 'nothing was ever queued', not as health", () => {
