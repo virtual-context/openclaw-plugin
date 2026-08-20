@@ -15,6 +15,7 @@ import {
   outboundIdQueueOrder,
   enforceOutboundIdQueueBounds,
   outboundIdFailureIsPermanent,
+  classifyOutboundIdResponse,
   newOutboundIdStats,
   noteOutboundIdRefusal,
   renderOutboundIdReport,
@@ -534,36 +535,94 @@ describe("queue bounds report their N (leg 4)", () => {
   });
 });
 
-describe("failure classification", () => {
-  it("prefers the receiver's typed reason over the HTTP status", () => {
-    // Two rulers. Classifying from the status alone means my notion of
-    // "permanent" and the engine's drift the moment either side adds a case.
-    for (const reason of [
-      "malformed_identity", "unresolvable_tenant_scope", "conversation_deleted",
-      "ambiguous_alias_resolution", "fence_rejection",
+describe("late-path response classification", () => {
+  it("treats accepted and duplicate as success -- a duplicate is a no-op, not a failure", () => {
+    for (const body of [
+      { accepted: 1 }, { duplicate: 1 }, { accepted: 0, duplicate: 1 },
+      { accepted: 1, duplicate: 0, malformed: 0 },
     ]) {
-      expect(outboundIdFailureIsPermanent(new Error("VC API 503: later"), { reason }))
-        .toBe(true);
+      expect(classifyOutboundIdResponse(body).ok).toBe(true);
     }
-    // store_unavailable is the ONLY retryable reason core named, and it wins
-    // over a status that would otherwise read as permanent.
-    expect(outboundIdFailureIsPermanent(
-      new Error("VC API 400: bad"), { reason: "store_unavailable" },
-    )).toBe(false);
+  });
+
+  it("names every permanent decline the engine can return", () => {
+    for (const reason of [
+      "malformed", "not_canonical", "unknown_conversation",
+      "epoch_start_unknown", "predates_epoch",
+    ]) {
+      const verdict = classifyOutboundIdResponse({ [reason]: 1 });
+      expect(verdict).toMatchObject({ ok: false, reason, permanent: true });
+      expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(true);
+    }
+  });
+
+  it("write_failed is the ONLY retryable decline", () => {
+    const verdict = classifyOutboundIdResponse({ write_failed: 1 });
+    expect(verdict).toMatchObject({ ok: false, reason: "write_failed", permanent: false });
+    expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(false);
+  });
+
+  it("REGRESSION: a response with no recognisable outcome is NOT success", () => {
+    // The shape this replaces checked `result?.status`, which is absent from a
+    // counts-keyed body -- so a DECLINED record was unlinked as delivered and
+    // the identity vanished with a success in the log.
+    for (const body of [
+      {}, { accepted: 0 }, { unrelated: 3 }, { accepted: "1" },
+      null, undefined, "ok", 7,
+    ]) {
+      const verdict = classifyOutboundIdResponse(body);
+      expect(verdict.ok).toBe(false);
+      // Unknown is retried, never discarded.
+      expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(false);
+    }
+  });
+
+  it("still understands a receiver that has not moved to counts yet", () => {
+    expect(classifyOutboundIdResponse({ status: "accepted" }).ok).toBe(true);
+    expect(classifyOutboundIdResponse({ status: "idempotent" }).ok).toBe(true);
+    const declined = classifyOutboundIdResponse({
+      status: "declined", reason: "predates_epoch",
+    });
+    expect(declined).toMatchObject({ ok: false, permanent: true });
   });
 
   it("retries an UNRECOGNISED reason rather than discarding the record", () => {
-    // A reason we cannot interpret is unknown, and unknown is never dropped.
+    const verdict = classifyOutboundIdResponse({
+      status: "declined", reason: "some_future_reason",
+    });
+    expect(verdict.ok).toBe(false);
+    expect(outboundIdFailureIsPermanent(new Error("x"), verdict)).toBe(false);
+  });
+
+  it("honours an explicit permanent flag for a reason it has never heard of", () => {
+    // This is the drift case: the engine adds a sixth decline reason and marks
+    // it permanent. Falling back to the local reason set would retry it
+    // forever. The receiver's own verdict wins over this side's stale table.
     expect(outboundIdFailureIsPermanent(
-      new Error("VC API 400: bad"), { reason: "some_future_reason" },
+      new Error("x"), { reason: "a_reason_added_after_this_shipped", permanent: true },
+    )).toBe(true);
+    // And the converse: a reason this side thinks is permanent, which the
+    // receiver says is retryable, is retried.
+    expect(outboundIdFailureIsPermanent(
+      new Error("x"), { reason: "predates_epoch", permanent: false },
     )).toBe(false);
   });
 
-  it("falls back to the status only when no reason is supplied", () => {
+  it("a bare reason with no verdict still classifies, and unknown still retries", () => {
+    // outboundIdFailureIsPermanent is exported and can be handed a verdict that
+    // carries only a reason. That branch is defence, so it gets a test rather
+    // than being left to rot untested.
+    expect(outboundIdFailureIsPermanent(new Error("x"), { reason: "predates_epoch" }))
+      .toBe(true);
+    expect(outboundIdFailureIsPermanent(new Error("x"), { reason: "write_failed" }))
+      .toBe(false);
+    expect(outboundIdFailureIsPermanent(new Error("x"), { reason: "invented_later" }))
+      .toBe(false);
+  });
+
+  it("falls back to the HTTP status only when there is no verdict at all", () => {
     for (const status of [400, 404, 405, 409, 410, 413, 422, 501]) {
       expect(outboundIdFailureIsPermanent(new Error(`VC API ${status}: nope`)))
-        .toBe(true);
-      expect(outboundIdFailureIsPermanent(new Error(`VC API ${status}: nope`), {}))
         .toBe(true);
     }
   });

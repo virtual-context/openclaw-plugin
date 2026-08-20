@@ -4656,12 +4656,73 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
  * is why nothing in A7 ever retries on this side.
  */
 const OUTBOUND_ID_PERMANENT_REASONS = new Set([
-  "malformed_identity",
-  "unresolvable_tenant_scope",
-  "conversation_deleted",
-  "ambiguous_alias_resolution",
-  "fence_rejection",
+  "malformed",
+  "not_canonical",
+  "unknown_conversation",
+  "epoch_start_unknown",
+  "predates_epoch",
 ]);
+
+/** Outcomes that mean the identity is on record. `duplicate` is a success. */
+const OUTBOUND_ID_ACCEPTED_OUTCOMES = ["accepted", "duplicate"];
+
+/** The only retryable decline. Everything else named is permanent. */
+const OUTBOUND_ID_RETRYABLE_REASONS = new Set(["write_failed"]);
+
+/**
+ * Interpret a late-path response.
+ *
+ * The receiver answers with COUNTS KEYED BY OUTCOME, not a status string:
+ * `{accepted, duplicate, malformed, not_canonical, unknown_conversation,
+ * epoch_start_unknown, predates_epoch, write_failed}`. Records are delivered
+ * one per request precisely so those counts are unambiguous here.
+ *
+ * The dangerous shape is the one this replaces: a bare `result?.status` check
+ * silently passes when the field does not exist, so a DECLINED record would
+ * have been unlinked as delivered and the identity lost with a success in the
+ * log. An unreadable response is UNKNOWN and retried, never treated as either.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function classifyOutboundIdResponse(result) {
+  if (!result || typeof result !== "object") {
+    return { ok: false, reason: "", permanent: false };
+  }
+  const count = (key) => {
+    const value = result[key];
+    return Number.isFinite(value) ? value : 0;
+  };
+  if (OUTBOUND_ID_ACCEPTED_OUTCOMES.some((key) => count(key) > 0)) {
+    return { ok: true, reason: "", permanent: false };
+  }
+  for (const reason of [...OUTBOUND_ID_PERMANENT_REASONS, "write_failed"]) {
+    if (count(reason) > 0) {
+      return {
+        ok: false,
+        reason,
+        permanent: !OUTBOUND_ID_RETRYABLE_REASONS.has(reason),
+      };
+    }
+  }
+  // Legacy / transitional single-status shape, kept so a receiver that has not
+  // moved to counts yet is still understood rather than silently accepted.
+  const status = typeof result.status === "string" ? result.status : "";
+  if (status && ["accepted", "idempotent", "ok"].includes(status)) {
+    return { ok: true, reason: "", permanent: false };
+  }
+  const reason = typeof result.reason === "string" ? result.reason : "";
+  if (reason) {
+    return {
+      ok: false,
+      reason,
+      permanent: OUTBOUND_ID_PERMANENT_REASONS.has(reason),
+    };
+  }
+  if (status) return { ok: false, reason: status, permanent: false };
+  // No outcome of any kind. A 200 carrying nothing recognisable proves
+  // nothing, so it is not success.
+  return { ok: false, reason: "", permanent: false };
+}
 
 /**
  * Classify a delivery outcome as permanent.
@@ -4679,10 +4740,12 @@ const OUTBOUND_ID_PERMANENT_REASONS = new Set([
  *
  * Pure function; exported for unit testing.
  */
-export function outboundIdFailureIsPermanent(error, result = null) {
-  const reason = typeof result?.reason === "string" ? result.reason : "";
+export function outboundIdFailureIsPermanent(error, verdict = null) {
+  if (verdict && typeof verdict === "object" && "permanent" in verdict) {
+    return verdict.permanent === true;
+  }
+  const reason = typeof verdict?.reason === "string" ? verdict.reason : "";
   if (reason) return OUTBOUND_ID_PERMANENT_REASONS.has(reason);
-  if (result?.status === "permanent_rejection") return true;
   const match = /^VC API (\d{3}):/.exec(String(error?.message ?? error ?? ""));
   const status = match ? Number(match[1]) : 0;
   return [400, 404, 405, 409, 410, 413, 422, 501].includes(status);
@@ -4734,14 +4797,15 @@ async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }
     log,
     { correlationId: `outbound-id:${String(record.key).slice(0, 16)}` },
   );
-  // A receiver can reject inside a 200. Surface that as a failure carrying the
-  // typed reason rather than unlinking a record that was never accepted.
-  if (result?.status && !["accepted", "idempotent", "ok"].includes(result.status)) {
+  // A receiver can decline inside a 200, and it answers with counts rather than
+  // a status string. Unlinking on anything short of an explicit accept would
+  // lose the identity while logging a success.
+  const verdict = classifyOutboundIdResponse(result);
+  if (!verdict.ok) {
     const rejection = new Error(
-      `late path rejected status=${result.status} ` +
-      `reason=${result.reason ?? "unspecified"}`,
+      `late path declined reason=${verdict.reason || "unrecognised_response"}`,
     );
-    rejection.vcResult = result;
+    rejection.vcVerdict = verdict;
     throw rejection;
   }
   durableUnlink(outboundIdQueuePath(record.deployment_id, record.key));
@@ -4820,7 +4884,7 @@ function scheduleOutboundIdDrain(options) {
           await deliverOutboundIdRecord(record, worker.options);
           delivered += 1;
         } catch (error) {
-          if (outboundIdFailureIsPermanent(error, error?.vcResult)) {
+          if (outboundIdFailureIsPermanent(error, error?.vcVerdict)) {
             durableUnlink(
               outboundIdQueuePath(record.deployment_id, record.key),
             );

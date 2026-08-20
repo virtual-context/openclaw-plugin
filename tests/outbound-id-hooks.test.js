@@ -700,9 +700,8 @@ describe("a receiver can reject inside a 200", () => {
     // delivered -- loss that leaves no trace anywhere.
     const home = makeHome();
     const dir = plantQueuedRecord(home);
-    const fetchSpy = installLatePathFetch({
-      status: "rejected", reason: "store_unavailable",
-    });
+    // write_failed is the engine's only retryable decline.
+    const fetchSpy = installLatePathFetch({ write_failed: 1 });
     await registerPlugin(home, { outboundIdCapture: armed });
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(fetchSpy.mock.calls.some(([url]) =>
@@ -713,17 +712,37 @@ describe("a receiver can reject inside a 200", () => {
   it("drops the record on a permanent reason named by the engine", async () => {
     const home = makeHome();
     const dir = plantQueuedRecord(home);
-    installLatePathFetch({ status: "rejected", reason: "conversation_deleted" });
+    installLatePathFetch({ unknown_conversation: 1 });
     const { log } = await registerPlugin(home, { outboundIdCapture: armed });
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(remaining(dir)).toHaveLength(0);
     expect(logText(log)).toContain("DROPPED permanently-rejected record");
   });
 
-  it("POSITIVE CONTROL: an accepted status DOES unlink the record", async () => {
+  it("REGRESSION: a counts body with no accept does NOT unlink the record", async () => {
+    // The replaced check read `result?.status`, absent from a counts body, so
+    // a declined record was unlinked as delivered.
     const home = makeHome();
     const dir = plantQueuedRecord(home);
-    installLatePathFetch({ status: "accepted" });
+    installLatePathFetch({ accepted: 0, duplicate: 0 });
+    await registerPlugin(home, { outboundIdCapture: armed });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(remaining(dir)).toHaveLength(1);
+  });
+
+  it("treats duplicate as success and unlinks", async () => {
+    const home = makeHome();
+    const dir = plantQueuedRecord(home);
+    installLatePathFetch({ duplicate: 1 });
+    await registerPlugin(home, { outboundIdCapture: armed });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(remaining(dir)).toHaveLength(0);
+  });
+
+  it("POSITIVE CONTROL: an accepted count DOES unlink the record", async () => {
+    const home = makeHome();
+    const dir = plantQueuedRecord(home);
+    installLatePathFetch({ accepted: 1 });
     await registerPlugin(home, { outboundIdCapture: armed });
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(remaining(dir)).toHaveLength(0);
