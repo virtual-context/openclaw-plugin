@@ -249,6 +249,29 @@ describe("message_sent wiring", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("attributes an event to the agent scope from its session key", async () => {
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    expect(logText(log)).toContain("byAgentScope[vast=1]");
+  });
+
+  it("counts a scope it cannot parse as unknown rather than dropping the event", async () => {
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    await handlers.get("message_sent")(
+      sentEvent({ sessionKey: "not-an-agent-key" }),
+      sentCtx({ sessionKey: "not-an-agent-key" }),
+    );
+    expect(logText(log)).toContain("byAgentScope[unknown=1]");
+  });
+
   it("prints for each of the first five events, then goes quiet", async () => {
     // Between event 1 and event 25 the running count was unreadable from
     // outside the process -- during the measurement phase the report exists

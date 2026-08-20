@@ -5175,6 +5175,12 @@ export function newOutboundIdStats() {
     carriedExact: 0,
     evictedPending: 0,
     refusedByReason: new Map(),
+    // Which agent scopes are delivering. Pairs against which ones ingest:
+    // an outbound delivery on a conversation the memory layer never sees is
+    // a gap in the other direction, and without this the report cannot say
+    // WHICH scope it is. Scope ids only -- no channel, no conversation, no
+    // content.
+    byAgentScope: new Map(),
     firstEventAt: null,
     lastEventAt: null,
   };
@@ -5206,10 +5212,12 @@ export function noteOutboundIdRefusal(stats, reason) {
  * Pure function; exported for unit testing.
  */
 export function renderOutboundIdReport(stats, context = {}) {
-  const refusals = [...(stats?.refusedByReason?.entries() ?? [])]
+  const tally = (map) => [...(map?.entries() ?? [])]
     .sort((left, right) => right[1] - left[1])
-    .map(([reason, count]) => `${reason}=${count}`)
+    .map(([name, count]) => `${name}=${count}`)
     .join(" ");
+  const refusals = tally(stats?.refusedByReason);
+  const agents = tally(stats?.byAgentScope);
   const mode = context.mode ?? "?";
   const convIdentity = context.convIdentity ?? "?";
   const late = context.latePath ? "configured" : "NOT configured";
@@ -5239,6 +5247,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `multiChunkPayloads>=${stats.chunkedLowerBound} ` +
     `evictedPending=${stats.evictedPending} ` +
     `refused[${refusals || "none"}] ` +
+    `byAgentScope[${agents || "none"}] ` +
     `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
     `mode=${mode} convIdentity=${convIdentity} latePath=${late} ` +
     `registrations=${registrations} ` +
@@ -7478,6 +7487,11 @@ export default {
             && event.content.length > OUTBOUND_ID_SINGLE_MESSAGE_CHARS) {
             outboundIdStats.chunkedLowerBound += 1;
           }
+
+          const agentScope = sessionAgentScopeId(sessionKey) || "unknown";
+          outboundIdStats.byAgentScope.set(
+            agentScope, (outboundIdStats.byAgentScope.get(agentScope) ?? 0) + 1,
+          );
 
           const { identity, reason } = normalizeOutboundIdentity(event, ctx);
           const convId = identity ? resolveOutboundConvId(sessionKey) : "";

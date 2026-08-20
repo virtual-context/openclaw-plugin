@@ -774,6 +774,21 @@ describe("the instrument states its own limitations (legs 3 and 4)", () => {
     expect(line).toContain("Never fold this number into a success rate");
   });
 
+  it("breaks events down by agent scope, so a delivering-but-not-ingesting scope is nameable", () => {
+    const stats = newOutboundIdStats();
+    stats.events = 3;
+    stats.byAgentScope.set("vast", 2);
+    stats.byAgentScope.set("bastkid-dedicated", 1);
+    const line = renderOutboundIdReport(stats, context);
+    expect(line).toContain("byAgentScope[vast=2 bastkid-dedicated=1]");
+  });
+
+  it("says none rather than an empty bracket when no scope was seen", () => {
+    const stats = newOutboundIdStats();
+    stats.events = 1;
+    expect(renderOutboundIdReport(stats, context)).toContain("byAgentScope[none]");
+  });
+
   it("names all three populations it is structurally blind to", () => {
     const stats = newOutboundIdStats();
     stats.events = 1;
