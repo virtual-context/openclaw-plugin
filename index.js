@@ -4127,6 +4127,16 @@ const OUTBOUND_ID_REPORT_EARLY_THROUGH = 5;
 // equally unattested -- but a fast-path identity is exactly as trusted as a
 // late-path one, never more. The protection is the namespace, the two epoch
 // fences, and suppression requiring an exact positive match.
+// THE RESERVED KEY, ON THE WIRE AND IN METADATA -- one string on both sides.
+//
+// This flip-flopped once and cost a wrong commit, so the reasoning is recorded
+// rather than left to be re-derived: the receiver pops this field from the
+// request body and stores it under the engine's reserved key, and it defines
+// the wire field AS that key so a sender's field and a reader's lookup cannot
+// drift apart. A bare `agent_outbound_ids` is read by nothing.
+//
+// Verify against the deployed receiver, never against either side's
+// description of itself. Both of the errors here were confident descriptions.
 const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "_vc_agent_outbound_ids";
 // The SAME key on the legacy ingest path. These were two different names until
 // the engine named its reader key; carrying two means whoever forwards the body

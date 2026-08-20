@@ -545,6 +545,24 @@ describe("queue bounds report their N (leg 4)", () => {
   });
 });
 
+describe("the wire key is the receiver's reserved key", () => {
+  it("REGRESSION: sends _vc_agent_outbound_ids, never a bare name", () => {
+    // The receiver defines its wire field AS the engine's reserved key, so a
+    // sender's field and a reader's lookup cannot drift apart. A bare
+    // `agent_outbound_ids` is read by nothing and the ledger would stay empty
+    // WITH NO ERROR ANYWHERE.
+    //
+    // This name flip-flopped once, in both directions, and cost a wrong commit
+    // on each side. The lesson is in the assertion: verify against the deployed
+    // receiver, not against either side's description of itself.
+    const body = outboundIdWireProjection(
+      [{ identity: identity(), observed_at: "2026-08-20T00:00:00.000Z" }], "vast",
+    );
+    expect(Object.keys(body)).toEqual(["_vc_agent_outbound_ids"]);
+    expect(body).not.toHaveProperty("agent_outbound_ids");
+  });
+});
+
 describe("the exact-completion fingerprint ignores outbound ids", () => {
   const KEY = "_vc_agent_outbound_ids";
   const base = {
