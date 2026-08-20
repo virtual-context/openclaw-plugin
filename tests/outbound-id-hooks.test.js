@@ -572,6 +572,49 @@ describe("pending ids may not cross a VC credential boundary", () => {
   });
 });
 
+describe("the denominator comes from the pre-delivery hook", () => {
+  it("counts message_sending even for events the sent-hook refuses", async () => {
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    // Two outbound messages seen pre-delivery...
+    await handlers.get("message_sending")({ content: "one" });
+    await handlers.get("message_sending")({ content: "two" });
+    // ...but only one post-delivery event, and that one REFUSED.
+    await handlers.get("message_sent")(
+      sentEvent({ success: false }), sentCtx(),
+    );
+    const text = logText(log);
+    expect(text).toContain("sendingHook=2");
+    expect(text).toContain("events=1");
+    expect(text).toContain("sent_per_sending=0.50");
+    expect(text).toContain("delivery_not_successful=1");
+  });
+
+  it("does not count message_sending when the feature is off", async () => {
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {});
+    await handlers.get("message_sending")({ content: "one" });
+    expect(logText(log)).not.toContain("sendingHook");
+  });
+
+  it("still strips vc comment tags while counting", async () => {
+    // The counter must not disturb what this hook already does.
+    const home = makeHome();
+    installFetch();
+    const { handlers } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    const out = await handlers.get("message_sending")({
+      content: "hello <!-- vc:x --> world",
+    });
+    expect(out.content).toBe("hello  world");
+  });
+});
+
 describe("counters are process-wide, not per registration", () => {
   it("REGRESSION: two registrations in ONE module instance share one counter", async () => {
     // register() runs once per AGENT CONTEXT, not once per process -- measured

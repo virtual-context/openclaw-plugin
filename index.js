@@ -5063,6 +5063,7 @@ export function newOutboundIdStats() {
     unbackedFast: 0,
     metadataRejected: 0,
     chunkedLowerBound: 0,
+    sendingHookEvents: 0,
     evictedPending: 0,
     refusedByReason: new Map(),
     firstEventAt: null,
@@ -5130,14 +5131,26 @@ export function renderOutboundIdReport(stats, context = {}) {
     `refused[${refusals || "none"}] ` +
     `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
     `mode=${mode} convIdentity=${convIdentity} latePath=${late} ` +
-    `registrations=${registrations} capture_rate=UNKNOWN | ` +
+    `registrations=${registrations} ` +
+    `sendingHook=${stats.sendingHookEvents} ` +
+    `sent_per_sending=${stats.sendingHookEvents > 0
+      ? (stats.events / stats.sendingHookEvents).toFixed(2)
+      : "NO_DATA"} ` +
+    `capture_rate=UNKNOWN | ` +
     `LIMITATIONS: this measures PRESENCE, not correctness. ` +
-    `capture_rate is UNKNOWN and not merely unreported: events= is a ` +
-    `NUMERATOR WITH NO DENOMINATOR. This process cannot count how many ` +
-    `deliveries actually occurred, so "the hook fired for every delivery" and ` +
-    `"the hook fired for one delivery in a hundred" produce identical output ` +
-    `here. The denominator has to come from the gateway's own delivery log, a ` +
-    `second and independent instrument. Ordering against ingest is likewise ` +
+    `TWO DIFFERENT RATIOS, and conflating them is the trap. ` +
+    `sent_per_sending compares the post-delivery hook against the ` +
+    `PRE-delivery hook this plugin already subscribes to, and it answers ` +
+    `"did message_sent fire for every outbound message the plugin saw". Below ` +
+    `1.00 means sent-hook events are being lost. It is NOT a capture rate ` +
+    `against real platform deliveries, and it is not independent: both are ` +
+    `host-dispatched hooks in one process, so if the host stops dispatching, ` +
+    `both fall to zero together and the ratio stays flattering. ` +
+    `capture_rate remains UNKNOWN and is not merely unreported: no per-delivery ` +
+    `counter for Discord exists in this host at any log level -- the ` +
+    `"outbound send ok" line lives only in the Telegram adapter -- so nothing ` +
+    `here can count how many platform deliveries actually occurred. ` +
+    `Ordering against ingest is likewise ` +
     `NOT reported: sessionKey cannot disambiguate concurrent turns in one ` +
     `session, so any ordering claim built on it would pair an outbound event ` +
     `with a turn it may not belong to. This report is also blind to the N-1 ` +
@@ -7397,6 +7410,13 @@ export default {
 
     // ── Strip vc comment tags from outbound messages ──
     api.on("message_sending", async (event) => {
+      // Denominator for the sent-hook (see renderOutboundIdReport).
+      // message_sending fires PRE-delivery; message_sent fires after. Counting
+      // both is the only way to answer "did the post-delivery hook fire for
+      // every outbound message this plugin saw", and the host provides no
+      // per-delivery counter for Discord at any log level -- the
+      // "outbound send ok" line exists only in the Telegram adapter.
+      if (outboundIdCfg.enabled) outboundIdStats.sendingHookEvents += 1;
       if (!event?.content) return;
       VC_COMMENT_RE.lastIndex = 0;
       const stripped = event.content.replace(VC_COMMENT_RE, "").trim();

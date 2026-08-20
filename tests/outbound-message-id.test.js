@@ -600,7 +600,7 @@ describe("the instrument states its own limitations (legs 3 and 4)", () => {
     expect(line.toLowerCase()).not.toContain("clean");
   });
 
-  it("a fired hook prints capture_rate=UNKNOWN, because events= has no denominator", () => {
+  it("a fired hook still prints capture_rate=UNKNOWN against real deliveries", () => {
     const stats = newOutboundIdStats();
     stats.events = 12;
     stats.witnessed = 9;
@@ -611,7 +611,35 @@ describe("the instrument states its own limitations (legs 3 and 4)", () => {
     expect(line).toContain("witnessed=9");
     expect(line).toContain("no_channel_ruler:telegram=2");
     expect(line).toContain("capture_rate=UNKNOWN");
-    expect(line).toContain("NUMERATOR WITH NO DENOMINATOR");
+    // The within-host denominator (sent_per_sending) does NOT make this a
+    // capture rate: no per-delivery counter for Discord exists in the host.
+    expect(line).toContain("no per-delivery ");
+    expect(line).toContain("Discord");
+  });
+
+  it("reports sent_per_sending and capture_rate as DIFFERENT questions", () => {
+    // Conflating them is the trap: one measures whether the post-delivery hook
+    // fired for every outbound message the plugin saw; the other would measure
+    // coverage of real platform deliveries, which nothing here can count.
+    const stats = newOutboundIdStats();
+    stats.events = 3;
+    stats.sendingHookEvents = 4;
+    const line = renderOutboundIdReport(stats, context);
+    expect(line).toContain("sendingHook=4");
+    expect(line).toContain("sent_per_sending=0.75");
+    expect(line).toContain("capture_rate=UNKNOWN");
+    expect(line).toContain("TWO DIFFERENT RATIOS");
+    expect(line).toContain("not independent");
+    expect(line).toContain("only in the Telegram adapter");
+  });
+
+  it("says NO_DATA rather than dividing by zero", () => {
+    const stats = newOutboundIdStats();
+    stats.events = 2;
+    const line = renderOutboundIdReport(stats, context);
+    expect(line).toContain("sent_per_sending=NO_DATA");
+    expect(line).not.toContain("sent_per_sending=Infinity");
+    expect(line).not.toContain("sent_per_sending=NaN");
   });
 
   it("publishes the multi-chunk hole as a LOWER BOUND with its threshold", () => {
