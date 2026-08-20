@@ -5303,6 +5303,34 @@ export default {
      * a duplicate is safe by contract (I-3). Consuming here would make a failed
      * ingest destroy the only observation, with nothing recording the loss.
      */
+    /**
+     * Durable half of the capture. Runs BEFORE anything is carried on an
+     * ingest, because the fast path is a permitted duplicate and never an
+     * ownership transfer (spec 4.2).
+     */
+    function captureOutboundIdDurably(convId, identity, sessionKey, observedAt) {
+      if (!outboundIdCfg.carry) return;
+      if (!outboundIdCfg.latePath) {
+        // No late path configured means the fast path is the ONLY path, so an
+        // id witnessed after its own ingest has no durable backstop and is
+        // simply lost. Counted, so the report can never show a capture number
+        // that quietly excludes them.
+        outboundIdStats.unbackedFast += 1;
+        return;
+      }
+      const drainOptions = {
+        baseUrl, vcKey: vcKeyFor(sessionKey),
+        latePath: outboundIdCfg.latePath, log, debug,
+      };
+      const queued = queueOutboundId(convId, identity, {
+        baseUrl, vcKey: drainOptions.vcKey, observedAt,
+      });
+      if (queued.refused) outboundIdStats.queueRefused += 1;
+      else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
+      else outboundIdStats.queued += 1;
+      void scheduleOutboundIdDrain(drainOptions);
+    }
+
     function outboundIdIngestFields(convId) {
       if (!outboundIdCfg.carry || !convId) return {};
       const entries = pendingOutboundIdsForConversation(
@@ -7020,53 +7048,31 @@ export default {
           }
 
           const { identity, reason } = normalizeOutboundIdentity(event, ctx);
+          const convId = identity ? resolveOutboundConvId(sessionKey) : "";
           if (!identity) {
             noteOutboundIdRefusal(outboundIdStats, reason);
-            return;
-          }
-          const convId = resolveOutboundConvId(sessionKey);
-          if (!convId) {
+          } else if (!convId) {
             noteOutboundIdRefusal(
               outboundIdStats,
               !sessionKey
                 ? "no_session_key"
                 : (stableMode ? "unstable_conv_identity" : "conv_identity_session_mode"),
             );
-            return;
+          } else {
+            const { added, evicted } = rememberPendingOutboundId(
+              pendingOutboundIds, convId, { identity, observed_at: observedAt }, now,
+            );
+            outboundIdStats.evictedPending += evicted;
+            if (added) outboundIdStats.witnessed += 1;
+            else outboundIdStats.duplicates += 1;
+            captureOutboundIdDurably(convId, identity, sessionKey, observedAt);
           }
 
-          const { added, evicted } = rememberPendingOutboundId(
-            pendingOutboundIds, convId, { identity, observed_at: observedAt }, now,
-          );
-          outboundIdStats.evictedPending += evicted;
-          if (added) outboundIdStats.witnessed += 1;
-          else outboundIdStats.duplicates += 1;
-
-          if (outboundIdCfg.carry) {
-            if (outboundIdCfg.latePath) {
-              // Durable FIRST, always. The fast path is an opportunistic
-              // duplicate on top of this, never an ownership transfer: an id
-              // classified as "fast" and then lost to a failed ingest would be
-              // an invisible loss, and duplicates are the safe direction.
-              const drainOptions = {
-                baseUrl, vcKey: vcKeyFor(sessionKey),
-                latePath: outboundIdCfg.latePath, log, debug,
-              };
-              const queued = queueOutboundId(convId, identity, {
-                baseUrl, vcKey: drainOptions.vcKey, observedAt,
-              });
-              if (queued.refused) outboundIdStats.queueRefused += 1;
-              else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
-              else outboundIdStats.queued += 1;
-              void scheduleOutboundIdDrain(drainOptions);
-            } else {
-              // No late path configured means the fast path is the ONLY path,
-              // so an id witnessed after its own ingest has no durable
-              // backstop and is simply lost. Counted, so the report can never
-              // show a capture number that quietly excludes them.
-              outboundIdStats.unbackedFast += 1;
-            }
-          }
+          // Reporting is deliberately OUTSIDE every refusal branch. When each
+          // refusal returned early, a deployment refusing 100% of its events
+          // printed nothing at all after boot - the precise silence this
+          // instrument exists to break, and the case where reading it matters
+          // most.
 
           // The FIRST firing is what calibrates this instrument: until it has
           // fired once, "no ids captured" and "the hook is broken or never
