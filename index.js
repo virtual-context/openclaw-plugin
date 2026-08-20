@@ -4110,6 +4110,11 @@ const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
 const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
 const OUTBOUND_ID_MAX_CARRIED_PER_INGEST = 32;
 const OUTBOUND_ID_REPORT_EVERY = 25;
+// The first few events are the ones that calibrate the instrument, and between
+// event 1 and event 25 the running count was unreadable from outside the
+// process -- during exactly the measurement phase the report exists for. The
+// early burst costs a handful of lines once per boot.
+const OUTBOUND_ID_REPORT_EARLY_THROUGH = 5;
 // The sibling key the engine reads with get_agent_outbound_ids. It rides
 // OUTSIDE the attested region, which is what lets guild channels have a fast
 // path at all -- their completion payload is fingerprinted, and a
@@ -7509,7 +7514,7 @@ export default {
           // reached" are the same observation. Print it immediately, then
           // periodically.
           if (
-            outboundIdStats.events === 1
+            outboundIdStats.events <= OUTBOUND_ID_REPORT_EARLY_THROUGH
             || outboundIdStats.events % OUTBOUND_ID_REPORT_EVERY === 0
           ) {
             log.info?.(renderOutboundIdReport(outboundIdStats, {

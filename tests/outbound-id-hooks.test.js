@@ -249,6 +249,27 @@ describe("message_sent wiring", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("prints for each of the first five events, then goes quiet", async () => {
+    // Between event 1 and event 25 the running count was unreadable from
+    // outside the process -- during the measurement phase the report exists
+    // for.
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    for (let i = 0; i < 7; i += 1) {
+      await handlers.get("message_sent")(
+        sentEvent({ messageId: `152900000000000${2000 + i}` }), sentCtx(),
+      );
+    }
+    const reports = log.info.mock.calls
+      .map((c) => String(c[0]))
+      .filter((line) => line.includes("[vc:outbound-id] report"));
+    expect(reports).toHaveLength(5);
+    expect(reports.at(-1)).toContain("events=5");
+  });
+
   it("prints the report on the FIRST firing, because that is what calibrates it", async () => {
     const home = makeHome();
     installFetch();
