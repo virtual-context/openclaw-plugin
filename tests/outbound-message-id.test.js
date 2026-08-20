@@ -535,6 +535,39 @@ describe("queue bounds report their N (leg 4)", () => {
 });
 
 describe("failure classification", () => {
+  it("prefers the receiver's typed reason over the HTTP status", () => {
+    // Two rulers. Classifying from the status alone means my notion of
+    // "permanent" and the engine's drift the moment either side adds a case.
+    for (const reason of [
+      "malformed_identity", "unresolvable_tenant_scope", "conversation_deleted",
+      "ambiguous_alias_resolution", "fence_rejection",
+    ]) {
+      expect(outboundIdFailureIsPermanent(new Error("VC API 503: later"), { reason }))
+        .toBe(true);
+    }
+    // store_unavailable is the ONLY retryable reason core named, and it wins
+    // over a status that would otherwise read as permanent.
+    expect(outboundIdFailureIsPermanent(
+      new Error("VC API 400: bad"), { reason: "store_unavailable" },
+    )).toBe(false);
+  });
+
+  it("retries an UNRECOGNISED reason rather than discarding the record", () => {
+    // A reason we cannot interpret is unknown, and unknown is never dropped.
+    expect(outboundIdFailureIsPermanent(
+      new Error("VC API 400: bad"), { reason: "some_future_reason" },
+    )).toBe(false);
+  });
+
+  it("falls back to the status only when no reason is supplied", () => {
+    for (const status of [400, 404, 405, 409, 410, 413, 422, 501]) {
+      expect(outboundIdFailureIsPermanent(new Error(`VC API ${status}: nope`)))
+        .toBe(true);
+      expect(outboundIdFailureIsPermanent(new Error(`VC API ${status}: nope`), {}))
+        .toBe(true);
+    }
+  });
+
   it("treats only NAMED rejections as permanent", () => {
     for (const status of [400, 404, 405, 409, 410, 413, 422, 501]) {
       expect(outboundIdFailureIsPermanent(new Error(`VC API ${status}: nope`))).toBe(true);
@@ -579,6 +612,21 @@ describe("the instrument states its own limitations (legs 3 and 4)", () => {
     expect(line).toContain("no_channel_ruler:telegram=2");
     expect(line).toContain("capture_rate=UNKNOWN");
     expect(line).toContain("NUMERATOR WITH NO DENOMINATOR");
+  });
+
+  it("publishes the multi-chunk hole as a LOWER BOUND with its threshold", () => {
+    // The N-1 non-tail ids of a split reply are never offered to any hook, so
+    // no honest count of them exists. A bound with its instrument stated is
+    // publishable; a number that cannot be defended is not.
+    const stats = newOutboundIdStats();
+    stats.events = 4;
+    stats.chunkedLowerBound = 2;
+    const line = renderOutboundIdReport(stats, context);
+    expect(line).toContain("multiChunkPayloads>=2");
+    expect(line).toContain("LOWER BOUND, not a count");
+    expect(line).toContain("PROXY");
+    expect(line).toContain("DOES NOT CLOSE THE DEFECT FOR MULTI-CHUNK REPLIES");
+    expect(line).toContain("Never fold this number into a success rate");
   });
 
   it("names all three populations it is structurally blind to", () => {

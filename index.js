@@ -4098,6 +4098,11 @@ const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
 const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
 const OUTBOUND_ID_MAX_CARRIED_PER_INGEST = 32;
 const OUTBOUND_ID_REPORT_EVERY = 25;
+// Discord's per-message character limit. Used ONLY to compute a lower bound on
+// how many payloads were split across several platform messages -- see
+// chunkedLowerBound. It is a threshold for an estimate that is labelled as an
+// estimate, never a count of anything.
+const OUTBOUND_ID_SINGLE_MESSAGE_CHARS = 2000;
 // NUL, not a space or a colon, and written as an escape so it stays visible
 // in source. Every field in the tuple passes through cleanInboundField, which
 // REJECTS control characters, so NUL is the one byte guaranteed absent from
@@ -4629,7 +4634,42 @@ export function enforceOutboundIdQueueBounds(records, now, remove, log, limits =
  *
  * Pure function; exported for unit testing.
  */
-export function outboundIdFailureIsPermanent(error) {
+/**
+ * The reasons core@vc named as permanent. A record rejected for any of these
+ * can never succeed on a later attempt, so retrying only burns the queue's age
+ * budget; it is dropped and counted instead.
+ *
+ * All three A7 outcomes (deleted, ambiguous, unresolvable) are in here, which
+ * is why nothing in A7 ever retries on this side.
+ */
+const OUTBOUND_ID_PERMANENT_REASONS = new Set([
+  "malformed_identity",
+  "unresolvable_tenant_scope",
+  "conversation_deleted",
+  "ambiguous_alias_resolution",
+  "fence_rejection",
+]);
+
+/**
+ * Classify a delivery outcome as permanent.
+ *
+ * TWO RULERS, IN PRIORITY ORDER, and the order is the point. The receiver's own
+ * typed `reason` is authoritative when present, because classifying from the
+ * HTTP status alone means my notion of "permanent" and the engine's are two
+ * different rulers that will drift the moment either side adds a case. The
+ * status code is the fallback for a receiver that has not yet been taught to
+ * send a reason.
+ *
+ * Everything unrecognised -- an unknown reason, an unreadable status, a
+ * transport error -- is UNKNOWN, and unknown is RETRIED. A record is never
+ * discarded because its failure could not be parsed.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundIdFailureIsPermanent(error, result = null) {
+  const reason = typeof result?.reason === "string" ? result.reason : "";
+  if (reason) return OUTBOUND_ID_PERMANENT_REASONS.has(reason);
+  if (result?.status === "permanent_rejection") return true;
   const match = /^VC API (\d{3}):/.exec(String(error?.message ?? error ?? ""));
   const status = match ? Number(match[1]) : 0;
   return [400, 404, 405, 409, 410, 413, 422, 501].includes(status);
@@ -4669,7 +4709,7 @@ async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }
     || record?.base_url !== deployment.base_url
     || record?.vc_key_hash !== deployment.vc_key_hash
   ) throw new Error("outbound-id queue deployment scope mismatch");
-  await vcPost(
+  const result = await vcPost(
     baseUrl,
     latePath,
     vcKey,
@@ -4681,6 +4721,16 @@ async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }
     log,
     { correlationId: `outbound-id:${String(record.key).slice(0, 16)}` },
   );
+  // A receiver can reject inside a 200. Surface that as a failure carrying the
+  // typed reason rather than unlinking a record that was never accepted.
+  if (result?.status && !["accepted", "idempotent", "ok"].includes(result.status)) {
+    const rejection = new Error(
+      `late path rejected status=${result.status} ` +
+      `reason=${result.reason ?? "unspecified"}`,
+    );
+    rejection.vcResult = result;
+    throw rejection;
+  }
   durableUnlink(outboundIdQueuePath(record.deployment_id, record.key));
 }
 
@@ -4757,7 +4807,7 @@ function scheduleOutboundIdDrain(options) {
           await deliverOutboundIdRecord(record, worker.options);
           delivered += 1;
         } catch (error) {
-          if (outboundIdFailureIsPermanent(error)) {
+          if (outboundIdFailureIsPermanent(error, error?.vcResult)) {
             durableUnlink(
               outboundIdQueuePath(record.deployment_id, record.key),
             );
@@ -4999,6 +5049,7 @@ export function newOutboundIdStats() {
     queueRefused: 0,
     unbackedFast: 0,
     metadataRejected: 0,
+    chunkedLowerBound: 0,
     evictedPending: 0,
     refusedByReason: new Map(),
     firstEventAt: null,
@@ -5056,6 +5107,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `queuedDuplicate=${stats.queuedDuplicate} ` +
     `queueRefused=${stats.queueRefused} unbackedFast=${stats.unbackedFast} ` +
     `metadataRejected=${stats.metadataRejected} ` +
+    `multiChunkPayloads>=${stats.chunkedLowerBound} ` +
     `evictedPending=${stats.evictedPending} ` +
     `refused[${refusals || "none"}] ` +
     `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
@@ -5074,7 +5126,13 @@ export function renderOutboundIdReport(stats, context = {}) {
     `non-tail ids of every multi-chunk reply (the host emits only the last ` +
     `chunk's id), to every Telegram id (its sent hook passes no sessionKey), ` +
     `and to everything under convIdentity="session". A zero in any of those ` +
-    `populations is UNCOVERED, never negative evidence.`
+    `populations is UNCOVERED, never negative evidence. ` +
+    `multiChunkPayloads is a LOWER BOUND, not a count: it is payloads whose ` +
+    `content exceeded ${OUTBOUND_ID_SINGLE_MESSAGE_CHARS} chars, which is a ` +
+    `PROXY for having been split. Each one contributed at least one ` +
+    `unwitnessed id, and those ids keep producing the very defect this ` +
+    `feature exists to remove. THIS FEATURE DOES NOT CLOSE THE DEFECT FOR ` +
+    `MULTI-CHUNK REPLIES. Never fold this number into a success rate.`
   );
 }
 
@@ -7251,6 +7309,16 @@ export default {
           // it is noticed rather than assumed.
           if (cleanInboundField(event?.runId ?? ctx?.runId, 128)) {
             outboundIdStats.withRunId += 1;
+          }
+          // A9. The host emits only the LAST chunk's id, so for a payload split
+          // across N platform messages the other N-1 ids are never offered to
+          // any hook and NO HONEST COUNT OF THEM EXISTS. What can be measured
+          // is a lower bound on how many payloads were split at all. Only the
+          // LENGTH of content is read here; the content itself is never
+          // inspected, hashed or logged anywhere in this file.
+          if (typeof event?.content === "string"
+            && event.content.length > OUTBOUND_ID_SINGLE_MESSAGE_CHARS) {
+            outboundIdStats.chunkedLowerBound += 1;
           }
 
           const { identity, reason } = normalizeOutboundIdentity(event, ctx);

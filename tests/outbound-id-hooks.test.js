@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -569,6 +569,62 @@ describe("pending ids may not cross a VC credential boundary", () => {
       .filter((body) => body.observed_outbound_messages);
     expect(carried.length).toBeGreaterThan(0);
     expect(carried[0].observed_outbound_messages[0].message_id).toBe(MESSAGE);
+  });
+});
+
+describe("a receiver can reject inside a 200", () => {
+  function installLatePathFetch(payload, status = 200) {
+    const fetchSpy = vi.fn(async (url) => {
+      if (String(url).includes("/api/v1/outbound-ids")) {
+        return new Response(JSON.stringify(payload), {
+          status, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ conversation_id: "conv", status: "ok" }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchSpy;
+    return fetchSpy;
+  }
+
+  const armed = { mode: "carry", latePath: "/api/v1/outbound-ids" };
+  const remaining = (dir) =>
+    (existsSync(dir) ? readdirSync(dir) : []).filter((f) => f.endsWith(".json"));
+
+  it("REGRESSION: a retryable rejection in a 200 body keeps the record", async () => {
+    // HTTP 200 is metadata, not evidence of acceptance. Unlinking on a 200 that
+    // says "rejected" silently discards a witnessed identity and reports it as
+    // delivered -- loss that leaves no trace anywhere.
+    const home = makeHome();
+    const dir = plantQueuedRecord(home);
+    const fetchSpy = installLatePathFetch({
+      status: "rejected", reason: "store_unavailable",
+    });
+    await registerPlugin(home, { outboundIdCapture: armed });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(fetchSpy.mock.calls.some(([url]) =>
+      String(url).includes("/api/v1/outbound-ids"))).toBe(true);
+    expect(remaining(dir)).toHaveLength(1);
+  });
+
+  it("drops the record on a permanent reason named by the engine", async () => {
+    const home = makeHome();
+    const dir = plantQueuedRecord(home);
+    installLatePathFetch({ status: "rejected", reason: "conversation_deleted" });
+    const { log } = await registerPlugin(home, { outboundIdCapture: armed });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(remaining(dir)).toHaveLength(0);
+    expect(logText(log)).toContain("DROPPED permanently-rejected record");
+  });
+
+  it("POSITIVE CONTROL: an accepted status DOES unlink the record", async () => {
+    const home = makeHome();
+    const dir = plantQueuedRecord(home);
+    installLatePathFetch({ status: "accepted" });
+    await registerPlugin(home, { outboundIdCapture: armed });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(remaining(dir)).toHaveLength(0);
   });
 });
 
