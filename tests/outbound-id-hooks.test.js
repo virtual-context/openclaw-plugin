@@ -184,8 +184,8 @@ function installMetadataRejectingFetch() {
   const fetchSpy = vi.fn(async (url, options = {}) => {
     const raw = String(options.body ?? "{}");
     if (String(url).includes("/api/v1/context/ingest")
-      && raw.includes("_vc_agent_outbound_ids")) {
-      return new Response("unknown field _vc_agent_outbound_ids", {
+      && raw.includes("agent_outbound_ids")) {
+      return new Response("unknown field agent_outbound_ids", {
         status: 400, headers: { "Content-Type": "text/plain" },
       });
     }
@@ -335,7 +335,7 @@ describe("fast path reaches the ingest body", () => {
 
     const bodies = ingestBodies(fetchSpy);
     expect(bodies.length).toBeGreaterThan(0);
-    const observed = bodies.at(-1)._vc_agent_outbound_ids;
+    const observed = bodies.at(-1).agent_outbound_ids;
     expect(observed).toEqual([{
       platform: "discord",
       account_id: "vast",
@@ -369,7 +369,7 @@ describe("fast path reaches the ingest body", () => {
     await handlers.get("message_sent")(sentEvent(), sentCtx());
     await driveTurn(handlers, turnCtx());
     for (const body of requireIngestBodies(fetchSpy)) {
-      expect(body).not.toHaveProperty("_vc_agent_outbound_ids");
+      expect(body).not.toHaveProperty("agent_outbound_ids");
     }
   });
 
@@ -381,7 +381,7 @@ describe("fast path reaches the ingest body", () => {
     });
     await driveTurn(handlers, turnCtx());
     for (const body of requireIngestBodies(fetchSpy)) {
-      expect(body).not.toHaveProperty("_vc_agent_outbound_ids");
+      expect(body).not.toHaveProperty("agent_outbound_ids");
     }
   });
 
@@ -396,7 +396,7 @@ describe("fast path reaches the ingest body", () => {
     });
     await handlers.get("message_sent")(sentEvent({ runId: undefined }), sentCtx());
     await driveTurn(handlers, { ...turnCtx(), runId: "a-completely-different-run" });
-    expect(ingestBodies(fetchSpy).at(-1)._vc_agent_outbound_ids).toHaveLength(1);
+    expect(ingestBodies(fetchSpy).at(-1).agent_outbound_ids).toHaveLength(1);
   });
 });
 
@@ -411,7 +411,7 @@ describe("the conversation gate is consulted at runtime (codex P0-3)", () => {
     await handlers.get("message_sent")(sentEvent(), sentCtx());
     await driveTurn(handlers, turnCtx());
     for (const body of requireIngestBodies(fetchSpy)) {
-      expect(body).not.toHaveProperty("_vc_agent_outbound_ids");
+      expect(body).not.toHaveProperty("agent_outbound_ids");
     }
     expect(logText(log)).toContain("NOTHING WILL BE CAPTURED");
     // Assert the REFUSAL directly, not just the empty body. Without the mode
@@ -481,10 +481,10 @@ describe("a metadata rejection must never cost the turn (I-4)", () => {
 
     const bodies = requireIngestBodies(fetchSpy);
     expect(bodies.length).toBe(2);
-    expect(bodies[0]).toHaveProperty("_vc_agent_outbound_ids");
+    expect(bodies[0]).toHaveProperty("agent_outbound_ids");
     // The retry must be the ORIGINAL payload, byte-identical to what would
     // have been sent with the feature switched off.
-    expect(bodies[1]).not.toHaveProperty("_vc_agent_outbound_ids");
+    expect(bodies[1]).not.toHaveProperty("agent_outbound_ids");
     expect(bodies[1].assistant_message).toBe(bodies[0].assistant_message);
     expect(logText(log)).toContain("RETRYING THE TURN WITHOUT METADATA");
     expect(logText(log)).not.toContain("[vc] ingest failed");
@@ -540,7 +540,7 @@ describe("delivery must be armed by BOTH switches", () => {
       String(url).includes("/api/v1/outbound-ids"));
     expect(late.length).toBeGreaterThan(0);
     const body = JSON.parse(late[0][1].body);
-    expect(body._vc_agent_outbound_ids[0].message_id).toBe(MESSAGE);
+    expect(body.agent_outbound_ids[0].message_id).toBe(MESSAGE);
   });
 });
 
@@ -588,7 +588,7 @@ describe("pending ids may not cross a VC credential boundary", () => {
     expect(betaIngests.length).toBeGreaterThan(0);
     for (const [, options] of betaIngests) {
       expect(JSON.parse(options.body))
-        .not.toHaveProperty("_vc_agent_outbound_ids");
+        .not.toHaveProperty("agent_outbound_ids");
     }
   });
 
@@ -611,9 +611,9 @@ describe("pending ids may not cross a VC credential boundary", () => {
     expect(alphaIngests.length).toBeGreaterThan(0);
     const carried = alphaIngests
       .map(([, options]) => JSON.parse(options.body))
-      .filter((body) => body._vc_agent_outbound_ids);
+      .filter((body) => body.agent_outbound_ids);
     expect(carried.length).toBeGreaterThan(0);
-    expect(carried[0]._vc_agent_outbound_ids[0].message_id).toBe(MESSAGE);
+    expect(carried[0].agent_outbound_ids[0].message_id).toBe(MESSAGE);
   });
 });
 
@@ -819,7 +819,7 @@ describe("Discord guild channels reach the store via the exact path", () => {
   it("carries ids under the sibling key, NOT the legacy ingest field", async () => {
     // agent:<a>:discord:channel:<id> requires exact source attestation, so its
     // completion goes through queueExactCompletion rather than the legacy
-    // ingest. Ids therefore ride the _vc_agent_outbound_ids sibling key, which
+    // ingest. Ids therefore ride the agent_outbound_ids sibling key, which
     // is EXCLUDED from completionOutboxFingerprint -- covering it would make a
     // re-queue with a changed set dead-letter the record and lose a real turn.
     //
@@ -845,7 +845,7 @@ describe("Discord guild channels reach the store via the exact path", () => {
     expect(ingestBodies(fetchSpy)).toHaveLength(0);
     for (const [, options] of fetchSpy.mock.calls) {
       expect(String(options?.body ?? ""))
-        .not.toContain("_vc_agent_outbound_ids");
+        .not.toContain("agent_outbound_ids");
     }
   });
 

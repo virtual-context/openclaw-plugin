@@ -4127,7 +4127,18 @@ const OUTBOUND_ID_REPORT_EARLY_THROUGH = 5;
 // equally unattested -- but a fast-path identity is exactly as trusted as a
 // late-path one, never more. The protection is the namespace, the two epoch
 // fences, and suppression requiring an exact positive match.
-const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "_vc_agent_outbound_ids";
+// WIRE key, deliberately UN-prefixed. The receiver pops this from the request
+// body alongside `source_attestation` and maps it into message metadata as
+// `_vc_agent_outbound_ids`, exactly as it maps `source_attestation` into
+// `_vc_source_attestation`. The `_vc_` prefix is the METADATA namespace and
+// does not belong on the wire.
+//
+// This shipped wrong once: the engine's metadata key was adopted verbatim as
+// the wire key, which made a single payload carry `source_attestation`
+// un-prefixed and `_vc_agent_outbound_ids` prefixed -- inconsistent with
+// itself. The receiver read the un-prefixed name, found nothing, and the
+// ledger stayed empty with no error anywhere.
+const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "agent_outbound_ids";
 // The SAME key on the legacy ingest path. These were two different names until
 // the engine named its reader key; carrying two means whoever forwards the body
 // carries one and silently drops the other, which is how a fix ships inert.
