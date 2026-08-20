@@ -83,6 +83,23 @@
         "default": "session",
         "description": "Conversation identity mode: 'session' keys VC conversations by the rotating OpenClaw session UUID (legacy); 'stable' keys durable chat scopes by their session key so memory survives session rotation."
       },
+      "outboundIdCapture": {
+        "type": "object",
+        "description": "Capture the bot's OWN outbound message ids so the engine can recognise its own text when a member quote-replies it. Requires convIdentity=\"stable\": ids can only be bound to a conversation there, and nothing is captured otherwise.",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["off", "observe", "carry"],
+            "default": "off",
+            "description": "\"off\" registers no hook and changes no byte on the wire. \"observe\" captures and reports with no network effect. \"carry\" adds the ids to the ingest body and, when latePath is set, to a durable delta queue delivered by its own non-blocking worker."
+          },
+          "latePath": {
+            "type": "string",
+            "description": "REST path for ids witnessed after their turn's ingest already completed. Without it there is no durable backstop and late ids are lost (counted, never silently). Must be agreed with the engine before enabling."
+          }
+        },
+        "additionalProperties": false
+      },
       "conversationGroups": {
         "type": "object",
         "additionalProperties": {

@@ -4045,6 +4045,875 @@ function scheduleCompletionOutboxDrain(options) {
   return worker.promise;
 }
 
+
+// ===========================================================================
+// Outbound message-id capture - SPEC-outbound-message-id.md
+//
+// The engine's anti-duplicate guard is asked "did the bot author this message
+// id?" and has no identity data to answer from: the bot's own outbound ids are
+// stored nowhere, in any system. With no way to recognise its own text, a
+// quote-replied bot message is re-extracted through a subject lane and stamped
+// as the quoting member's claim. This block is the capture half.
+//
+// FIVE INVARIANTS from the cross-stack contract (spec section 3). All five are
+// downstream of one sentence: a real person's disclosure must never disappear
+// because this feature guessed.
+//
+//   I-1 MONOTONIC. A witnessed identity is positive evidence. Absence, an
+//       empty set, and NON-MEMBERSHIP IN A PARTIAL SET are all unknown, as are
+//       timeout, restart, retention expiry and delivery failure. Nothing here
+//       may emit a completeness bit, or a count a receiver could read as a
+//       denominator. The failure this prevents is invisible: a suppression
+//       fired on an unknown deletes a member's disclosure and logs success.
+//   I-2 Exact match on the NAMESPACED tuple (platform, bot account, physical
+//       channel, message id). A bare message id is not an identity - Telegram
+//       ids are small integers that collide across chats.
+//   I-3 The wire field is an ADDITIVE IDEMPOTENT SET. Re-sending a known id is
+//       a no-op. It is never "the full list for this conversation": OpenClaw
+//       emits only the LAST chunk's id for a multi-chunk reply, so any set
+//       produced here is provably partial (spec 2.4).
+//   I-4 Fail open FOR THE METADATA ONLY. An id failure never rejects, delays
+//       or degrades a turn. Keep the asymmetry straight: fail open on the
+//       metadata, fail closed on suppression. Losing an id costs a repeat of a
+//       bug; suppressing on an unknown costs a person's words.
+//   I-5 Ordering and retry domain isolated from the completion outbox.
+// ===========================================================================
+
+const OUTBOUND_ID_QUEUE_VERSION = 1;
+const OUTBOUND_ID_DRAIN_LIMIT = 64;
+const OUTBOUND_ID_BASE_BACKOFF_MS = 500;
+const OUTBOUND_ID_MAX_BACKOFF_MS = 5 * 60_000;
+// Age is the ONLY lifecycle fence available to this side. A queued id that
+// outlives a delete-and-recreate of its conversation would attach an identity
+// claim to a SUCCESSOR - an I-1 unknown promoted to positive evidence, which
+// is exactly the false-suppression failure. The completion outbox fences this
+// with a prepare generation token, which an id-only record can never obtain.
+// Stays tight until core@vc rules on a real receiver-side fence (spec 5.4).
+const OUTBOUND_ID_MAX_AGE_MS = 30 * 60_000;
+const OUTBOUND_ID_MAX_RECORDS = 512;
+const OUTBOUND_ID_PENDING_TTL_MS = 15 * 60_000;
+const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
+const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
+const OUTBOUND_ID_MAX_CARRIED_PER_INGEST = 32;
+const OUTBOUND_ID_REPORT_EVERY = 25;
+// NUL, not a space or a colon, and written as an escape so it stays visible
+// in source. Every field in the tuple passes through cleanInboundField, which
+// REJECTS control characters, so NUL is the one byte guaranteed absent from
+// all four - which is what makes the join injective. A printable separator
+// would let (account "a b", channel "c") and (account "a", channel "b c")
+// produce ONE key: two different messages sharing an identity. That is the
+// exact class of identity bug this feature exists to remove, so the separator
+// is a correctness property, not a formatting choice.
+const OUTBOUND_ID_FIELD_SEPARATOR = "\u0000";
+const outboundIdWorkers = new Map();
+
+/**
+ * Normalize the plugin's outbound-id config block.
+ *
+ * mode "off" (the default) registers no hook and changes no byte on the wire.
+ * "observe" captures and reports without any network effect - spec Phase A,
+ * and the positive control that makes a later zero mean something. "carry"
+ * adds the fast-path ingest field and the durable delta queue.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function normalizeOutboundIdConfig(raw) {
+  const mode = ["off", "observe", "carry"].includes(raw?.mode) ? raw.mode : "off";
+  const latePath = typeof raw?.latePath === "string" && raw.latePath.startsWith("/")
+    ? raw.latePath
+    : "";
+  return { mode, latePath, enabled: mode !== "off", carry: mode === "carry" };
+}
+
+/**
+ * Project a message_sent event onto the I-2 identity tuple, or refuse.
+ *
+ * Never throws and never returns a partial tuple. Every refusal carries a
+ * NAMED reason so the instrument can report which population it is blind to
+ * rather than printing a zero that reads as health. Under I-1 a refused id is
+ * an unknown and costs nothing; a guessed one is an identity claim about the
+ * wrong message, which is the class of bug this feature exists to remove.
+ *
+ * The channel projection deliberately reuses trustedDiscordChannelId - the
+ * SAME function rememberInboundTurn uses to derive origin_channel_id on the
+ * inbound side. A tuple built with a different ruler than the side that
+ * compares it can never match, and a never-matching set is indistinguishable
+ * from an absent one. Platforms with no established ruler are refused and
+ * counted as UNCOVERED, never emitted on a guess.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function normalizeOutboundIdentity(event, ctx) {
+  // A delivery that did not succeed is an unknown, not a negative: the id may
+  // be absent, or may name a message that does not exist. I-1 refuses it.
+  if (event?.success !== true) {
+    return { identity: null, reason: "delivery_not_successful" };
+  }
+  const platform = cleanInboundField(ctx?.channelId ?? event?.channelId, 64)
+    .toLowerCase();
+  if (!platform) return { identity: null, reason: "no_platform" };
+  const messageId = cleanInboundField(event?.messageId ?? ctx?.messageId, 128);
+  if (!messageId) return { identity: null, reason: "no_message_id" };
+  const accountId = cleanInboundField(ctx?.accountId ?? event?.accountId, 128);
+  if (!accountId) return { identity: null, reason: "no_account_id" };
+  if (platform !== "discord") {
+    // Not "unsupported" - UNCOVERED. Telegram's sent-hook context passes
+    // neither runId nor sessionKey, and no other platform has an agreed
+    // channel canonicalization yet. Both facts are printed by the report.
+    return { identity: null, reason: `no_channel_ruler:${platform}` };
+  }
+  const channelId = trustedDiscordChannelId(
+    "",
+    ctx?.conversationId ?? event?.conversationId,
+  );
+  if (!channelId) return { identity: null, reason: "no_channel_id" };
+  return {
+    identity: {
+      platform,
+      account_id: accountId,
+      channel_id: channelId,
+      message_id: messageId,
+    },
+    reason: "",
+  };
+}
+
+/**
+ * Re-validate a tuple as four EXACT primitive strings.
+ *
+ * normalizeOutboundIdentity is the only intended producer and already
+ * validates, but these functions are exported and are also fed by records read
+ * back off disk, which is an untrusted input. A key function that trusts its
+ * caller is a key function that can be made to collapse two identities into
+ * one - so the check lives here, at the point the identity becomes a key,
+ * rather than at the point somebody remembered to call a validator.
+ *
+ * Returns false rather than throwing: under I-4 a malformed identity drops the
+ * metadata, and nothing else.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function isExactOutboundIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const bounds = [
+    ["platform", 64], ["account_id", 128], ["channel_id", 128],
+    ["message_id", 128],
+  ];
+  for (const [field, maxLength] of bounds) {
+    const raw = identity[field];
+    // Exact string, already canonical: cleanInboundField must return it
+    // unchanged. That rejects non-strings, empties, over-long values, control
+    // characters (which is what keeps the NUL separator injective), and any
+    // value that would have been silently trimmed into a different identity.
+    if (typeof raw !== "string" || cleanInboundField(raw, maxLength) !== raw) {
+      return false;
+    }
+  }
+  return identity.platform === identity.platform.toLowerCase();
+}
+
+/**
+ * The I-2 tuple as one opaque string. Never a bare message id.
+ * Returns "" for any tuple that is not exact - callers treat "" as a refusal.
+ */
+export function outboundIdentityKey(identity) {
+  if (!isExactOutboundIdentity(identity)) return "";
+  const sep = OUTBOUND_ID_FIELD_SEPARATOR;
+  return [
+    identity.platform,
+    identity.account_id,
+    identity.channel_id,
+    identity.message_id,
+  ].join(sep);
+}
+
+/**
+ * Filesystem-level idempotence for I-3: re-witnessing the same message in the
+ * same conversation resolves to the same path, so a duplicate is a no-op
+ * rather than a second record.
+ */
+export function outboundIdRecordKey(deploymentId, convId, identity) {
+  const identityKey = outboundIdentityKey(identity);
+  if (!identityKey || typeof convId !== "string" || !convId) return "";
+  // Versioned preimage. If the encoding ever changes, old keys must not
+  // silently alias new ones - a collision here is two different messages
+  // sharing one record.
+  return createHash("sha256")
+    .update(JSON.stringify([
+      "outbound-id/v1", deploymentId, convId, identityKey,
+    ]), "utf8")
+    .digest("hex");
+}
+
+/**
+ * The wire projection of a witnessed set.
+ *
+ * The field name carries SET semantics so a reader cannot mistake it for a
+ * complete list, and there is deliberately NO count, NO `complete` and NO
+ * `final` field: under I-1 any of those is a denominator the receiver could
+ * read as completeness, and completeness is structurally impossible here.
+ *
+ * NO MESSAGE CONTENT. The message_sent event carries `content`; it is not
+ * read, not hashed into the record, and not logged anywhere in this file.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundIdWireProjection(entries) {
+  const observed = [];
+  const seen = new Set();
+  for (const entry of entries ?? []) {
+    const identity = entry?.identity ?? entry;
+    const key = outboundIdentityKey(identity);
+    // Same ruler as the record key. A tuple the store would refuse must never
+    // reach the wire, or the two sides disagree about what an identity is.
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    observed.push({
+      platform: identity.platform,
+      account_id: identity.account_id,
+      channel_id: identity.channel_id,
+      message_id: identity.message_id,
+      ...(entry?.observed_at ? { observed_at: entry.observed_at } : {}),
+    });
+  }
+  return observed.length > 0 ? { observed_outbound_messages: observed } : {};
+}
+
+/**
+ * Resolve the conversation an outbound id belongs to, or refuse with "".
+ *
+ * THE FIRST LINE IS THE POINT. `deriveConvIdentity` returns `sk:<sessionKey>`
+ * for a Discord-shaped key REGARDLESS of the deployment's convIdentity
+ * setting - it is a pure derivation, not a policy. Calling it without the mode
+ * gate would mean that on a `convIdentity: "session"` deployment the base turns
+ * ingest under a rotating session UUID while outbound ids are delivered under
+ * `sk:<sessionKey>` - a DIFFERENT conversation, possibly one that already
+ * belongs to other traffic. That is wrong-conversation attribution: the precise
+ * failure this whole feature exists to remove, reintroduced by its own fix.
+ *
+ * The mode gate therefore comes first, off the SAME stableMode snapshot that
+ * prepare and ingest use. selectConvId is deliberately not reused: its fallback
+ * warning counts a different population (sessions that reached prepare), and
+ * mixing outbound events into that counter would corrupt an existing instrument
+ * in order to build a new one.
+ *
+ * There is no sessionId on the message_sent hook and none is invented here. A
+ * refusal is an I-1 unknown and costs nothing; a guess is an identity claim
+ * about the wrong conversation.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundConvIdFor(sessionKey, { stableMode, groupIndex } = {}) {
+  if (stableMode !== true) return "";
+  const cleanKey = cleanInboundField(sessionKey, 1024);
+  if (!cleanKey) return "";
+  const identity = deriveConvIdentity(cleanKey, null, groupIndex);
+  if (identity?.isStable !== true) return "";
+  return typeof identity.convId === "string" ? identity.convId : "";
+}
+
+// -- In-memory pending set (fast path) --------------------------------------
+// convId -> Map(identityKey -> {identity, observed_at, captured_at})
+const pendingOutboundIds = new Map();
+
+/** Evict by TTL. Returns the count evicted so no caller can print a bare drop. */
+export function prunePendingOutboundIds(
+  state, now, ttlMs = OUTBOUND_ID_PENDING_TTL_MS,
+) {
+  let evicted = 0;
+  for (const [convId, bucket] of [...state.entries()]) {
+    for (const [key, entry] of [...bucket.entries()]) {
+      if (now - (entry?.captured_at ?? 0) >= ttlMs) {
+        bucket.delete(key);
+        evicted += 1;
+      }
+    }
+    if (bucket.size === 0) state.delete(convId);
+  }
+  return evicted;
+}
+
+/**
+ * Union a witnessed identity into the conversation's pending set (I-3).
+ * Returns {added, evicted} - `added:false` means a duplicate no-op, never an
+ * error. Bounded per conversation and across conversations; overflow drops the
+ * OLDEST and is counted, because dropping is I-1-safe and unbounded growth is
+ * not.
+ *
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function rememberPendingOutboundId(state, convId, entry, now, limits = {}) {
+  const maxConversations =
+    limits.maxConversations ?? OUTBOUND_ID_MAX_PENDING_CONVERSATIONS;
+  const maxPerConversation =
+    limits.maxPerConversation ?? OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION;
+  let evicted = prunePendingOutboundIds(
+    state, now, limits.ttlMs ?? OUTBOUND_ID_PENDING_TTL_MS,
+  );
+  const existing = state.get(convId);
+  const bucket = existing ?? new Map();
+  // Re-insert so Map iteration order is least-recently-touched first.
+  if (existing) state.delete(convId);
+  state.set(convId, bucket);
+  const key = outboundIdentityKey(entry?.identity);
+  const added = !bucket.has(key);
+  bucket.delete(key);
+  bucket.set(key, { ...entry, captured_at: now });
+  while (bucket.size > maxPerConversation) {
+    const oldest = bucket.keys().next().value;
+    bucket.delete(oldest);
+    evicted += 1;
+  }
+  while (state.size > maxConversations) {
+    const oldestConv = state.keys().next().value;
+    evicted += state.get(oldestConv)?.size ?? 0;
+    state.delete(oldestConv);
+  }
+  return { added, evicted };
+}
+
+/**
+ * Snapshot - deliberately NOT a consume. The durable queue owns delivery; the
+ * fast path is an optimization on top of it, and a copy is safe precisely
+ * because the wire semantics are an additive idempotent set (I-3). Consuming
+ * here would make a failed ingest lose the id with nothing recording the loss.
+ *
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function pendingOutboundIdsForConversation(
+  state, convId, limit = OUTBOUND_ID_MAX_CARRIED_PER_INGEST,
+) {
+  const bucket = state.get(convId);
+  if (!bucket || bucket.size === 0) return [];
+  const entries = [...bucket.values()];
+  return entries.slice(Math.max(0, entries.length - limit));
+}
+
+/** Drop exactly the identities a successful send acknowledged. */
+export function forgetPendingOutboundIds(state, convId, identityKeys) {
+  const bucket = state.get(convId);
+  if (!bucket) return 0;
+  let removed = 0;
+  for (const key of identityKeys ?? []) if (bucket.delete(key)) removed += 1;
+  if (bucket.size === 0) state.delete(convId);
+  return removed;
+}
+
+// -- Durable delta queue (late path) ----------------------------------------
+// DISTINCT directory, worker, ordering and retry domain from the completion
+// outbox - see spec 5.1. Reusing the outbox would be independently fatal twice
+// over: its head selection is one FIFO head per conversation, so a blocked id
+// follow-up would queue every later record behind it and those records carry
+// real users' disclosures; and its reader quarantines any record without a
+// prepare generation token and an inbound source_message_id, neither of which
+// an id-only delta has or can ever obtain.
+//
+// SHARED HELPERS, NOT SHARED DOMAINS: durableAtomicWrite, durableUnlink,
+// fsyncDirectory and completionDeploymentScope are reused verbatim. Ordering,
+// head selection, retry schedule and worker are new and separate.
+
+function outboundIdQueueDirectory(deploymentId) {
+  return join(
+    homedir(), ".openclaw", "state", "virtual-context", "outbound-id-queue",
+    deploymentId,
+  );
+}
+
+function outboundIdQueuePath(deploymentId, key) {
+  return join(outboundIdQueueDirectory(deploymentId), `${key}.json`);
+}
+
+/**
+ * Enqueue one witnessed identity. Idempotent: a record that already exists is
+ * reported as a duplicate no-op, never an error and never a second row (I-3).
+ * Per-key scoping matches the completion outbox's, for the same reason - a
+ * drain scheduled for one VC key can never see another key's records, so
+ * startup must drain EVERY configured key or an agent's ids sit forever with
+ * no error anywhere.
+ */
+function queueOutboundId(convId, identity, { baseUrl, vcKey, observedAt }) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  const key = outboundIdRecordKey(deployment.deployment_id, convId, identity);
+  // I-4: a metadata failure drops the metadata and nothing else. Never throw
+  // here - this runs on the same call path as a turn.
+  if (!key) return { record: null, duplicate: false, refused: true };
+  const finalPath = outboundIdQueuePath(deployment.deployment_id, key);
+  if (existsSync(finalPath)) return { record: null, duplicate: true, refused: false };
+  const record = {
+    version: OUTBOUND_ID_QUEUE_VERSION,
+    ...deployment,
+    key,
+    conv_id: convId,
+    identity,
+    observed_at: observedAt,
+    enqueued_at: new Date().toISOString(),
+  };
+  durableAtomicWrite(finalPath, `${JSON.stringify(record)}\n`);
+  return { record, duplicate: false, refused: false };
+}
+
+/**
+ * Read every record for this deployment. NO head selection, by design - see
+ * outboundIdDueRecords. An unreadable or schema-mismatched record is DELETED
+ * rather than dead-lettered: under I-4 this metadata is droppable, and a
+ * quarantine store for it would only accumulate. The counts are returned so no
+ * caller can report a drop without its N.
+ */
+function readOutboundIdQueue({ baseUrl, vcKey, log }) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  const directory = outboundIdQueueDirectory(deployment.deployment_id);
+  if (!existsSync(directory)) return { records: [], scanned: 0, discarded: 0 };
+  const records = [];
+  let scanned = 0;
+  let discarded = 0;
+  for (const filename of readdirSync(directory).sort()) {
+    if (!/^[a-f0-9]{64}\.json$/.test(filename)) continue;
+    scanned += 1;
+    const path = join(directory, filename);
+    try {
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      const identity = record?.identity;
+      const expectedKey = identity && typeof record?.conv_id === "string"
+        ? outboundIdRecordKey(deployment.deployment_id, record.conv_id, identity)
+        : "";
+      if (
+        record?.version !== OUTBOUND_ID_QUEUE_VERSION
+        || record?.deployment_id !== deployment.deployment_id
+        || record?.base_url !== deployment.base_url
+        || record?.vc_key_hash !== deployment.vc_key_hash
+        || record?.key !== filename.slice(0, -5)
+        || !expectedKey || expectedKey !== record?.key
+        || !isExactOutboundIdentity(identity)
+      ) throw new Error("schema or key mismatch");
+      records.push(record);
+    } catch {
+      durableUnlink(path);
+      discarded += 1;
+    }
+  }
+  if (discarded > 0) {
+    log?.warn?.(
+      `[vc:outbound-id] discarded unreadable records=${discarded} ` +
+      `of scanned=${scanned} (metadata only; no turn is affected)`,
+    );
+  }
+  records.sort((left, right) => {
+    const leftTime = Date.parse(left.enqueued_at ?? "") || 0;
+    const rightTime = Date.parse(right.enqueued_at ?? "") || 0;
+    if (leftTime !== rightTime) return leftTime - rightTime;
+    return String(left.key).localeCompare(String(right.key));
+  });
+  return { records, scanned, discarded };
+}
+
+/**
+ * NON-BLOCKING IS THE DEFINING PROPERTY OF THIS QUEUE (spec 5.3).
+ *
+ * Records are INDEPENDENT. There is deliberately no per-conversation head and
+ * no blocked-key set: every due record is attempted on every drain, and a
+ * record that fails backs off on its own schedule and blocks NOTHING.
+ *
+ * This is pinned by a test rather than left as a property of the current loop
+ * shape, because a later refactor that reintroduces a head would silently
+ * recreate the exact failure 5.1 exists to prevent.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundIdDueRecords(records, now) {
+  return (records ?? []).filter(
+    (record) => (Date.parse(record?.next_attempt_at ?? "") || 0) <= now,
+  );
+}
+
+/**
+ * Age and size bounds. Overflow drops the OLDEST; both branches are counted,
+ * because a bare "dropped" line is a verdict with no N. Dropping is I-1-safe:
+ * a lost id is an unknown. Unbounded growth is not safe, and neither is
+ * keeping a record long enough to outlive its conversation (spec 5.4).
+ *
+ * Pure apart from the unlink; exported for unit testing via the injected
+ * remove callback.
+ */
+export function enforceOutboundIdQueueBounds(records, now, remove, log, limits = {}) {
+  const maxAgeMs = limits.maxAgeMs ?? OUTBOUND_ID_MAX_AGE_MS;
+  const maxRecords = limits.maxRecords ?? OUTBOUND_ID_MAX_RECORDS;
+  let droppedAged = 0;
+  const live = [];
+  for (const record of records ?? []) {
+    const enqueuedAt = Date.parse(record?.enqueued_at ?? "") || now;
+    if (now - enqueuedAt >= maxAgeMs) {
+      remove?.(record);
+      droppedAged += 1;
+      continue;
+    }
+    live.push(record);
+  }
+  let droppedOverflow = 0;
+  while (live.length > maxRecords) {
+    remove?.(live.shift());
+    droppedOverflow += 1;
+  }
+  if (droppedAged > 0 || droppedOverflow > 0) {
+    log?.warn?.(
+      `[vc:outbound-id] bounds enforced - dropped_aged=${droppedAged} ` +
+      `dropped_overflow=${droppedOverflow} remaining=${live.length} ` +
+      `max_age_ms=${maxAgeMs} max_records=${maxRecords}. ` +
+      `Dropped ids are UNKNOWN to the engine, never negative evidence.`,
+    );
+  }
+  return { live, droppedAged, droppedOverflow };
+}
+
+/**
+ * Classify a delivery failure.
+ *
+ * Only statuses where the receiver has NAMED the record unacceptable, or has
+ * no late path at all, are permanent. Everything else - including a status
+ * that could not be read out of the error - is UNKNOWN and therefore retried,
+ * never silently discarded. Auth failures are deployment-wide rather than
+ * per-record and stay retryable on purpose.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function outboundIdFailureIsPermanent(error) {
+  const match = /^VC API (\d{3}):/.exec(String(error?.message ?? error ?? ""));
+  const status = match ? Number(match[1]) : 0;
+  return [400, 404, 405, 409, 410, 413, 422, 501].includes(status);
+}
+
+/** Exponential backoff with jitter, capped. Own schedule; blocks nothing. */
+function retainOutboundIdFailure(record, error, log) {
+  const now = Date.now();
+  const attempts = Math.max(0, Number(record?.attempts) || 0) + 1;
+  const exponential = Math.min(
+    OUTBOUND_ID_MAX_BACKOFF_MS,
+    OUTBOUND_ID_BASE_BACKOFF_MS * (2 ** Math.min(attempts - 1, 16)),
+  );
+  const jitter = Math.floor(exponential * (Math.random() * 0.2));
+  const retained = {
+    ...record,
+    attempts,
+    last_attempt_at: new Date(now).toISOString(),
+    next_attempt_at: new Date(now + exponential + jitter).toISOString(),
+    last_error: String(error?.message ?? error ?? "delivery failed").slice(0, 300),
+  };
+  try {
+    durableAtomicWrite(
+      outboundIdQueuePath(record.deployment_id, record.key),
+      `${JSON.stringify(retained)}\n`,
+    );
+  } catch (writeError) {
+    log?.warn?.(`[vc:outbound-id] could not retain record: ${writeError}`);
+  }
+  return retained;
+}
+
+async function deliverOutboundIdRecord(record, { baseUrl, vcKey, latePath, log }) {
+  const deployment = completionDeploymentScope(baseUrl, vcKey);
+  if (
+    record?.deployment_id !== deployment.deployment_id
+    || record?.base_url !== deployment.base_url
+    || record?.vc_key_hash !== deployment.vc_key_hash
+  ) throw new Error("outbound-id queue deployment scope mismatch");
+  await vcPost(
+    baseUrl,
+    latePath,
+    vcKey,
+    record.conv_id,
+    // Single-element additive set. One record per request keeps the retry
+    // domain per-identity: a rejected id can never hold a different id back.
+    outboundIdWireProjection([record]),
+    10000,
+    log,
+    { correlationId: `outbound-id:${String(record.key).slice(0, 16)}` },
+  );
+  durableUnlink(outboundIdQueuePath(record.deployment_id, record.key));
+}
+
+/**
+ * The late-path worker. One per deployment id, in a worker map isolated from
+ * the completion outbox's (I-5). Every due record is attempted each pass; a
+ * failure retains only ITS OWN record.
+ */
+function scheduleOutboundIdDrain(options) {
+  if (!options?.latePath) return Promise.resolve();
+  const deployment = completionDeploymentScope(options.baseUrl, options.vcKey);
+  let worker = outboundIdWorkers.get(deployment.deployment_id);
+  if (!worker) {
+    worker = { promise: null, timer: null, options };
+    outboundIdWorkers.set(deployment.deployment_id, worker);
+  }
+  worker.options = options;
+  if (worker.promise) return worker.promise;
+  if (worker.timer) {
+    clearTimeout(worker.timer);
+    worker.timer = null;
+  }
+
+  const run = async () => {
+    const attempted = new Set();
+    let processed = 0;
+    let delivered = 0;
+    let permanent = 0;
+    let retained = 0;
+    while (processed < OUTBOUND_ID_DRAIN_LIMIT) {
+      const now = Date.now();
+      const { records } = readOutboundIdQueue(worker.options);
+      const { live } = enforceOutboundIdQueueBounds(
+        records,
+        now,
+        (record) => durableUnlink(
+          outboundIdQueuePath(deployment.deployment_id, record.key),
+        ),
+        worker.options.log,
+      );
+      const due = outboundIdDueRecords(live, now)
+        .filter((record) => !attempted.has(record.key));
+      if (due.length === 0) break;
+      for (const record of due) {
+        if (processed >= OUTBOUND_ID_DRAIN_LIMIT) break;
+        processed += 1;
+        attempted.add(record.key);
+        try {
+          await deliverOutboundIdRecord(record, worker.options);
+          delivered += 1;
+        } catch (error) {
+          if (outboundIdFailureIsPermanent(error)) {
+            durableUnlink(
+              outboundIdQueuePath(record.deployment_id, record.key),
+            );
+            permanent += 1;
+            worker.options.log?.warn?.(
+              `[vc:outbound-id] DROPPED permanently-rejected record - ` +
+              `${error}. The id becomes UNKNOWN to the engine; no turn and no ` +
+              `other record is affected.`,
+            );
+          } else {
+            retainOutboundIdFailure(record, error, worker.options.log);
+            retained += 1;
+          }
+        }
+      }
+      await Promise.resolve();
+    }
+    if (processed > 0) {
+      worker.options.log?.info?.(
+        `[vc:outbound-id] drain - attempted=${processed} delivered=${delivered} ` +
+        `dropped_permanent=${permanent} retained=${retained}`,
+      );
+    }
+  };
+
+  worker.promise = run().finally(() => {
+    worker.promise = null;
+    const { records } = readOutboundIdQueue(worker.options);
+    if (records.length === 0) {
+      outboundIdWorkers.delete(deployment.deployment_id);
+      return;
+    }
+    const now = Date.now();
+    // Every record is independent, so the next wake is the soonest of ALL of
+    // them - not the soonest head. A head-based wake here would be the same
+    // ordering coupling 5.1 rejects, reintroduced through the timer.
+    const nextAt = Math.min(...records.map(
+      (record) => Date.parse(record.next_attempt_at ?? "") || now,
+    ));
+    const delay = Math.max(250, nextAt - now);
+    worker.timer = setTimeout(() => {
+      worker.timer = null;
+      void scheduleOutboundIdDrain(worker.options);
+    }, delay);
+    worker.timer.unref?.();
+  });
+  return worker.promise;
+}
+
+/**
+ * Inventory EVERY outbound-id queue directory on disk, not just the ones the
+ * current config can reach (codex P1-6).
+ *
+ * The directory name is a hash of (baseUrl, vcKey). Rotating a key file or
+ * removing an agent-key entry therefore leaves a directory that no worker can
+ * ever schedule a drain for: its records sit forever with no delivery, no
+ * expiry and NO ERROR ANYWHERE - which is exactly the silent failure the
+ * per-key startup drain exists to prevent, reintroduced through credential
+ * rotation. Repeated rotations accumulate unbounded orphaned state.
+ *
+ * This returns the classification so startup can PRINT it. An orphaned scope
+ * is reported by name and count; it is never silently deleted and never
+ * silently kept.
+ *
+ * Pure apart from the directory read; exported for unit testing.
+ */
+export function inventoryOutboundIdQueues(configuredDeploymentIds, now) {
+  const root = join(
+    homedir(), ".openclaw", "state", "virtual-context", "outbound-id-queue",
+  );
+  const configured = new Set(configuredDeploymentIds ?? []);
+  const scopes = [];
+  if (!existsSync(root)) return { scopes, configuredCount: configured.size };
+  for (const entry of readdirSync(root).sort()) {
+    if (!/^[a-f0-9]{64}$/.test(entry)) continue;
+    let records = 0;
+    let oldestAgeMs = 0;
+    try {
+      for (const filename of readdirSync(join(root, entry))) {
+        if (!/^[a-f0-9]{64}\.json$/.test(filename)) continue;
+        records += 1;
+        try {
+          const parsed = JSON.parse(
+            readFileSync(join(root, entry, filename), "utf8"),
+          );
+          const enqueuedAt = Date.parse(parsed?.enqueued_at ?? "") || now;
+          oldestAgeMs = Math.max(oldestAgeMs, now - enqueuedAt);
+        } catch { /* counted by records; age stays unknown for this one */ }
+      }
+    } catch { /* unreadable directory is still reported, with records=0 */ }
+    scopes.push({
+      deployment_id: entry,
+      drainable: configured.has(entry),
+      records,
+      oldest_age_ms: oldestAgeMs,
+    });
+  }
+  return { scopes, configuredCount: configured.size };
+}
+
+/**
+ * Report the inventory. Prints BOTH sides of every count, because "0 orphaned"
+ * and "the scan could not see anything" must not render the same way.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function renderOutboundIdInventory(inventory) {
+  const scopes = inventory?.scopes ?? [];
+  const orphaned = scopes.filter((scope) => !scope.drainable);
+  const orphanRecords = orphaned.reduce((sum, scope) => sum + scope.records, 0);
+  const drainableRecords = scopes
+    .filter((scope) => scope.drainable)
+    .reduce((sum, scope) => sum + scope.records, 0);
+  const oldestOrphan = orphaned.reduce(
+    (max, scope) => Math.max(max, scope.oldest_age_ms), 0,
+  );
+  if (scopes.length === 0) {
+    return (
+      `[vc:outbound-id] queue inventory - NO DIRECTORIES ON DISK ` +
+      `(configured_scopes=${inventory?.configuredCount ?? 0}). This means ` +
+      `nothing has ever been queued on this host, NOT that delivery is healthy.`
+    );
+  }
+  return (
+    `[vc:outbound-id] queue inventory - scopes=${scopes.length} ` +
+    `configured=${inventory?.configuredCount ?? 0} ` +
+    `drainable_scopes=${scopes.length - orphaned.length} ` +
+    `drainable_records=${drainableRecords} ` +
+    `orphaned_scopes=${orphaned.length} orphaned_records=${orphanRecords} ` +
+    `oldest_orphan_age_ms=${oldestOrphan}` +
+    (orphaned.length > 0
+      ? ` | ORPHANED: no configured VC key hashes to these directories, so no ` +
+        `worker can ever drain them. Most likely a key rotation or a removed ` +
+        `agentKeyFiles entry. Their ids are UNKNOWN to the engine, never ` +
+        `negative evidence. Retire the credential or restore it; do not assume ` +
+        `these records were delivered.`
+      : "")
+  );
+}
+
+// -- Instrument (spec Phase A) ----------------------------------------------
+
+/** Every counter this feature can report. Reasons are NAMED, never lumped. */
+export function newOutboundIdStats() {
+  return {
+    events: 0,
+    withMessageId: 0,
+    withSessionKey: 0,
+    withRunId: 0,
+    successTrue: 0,
+    witnessed: 0,
+    duplicates: 0,
+    carried: 0,
+    queued: 0,
+    queuedDuplicate: 0,
+    queueRefused: 0,
+    unbackedFast: 0,
+    evictedPending: 0,
+    refusedByReason: new Map(),
+    firstEventAt: null,
+    lastEventAt: null,
+  };
+}
+
+/** Name every refusal. A lumped "dropped" count cannot locate a blind spot. */
+export function noteOutboundIdRefusal(stats, reason) {
+  stats.refusedByReason.set(
+    reason, (stats.refusedByReason.get(reason) ?? 0) + 1,
+  );
+}
+
+/**
+ * Render the report.
+ *
+ * Two rules this text obeys, and they are why it is a function rather than an
+ * inline template:
+ *
+ *   1. EVERY number is printed with the N it came from, and the zero-data
+ *      branch is EXPLICIT and non-committal. A check that cannot tell "no
+ *      data" from "data supporting the conclusion" is not an instrument.
+ *   2. The limitations are printed IN THE INSTRUMENT'S OWN OUTPUT, not in a
+ *      spec nobody rereads. This measures PRESENCE, never correctness, and it
+ *      is structurally blind to three populations: the N-1 non-tail chunk ids
+ *      of any multi-chunk reply, every Telegram id, and everything under
+ *      convIdentity="session". A zero from any of those is UNCOVERED, not
+ *      healthy.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function renderOutboundIdReport(stats, context = {}) {
+  const refusals = [...(stats?.refusedByReason?.entries() ?? [])]
+    .sort((left, right) => right[1] - left[1])
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(" ");
+  const mode = context.mode ?? "?";
+  const convIdentity = context.convIdentity ?? "?";
+  const late = context.latePath ? "configured" : "NOT configured";
+  if (!stats?.events) {
+    return (
+      `[vc:outbound-id] NO DATA - the message_sent hook has not fired this ` +
+      `boot (events=0). This is NOT "no outbound messages" and NOT health: an ` +
+      `unfired instrument and a broken one are the same observation. ` +
+      `mode=${mode} convIdentity=${convIdentity} latePath=${late}`
+    );
+  }
+  return (
+    `[vc:outbound-id] report - events=${stats.events} ` +
+    `success=${stats.successTrue} withMessageId=${stats.withMessageId} ` +
+    `withSessionKey=${stats.withSessionKey} withRunId=${stats.withRunId} ` +
+    `witnessed=${stats.witnessed} duplicates=${stats.duplicates} ` +
+    `carried=${stats.carried} queued=${stats.queued} ` +
+    `queuedDuplicate=${stats.queuedDuplicate} ` +
+    `queueRefused=${stats.queueRefused} unbackedFast=${stats.unbackedFast} ` +
+    `evictedPending=${stats.evictedPending} ` +
+    `refused[${refusals || "none"}] ` +
+    `first=${stats.firstEventAt ?? "?"} last=${stats.lastEventAt ?? "?"} ` +
+    `mode=${mode} convIdentity=${convIdentity} latePath=${late} ` +
+    `capture_rate=UNKNOWN | ` +
+    `LIMITATIONS: this measures PRESENCE, not correctness. ` +
+    `capture_rate is UNKNOWN and not merely unreported: events= is a ` +
+    `NUMERATOR WITH NO DENOMINATOR. This process cannot count how many ` +
+    `deliveries actually occurred, so "the hook fired for every delivery" and ` +
+    `"the hook fired for one delivery in a hundred" produce identical output ` +
+    `here. The denominator has to come from the gateway's own delivery log, a ` +
+    `second and independent instrument. Ordering against ingest is likewise ` +
+    `NOT reported: sessionKey cannot disambiguate concurrent turns in one ` +
+    `session, so any ordering claim built on it would pair an outbound event ` +
+    `with a turn it may not belong to. This report is also blind to the N-1 ` +
+    `non-tail ids of every multi-chunk reply (the host emits only the last ` +
+    `chunk's id), to every Telegram id (its sent hook passes no sessionKey), ` +
+    `and to everything under convIdentity="session". A zero in any of those ` +
+    `populations is UNCOVERED, never negative evidence.`
+  );
+}
+
 // Per-conversation tool-definition cache. The server binds a request-local
 // speaker enum into eligible tool schemas from the conversation's current
 // roster snapshot; hardcoded definitions remain the fail-open baseline
@@ -4282,7 +5151,14 @@ export default {
             "/api/v1/context/ingest",
             vcKeyFor(state.sessionKey),
             identity.convId,
-            ingestPayload,
+            // Fast path. Deliberately NOT applied to the exact-completion
+            // payload above: queueExactCompletion fingerprints the whole
+            // payload and dead-letters a re-queue whose fingerprint differs,
+            // so folding a time-varying id set into it would create a brand
+            // new way to lose a real user's turn. The ids ride only the
+            // fire-and-forget legacy ingest, where a changed body costs
+            // nothing.
+            { ...ingestPayload, ...outboundIdIngestFields(identity.convId) },
             15000,
             log,
           );
@@ -4371,6 +5247,41 @@ export default {
         && selectConvId(sessionKey, sessionId).isStable;
     }
 
+    // ── Outbound message-id capture (SPEC-outbound-message-id.md) ──
+    const outboundIdCfg = normalizeOutboundIdConfig(cfg.outboundIdCapture);
+    const outboundIdStats = newOutboundIdStats();
+
+    // Conversation gate. See outboundConvIdFor.
+    const resolveOutboundConvId = (sessionKey) =>
+      outboundConvIdFor(sessionKey, { stableMode, groupIndex });
+
+    const drainAllOutboundIdQueues = () => {
+      if (!outboundIdCfg.latePath) return;
+      for (const key of allConfiguredVcKeys(vcKey, agentKeyIndex)) {
+        void scheduleOutboundIdDrain({
+          baseUrl, vcKey: key, latePath: outboundIdCfg.latePath, log, debug,
+        });
+      }
+    };
+
+    /**
+     * Snapshot the ids to ride an ingest body, WITHOUT consuming them.
+     *
+     * The durable queue owns delivery; this is an opportunistic duplicate, and
+     * a duplicate is safe by contract (I-3). Consuming here would make a failed
+     * ingest destroy the only observation, with nothing recording the loss.
+     */
+    function outboundIdIngestFields(convId) {
+      if (!outboundIdCfg.carry || !convId) return {};
+      const entries = pendingOutboundIdsForConversation(
+        pendingOutboundIds, convId,
+      );
+      const fields = outboundIdWireProjection(entries);
+      const carried = fields.observed_outbound_messages?.length ?? 0;
+      if (carried > 0) outboundIdStats.carried += carried;
+      return fields;
+    }
+
     if (!vcKey) {
       log.warn?.("[vc] no vcKey configured — plugin disabled");
       return;
@@ -4388,6 +5299,29 @@ export default {
       );
     }
     drainAllCompletionOutboxes();
+
+    if (outboundIdCfg.enabled) {
+      log.info?.(
+        `[vc:outbound-id] enabled mode=${outboundIdCfg.mode} ` +
+        `latePath=${outboundIdCfg.latePath || "NOT configured"} ` +
+        `convIdentity=${stableMode ? "stable" : "session"}` +
+        (stableMode
+          ? ""
+          : ` | NOTHING WILL BE CAPTURED: outbound ids can only be bound to a ` +
+            `conversation in stable mode, and a zero here is UNCOVERED, not ` +
+            `health.`),
+      );
+      // Report EVERY queue directory on disk, including ones no current key can
+      // reach. A rotated key file leaves records that no worker can schedule,
+      // and their silence is indistinguishable from delivery.
+      log.info?.(renderOutboundIdInventory(inventoryOutboundIdQueues(
+        allConfiguredVcKeys(vcKey, agentKeyIndex).map(
+          (key) => completionDeploymentScope(baseUrl, key).deployment_id,
+        ),
+        Date.now(),
+      )));
+      drainAllOutboundIdQueues();
+    }
 
     // ── Config compatibility checks ──
     const defaults = ocConfig.agents?.defaults ?? {};
@@ -5994,7 +6928,10 @@ export default {
             "/api/v1/context/ingest",
             vcKeyFor(sessionKey),
             identity.convId,
-            ingestPayload,
+            // Fast path: an opportunistic, non-consuming snapshot of ids
+            // already witnessed for this conversation. The durable queue still
+            // owns delivery, so a failure here loses nothing.
+            { ...ingestPayload, ...outboundIdIngestFields(identity.convId) },
             15000,
             log,
           );
@@ -6017,6 +6954,112 @@ export default {
         }
       }
     });
+
+    // ── message_sent: witness the bot's OWN outbound message ids ──
+    //
+    // This is the whole point of the feature. The plugin already subscribes to
+    // message_sending, which fires BEFORE delivery and therefore has no id yet.
+    // message_sent fires after, carries `messageId`, and is fire-and-forget -
+    // so it can and does land after the ingest for the same turn has already
+    // completed. Nothing here may assume otherwise.
+    if (outboundIdCfg.enabled) {
+      api.on("message_sent", (event, ctx) => {
+        try {
+          const now = Date.now();
+          const observedAt = new Date(now).toISOString();
+          outboundIdStats.events += 1;
+          outboundIdStats.lastEventAt = observedAt;
+          outboundIdStats.firstEventAt ??= observedAt;
+          if (event?.success === true) outboundIdStats.successTrue += 1;
+          if (cleanInboundField(event?.messageId, 128)) {
+            outboundIdStats.withMessageId += 1;
+          }
+          const sessionKey = cleanInboundField(
+            event?.sessionKey ?? ctx?.sessionKey, 1024,
+          );
+          if (sessionKey) outboundIdStats.withSessionKey += 1;
+          // Presence only. The SDK documents runId as NOT plumbed through the
+          // outbound delivery path, and the emit site confirms it. This counter
+          // exists so that claim stays falsifiable from production rather than
+          // quoted from a doc, and so a future gateway that starts populating
+          // it is noticed rather than assumed.
+          if (cleanInboundField(event?.runId ?? ctx?.runId, 128)) {
+            outboundIdStats.withRunId += 1;
+          }
+
+          const { identity, reason } = normalizeOutboundIdentity(event, ctx);
+          if (!identity) {
+            noteOutboundIdRefusal(outboundIdStats, reason);
+            return;
+          }
+          const convId = resolveOutboundConvId(sessionKey);
+          if (!convId) {
+            noteOutboundIdRefusal(
+              outboundIdStats,
+              !sessionKey
+                ? "no_session_key"
+                : (stableMode ? "unstable_conv_identity" : "conv_identity_session_mode"),
+            );
+            return;
+          }
+
+          const { added, evicted } = rememberPendingOutboundId(
+            pendingOutboundIds, convId, { identity, observed_at: observedAt }, now,
+          );
+          outboundIdStats.evictedPending += evicted;
+          if (added) outboundIdStats.witnessed += 1;
+          else outboundIdStats.duplicates += 1;
+
+          if (outboundIdCfg.carry) {
+            if (outboundIdCfg.latePath) {
+              // Durable FIRST, always. The fast path is an opportunistic
+              // duplicate on top of this, never an ownership transfer: an id
+              // classified as "fast" and then lost to a failed ingest would be
+              // an invisible loss, and duplicates are the safe direction.
+              const drainOptions = {
+                baseUrl, vcKey: vcKeyFor(sessionKey),
+                latePath: outboundIdCfg.latePath, log, debug,
+              };
+              const queued = queueOutboundId(convId, identity, {
+                baseUrl, vcKey: drainOptions.vcKey, observedAt,
+              });
+              if (queued.refused) outboundIdStats.queueRefused += 1;
+              else if (queued.duplicate) outboundIdStats.queuedDuplicate += 1;
+              else outboundIdStats.queued += 1;
+              void scheduleOutboundIdDrain(drainOptions);
+            } else {
+              // No late path configured means the fast path is the ONLY path,
+              // so an id witnessed after its own ingest has no durable
+              // backstop and is simply lost. Counted, so the report can never
+              // show a capture number that quietly excludes them.
+              outboundIdStats.unbackedFast += 1;
+            }
+          }
+
+          // The FIRST firing is what calibrates this instrument: until it has
+          // fired once, "no ids captured" and "the hook is broken or never
+          // reached" are the same observation. Print it immediately, then
+          // periodically.
+          if (
+            outboundIdStats.events === 1
+            || outboundIdStats.events % OUTBOUND_ID_REPORT_EVERY === 0
+          ) {
+            log.info?.(renderOutboundIdReport(outboundIdStats, {
+              mode: outboundIdCfg.mode,
+              convIdentity: stableMode ? "stable" : "session",
+              latePath: outboundIdCfg.latePath,
+            }));
+          }
+        } catch (error) {
+          // I-4. This hook is metadata and may never cost a turn, so every
+          // failure inside it is swallowed after being named.
+          log.warn?.(
+            `[vc:outbound-id] hook error (metadata only, no turn affected): ` +
+            `${error}`,
+          );
+        }
+      });
+    }
 
     // ── Strip vc comment tags from outbound messages ──
     api.on("message_sending", async (event) => {
