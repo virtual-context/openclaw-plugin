@@ -269,6 +269,12 @@ describe("the conversation gate is consulted at runtime (codex P0-3)", () => {
       expect(body).not.toHaveProperty("observed_outbound_messages");
     }
     expect(logText(log)).toContain("NOTHING WILL BE CAPTURED");
+    // Assert the REFUSAL directly, not just the empty body. Without the mode
+    // gate the id is still captured under sk:<key> while the turn ingests
+    // under the session UUID -- damage the ingest body alone cannot show,
+    // because it appears only once the late path delivers.
+    expect(logText(log)).toContain("conv_identity_session_mode=1");
+    expect(logText(log)).toContain("witnessed=0");
   });
 
   it("says at boot that a session-mode zero is UNCOVERED, not health", async () => {
