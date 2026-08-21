@@ -618,6 +618,41 @@ describe("the exact-completion fingerprint ignores outbound ids", () => {
   });
 });
 
+describe("an acknowledgement that accounts for MORE than was sent", () => {
+  it("REGRESSION: over-accounting is counted, not clamped into silence", () => {
+    // The receiver commits per row. A write that throws part-way leaves the
+    // earlier rows written AND counted, then counts the whole batch declined
+    // too -- so the totals exceed what was carried. Clamping that to zero made
+    // it read identically to a perfectly accounted answer.
+    const stats = newOutboundIdStats();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 2, store_unavailable: 5 },
+    }), 5);
+    expect(stats.ackOverAccounted).toBe(2);
+    expect(stats.ackUnaccounted).toBe(0);
+  });
+
+  it("does not net the two against each other", () => {
+    // A difference of two different errors is not a measurement. An exactly
+    // accounted answer must leave BOTH at zero.
+    const stats = newOutboundIdStats();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 1, fence_rejection: 1 },
+    }), 2);
+    expect(stats.ackOverAccounted).toBe(0);
+    expect(stats.ackUnaccounted).toBe(0);
+  });
+
+  it("still reports a short answer as unaccounted", () => {
+    const stats = newOutboundIdStats();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 1 },
+    }), 4);
+    expect(stats.ackUnaccounted).toBe(3);
+    expect(stats.ackOverAccounted).toBe(0);
+  });
+});
+
 describe("the ingest-retry gate", () => {
   it("DEFAULTS TO OFF, and this test failing means the default flipped", () => {
     expect(normalizeIngestRetryConfig(undefined).enabled).toBe(false);

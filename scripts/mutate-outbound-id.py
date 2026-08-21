@@ -4,6 +4,7 @@ A test that has never failed has not been shown to discriminate.
 """
 import io
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -303,7 +304,37 @@ MUTATIONS = [
         "        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log);",
         "        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log).catch(() => null);",
     ),
+    (
+        "over-accounting clamped back into silence",
+        "    else if (balance < 0) stats.ackOverAccounted += -balance;",
+        "",
+    ),
+    (
+        "over- and under-accounting netted into one counter",
+        "    else if (balance < 0) stats.ackOverAccounted += -balance;",
+        "    else if (balance < 0) stats.ackUnaccounted += -balance;",
+    ),
 ]
+
+
+def _install_restore_guard(path, original):
+    """Put the file back if we are killed.
+
+    A `timeout` on this script previously left a mutation applied to the source
+    tree: the next run then aborted with "suite is not green" and the working
+    tree carried a defect that looked like an edit. Restore-on-exit is not
+    optional for a tool whose normal state is a corrupted file.
+    """
+    def _restore(signum, frame):
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(original)
+            print(f"\nINTERRUPTED (signal {signum}) - {path} restored.")
+        finally:
+            raise SystemExit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _restore)
 
 
 def run_suite():
@@ -316,6 +347,7 @@ def run_suite():
 
 def main():
     shutil.copy(INDEX, PRISTINE)
+    _install_restore_guard(INDEX, io.open(INDEX, encoding="utf-8").read())
     passed, _ = run_suite()
     if not passed:
         print("ABORT: suite is not green before mutating.")

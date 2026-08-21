@@ -5341,6 +5341,7 @@ export function newOutboundIdStats() {
     ackAbsent: 0,
     ackUnreadable: 0,
     ackUnaccounted: 0,
+    ackOverAccounted: 0,
     turnsSeen: 0,
     turnsWithSessionId: 0,
     turnsWithRawRunId: 0,
@@ -5394,8 +5395,20 @@ export function noteOutboundIdAck(stats, ack, carried, log = null) {
     stats.ackDeclined += declinedCount;
     // Anything the request carried that the answer does not account for is
     // UNACCOUNTED -- not accepted, not refused, and not zero.
-    const unaccounted = Math.max(0, carried - acceptedCount - declinedCount);
-    if (unaccounted > 0) stats.ackUnaccounted += unaccounted;
+    const balance = carried - acceptedCount - declinedCount;
+    if (balance > 0) stats.ackUnaccounted += balance;
+    // OVER-accounting is a real receiver shape and the clamp above HID it.
+    // The receiver's pool is autocommit, so a write that throws part-way
+    // through a batch leaves the earlier rows durably written AND counted,
+    // then counts the WHOLE batch declined as well. One identity is then
+    // reported twice under two outcomes and the totals exceed what was sent.
+    //
+    // Clamping that to zero made it indistinguishable from a perfectly
+    // accounted answer -- the same "a zero that means two different things"
+    // failure this adapter exists to remove. Counted separately, never netted
+    // against ackUnaccounted, because they are different conditions and a
+    // difference of two errors is not a measurement.
+    else if (balance < 0) stats.ackOverAccounted += -balance;
   }
   // Reasons are recorded INDEPENDENTLY of which outcome "won" the classifier.
   // A mixed answer -- accepted:1, fence_rejection:2 -- classifies as accepted
@@ -5520,6 +5533,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `ackAccepted=${stats.ackAccepted} ackDeclined=${stats.ackDeclined} ` +
     `ackAbsent=${stats.ackAbsent} ackUnreadable=${stats.ackUnreadable} ` +
     `ackUnaccounted=${stats.ackUnaccounted} ` +
+    `ackOverAccounted=${stats.ackOverAccounted} ` +
     `turns=${stats.turnsSeen} sessionId=${stats.turnsWithSessionId} ` +
     `rawRunId=${stats.turnsWithRawRunId} ` +
     `group=${stats.groupTurns} groupNoRunId=${stats.groupTurnsWithoutRunId} ` +
@@ -5921,7 +5935,7 @@ export default {
       // deployment to "observe" would deliver everything previously queued and
       // activate suppression -- the opposite of a measurement-only rollout, and
       // the one mode whose entire purpose is having no network effect.
-      if (!outboundIdCfg.carry || !outboundIdCfg.latePath) return;
+      if (!outboundIdCfg.latePath) return;
       for (const key of allConfiguredVcKeys(vcKey, agentKeyIndex)) {
         startOutboundIdDrain({
           baseUrl, vcKey: key, latePath: outboundIdCfg.latePath, log, debug,
