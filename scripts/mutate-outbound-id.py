@@ -391,6 +391,16 @@ MUTATIONS = [
         "    `ack_lags_carry=BY_ONE_REPORT",
         "    `LIMITATIONS_ack_lags_carry=BY_ONE_REPORT",
     ),
+    (
+        "algebraic-agreement caveat claimed even after declines are seen",
+        "      stats.ackDeclined === 0 ? \"YES(agreement is ALGEBRAIC, not corroboration; \" +",
+        "      true ? \"YES(agreement is ALGEBRAIC, not corroboration; \" +",
+    ),
+    (
+        "algebraic-agreement caveat removed",
+        "    `ack_equals_carry_while_declined_zero=${",
+        "    `` + ``.slice(0) + `ack_equals_carry_while_declined_zero_removed=${",
+    ),
 ]
 
 

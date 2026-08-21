@@ -684,6 +684,30 @@ describe("the report carries its own age and its own falsifier", () => {
     expect(line.match(/hooks\] running message_sent(?!\s*\()/g)).toBeNull();
   });
 
+  it("REGRESSION: says agreement with carriedExact is algebraic while declines are zero", () => {
+    // offered = accepted + duplicate + declined. With declined=0 the two
+    // counters are two views of one quantity, so a run of equal readings is
+    // not evidence that they measure different things.
+    const stats = newOutboundIdStats();
+    stats.events = 4;   // the report refuses to print figures at events=0
+    stats.carriedExact = 4; stats.ackAccepted = 4; stats.ackDeclined = 0;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("ack_equals_carry_while_declined_zero=YES");
+    expect(line).toContain("ALGEBRAIC");
+    expect(line).toContain("not corroboration");
+  });
+
+  it("stops claiming it once a decline is seen", () => {
+    // The claim is conditional on the algebra holding. Once it does not, the
+    // line must stop asserting it rather than going stale.
+    const stats = newOutboundIdStats();
+    stats.events = 4;
+    stats.carriedExact = 4; stats.ackAccepted = 3; stats.ackDeclined = 1;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("ack_equals_carry_while_declined_zero=no(declines seen)");
+    expect(line).not.toContain("ALGEBRAIC");
+  });
+
   it("REGRESSION: says the acknowledgement is one report behind, not missing", () => {
     // Distinct from the staleness note: that one says the number MAY be old,
     // this says it is DELIBERATELY behind. A report showing a carry with a

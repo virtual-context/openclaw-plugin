@@ -5770,6 +5770,14 @@ export function renderOutboundIdReport(stats, context = {}) {
     // acknowledgement for its own turn. Reading carriedExact=1 with
     // ackAccepted=0 in a single report as a failure is the mistake this line
     // exists to prevent; it was nearly published once.
+    // Agreement between these two is TAUTOLOGICAL while nothing is declined:
+    // offered = accepted + duplicate + declined, so with declined=0 the carry
+    // count and the acknowledgement count are two views of one quantity. They
+    // can only diverge once something is refused -- so a run of equal readings
+    // is NOT accumulating evidence that the adapter distinguishes them.
+    `ack_equals_carry_while_declined_zero=${
+      stats.ackDeclined === 0 ? "YES(agreement is ALGEBRAIC, not corroboration; " +
+      "these can only differ once something is DECLINED)" : "no(declines seen)"} ` +
     `ack_lags_carry=BY_ONE_REPORT(ackAccepted is recorded when the exact-source ` +
     `response is handled, which is AFTER message_sent prints this line, so a ` +
     `single report showing carriedExact>0 with ackAccepted=0 is the EXPECTED ` +
