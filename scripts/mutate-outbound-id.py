@@ -4,6 +4,7 @@ A test that has never failed has not been shown to discriminate.
 """
 import io
 import shutil
+import os
 import signal
 import subprocess
 import sys
@@ -221,7 +222,7 @@ MUTATIONS = [
     ),
     (
         "unaccounted identities are silently dropped",
-        "    if (unaccounted > 0) stats.ackUnaccounted += unaccounted;",
+        "    if (balance > 0) stats.ackUnaccounted += balance;",
         "",
     ),
     (
@@ -345,7 +346,17 @@ def run_suite():
     return result.returncode == 0, result.stdout + result.stderr
 
 
+SENTINEL = "/tmp/.vc-mutation-in-progress"
+
+
 def main():
+    # A commit taken while this runs captures a MUTATED file. That happened:
+    # a background run was in flight during `git add index.js`, and the
+    # mutation reached the branch and was pushed. The sentinel exists so the
+    # condition is checkable from outside instead of remembered.
+    io.open(SENTINEL, "w", encoding="utf-8").write(
+        "mutation run in progress -- index.js is being rewritten in place; "
+        "DO NOT COMMIT until this file is gone\n")
     shutil.copy(INDEX, PRISTINE)
     _install_restore_guard(INDEX, io.open(INDEX, encoding="utf-8").read())
     passed, _ = run_suite()
@@ -354,12 +365,13 @@ def main():
         return 1
 
     survivors = []
+    stale = []
     for title, old, new in MUTATIONS:
         source = io.open(INDEX, encoding="utf-8").read()
         count = source.count(old)
         if count != 1:
-            print(f"SKIP  (anchor matched {count}x)  {title}")
-            survivors.append(f"{title} [ANCHOR NOT FOUND]")
+            print(f"STALE ANCHOR (matched {count}x)  {title}")
+            stale.append(title)
             continue
         io.open(INDEX, "w", encoding="utf-8").write(source.replace(old, new))
         green, output = run_suite()
@@ -376,8 +388,19 @@ def main():
 
     print()
     print(f"mutations run: {len(MUTATIONS)}   caught: "
-          f"{len(MUTATIONS) - len(survivors)}   SURVIVED: {len(survivors)}")
-    if survivors:
+          f"{len(MUTATIONS) - len(survivors) - len(stale)}   "
+          f"SURVIVED: {len(survivors)}   STALE ANCHORS: {len(stale)}")
+    if stale:
+        # A stale anchor NEVER RAN. Counting it as a survivor overstates the
+        # problem; counting it as caught hides that the property is now
+        # untested. It is neither -- it is a broken check, and the mutation
+        # tool has to report on its own health or it becomes another
+        # instrument nobody validates.
+        print("STALE ANCHORS DID NOT RUN AT ALL -- the property is UNTESTED "
+              "until the anchor is repointed:")
+        for name in stale:
+            print(f"  - {name}")
+    if survivors or stale:
         print("Survivors mean those properties are UNTESTED, not that they work:")
         for name in survivors:
             print(f"  - {name}")
@@ -387,4 +410,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        try:
+            os.unlink(SENTINEL)
+        except OSError:
+            pass
