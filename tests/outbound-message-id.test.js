@@ -16,6 +16,8 @@ import {
   enforceOutboundIdQueueBounds,
   outboundIdFailureIsPermanent,
   classifyOutboundIdResponse,
+  readOutboundIdAck,
+  noteOutboundIdAck,
   completionOutboxFingerprint,
   newOutboundIdStats,
   noteOutboundIdRefusal,
@@ -611,6 +613,107 @@ describe("the exact-completion fingerprint ignores outbound ids", () => {
     for (const payload of [null, undefined, "x", 7]) {
       expect(completionOutboxFingerprint("sk:c", payload)).toMatch(/^[a-f0-9]{64}$/);
     }
+  });
+});
+
+describe("the acknowledgement adapter (fast path)", () => {
+  const ack = (body) => readOutboundIdAck(body);
+  const KEY = "agent_outbound_ids_result";
+
+  it("REGRESSION: absent and unreadable are DIFFERENT, not both empty", () => {
+    // The distinction is the point. Absent = the receiver said nothing.
+    // Unreadable = it answered and the answer carried no outcome this side
+    // knows. Both are UNKNOWN and neither is zero, but collapsing them hides
+    // which side the silence came from.
+    expect(ack({ status: "tagged" }).state).toBe("absent");
+    expect(ack({}).state).toBe("absent");
+    expect(ack(null).state).toBe("absent");
+    expect(ack({ [KEY]: null }).state).toBe("unreadable");
+    expect(ack({ [KEY]: {} }).state).toBe("unreadable");
+    expect(ack({ [KEY]: [] }).state).toBe("unreadable");
+    expect(ack({ [KEY]: "nope" }).state).toBe("unreadable");
+    expect(ack({ [KEY]: { unrelated: 3 } }).state).toBe("unreadable");
+  });
+
+  it("reads accepted and duplicate as on-record", () => {
+    expect(ack({ [KEY]: { accepted: 1, duplicate: 0 } }).state).toBe("accepted");
+    expect(ack({ [KEY]: { accepted: 0, duplicate: 2 } }).state).toBe("accepted");
+  });
+
+  it("reads a named decline with its reason and permanence", () => {
+    const out = ack({ [KEY]: { accepted: 0, duplicate: 0, fence_rejection: 3 } });
+    expect(out).toMatchObject({ state: "declined", reason: "fence_rejection", permanent: true });
+    const retryable = ack({ [KEY]: { accepted: 0, duplicate: 0, store_unavailable: 1 } });
+    expect(retryable).toMatchObject({ state: "declined", reason: "store_unavailable", permanent: false });
+  });
+
+  it("NEGATIVE CONTROL: a flat merge is NOT read as an acknowledgement", () => {
+    // If the receiver ever merged flat, `status: "tagged"` would collide with
+    // the classifier's top-level read and a complete success would look like an
+    // unrecognised decline, retried forever.
+    expect(ack({ status: "tagged", accepted: 1 }).state).toBe("absent");
+  });
+
+  it("never throws on hostile input", () => {
+    for (const body of [undefined, 7, "x", [], { [KEY]: 0 }, { [KEY]: false }]) {
+      expect(() => readOutboundIdAck(body)).not.toThrow();
+    }
+  });
+});
+
+describe("acknowledgement counters separate producer from end-to-end", () => {
+  const mk = () => newOutboundIdStats();
+
+  it("REGRESSION: a total decline is visible, where carried alone was not", () => {
+    // carriedExact reads identically whether everything was accepted or
+    // everything refused. That is what let a live 100%-decline condition sit
+    // undetected until someone read the receiver's container logs.
+    const stats = mk();
+    const lines = [];
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 0, duplicate: 0, fence_rejection: 3 },
+    }), 3, { warn: (l) => lines.push(l) });
+    expect(stats.ackDeclined).toBe(3);
+    expect(stats.ackAccepted).toBe(0);
+    expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(1);
+    expect(lines[0]).toContain("DECLINED by receiver");
+    expect(lines[0]).toContain("NOT on record");
+    expect(lines[0]).toContain("not a transport failure");
+  });
+
+  it("counts absent and unreadable apart, and neither as accepted", () => {
+    const stats = mk();
+    noteOutboundIdAck(stats, readOutboundIdAck({ status: "tagged" }), 2);
+    noteOutboundIdAck(stats, readOutboundIdAck({ agent_outbound_ids_result: {} }), 5);
+    expect(stats.ackAbsent).toBe(2);
+    expect(stats.ackUnreadable).toBe(5);
+    expect(stats.ackAccepted).toBe(0);
+    expect(stats.ackDeclined).toBe(0);
+  });
+
+  it("does not log a warning for an accepted acknowledgement", () => {
+    const stats = mk();
+    const lines = [];
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 2, duplicate: 0 },
+    }), 2, { warn: (l) => lines.push(l) });
+    expect(stats.ackAccepted).toBe(2);
+    expect(lines).toHaveLength(0);
+  });
+
+  it("the report distinguishes attached from recorded, in its own text", () => {
+    const stats = mk();
+    stats.events = 3;
+    stats.carriedExact = 4;
+    stats.ackDeclined = 4;
+    stats.ackDeclinedByReason.set("epoch_start_unknown", 2);
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("carriedExact=4");
+    expect(line).toContain("ackAccepted=0");
+    expect(line).toContain("ackDeclined=4");
+    expect(line).toContain("ackDeclinedBy[epoch_start_unknown=2]");
+    expect(line).toContain("ackAccepted is the");
+    expect(line).toContain("UNKNOWN, never zero");
   });
 });
 

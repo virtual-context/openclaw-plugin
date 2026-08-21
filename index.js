@@ -5185,6 +5185,59 @@ export function renderOutboundIdInventory(inventory) {
   );
 }
 
+/**
+ * The receiver's acknowledgement block, keyed under its own name.
+ *
+ * NESTED, NOT FLAT, and that is a correctness requirement rather than a style
+ * choice: this side classifies from TOP-LEVEL keys, and the ingest response
+ * already carries `status: "tagged"`. Merged flat, a complete success reads as
+ * an unrecognised decline and is retried forever.
+ */
+const OUTBOUND_ID_ACK_KEY = "agent_outbound_ids_result";
+
+/**
+ * Read the acknowledgement off an ingest response.
+ *
+ * FOUR OUTCOMES, and they are deliberately not collapsed into three. The one
+ * that matters is the first pair: **an absent block and an unreadable one are
+ * different facts.** Absent means the receiver said nothing — an older
+ * deployment, a path that did not record, a response built before this shipped.
+ * Unreadable means it answered and the answer carried no outcome this side
+ * understands. Both are UNKNOWN and neither is zero, but conflating them hides
+ * which side the silence came from.
+ *
+ *   absent      -> the receiver reported nothing
+ *   unreadable  -> it reported something with no recognisable outcome
+ *   accepted    -> at least one identity is on record (duplicate counts)
+ *   declined    -> a named refusal, with its reason
+ *
+ * Never throws: this runs on the turn path and an acknowledgement is metadata.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function readOutboundIdAck(response) {
+  if (!response || typeof response !== "object"
+    || !(OUTBOUND_ID_ACK_KEY in response)) {
+    return { state: "absent", reason: "", counts: null };
+  }
+  const block = response[OUTBOUND_ID_ACK_KEY];
+  if (!block || typeof block !== "object" || Array.isArray(block)) {
+    return { state: "unreadable", reason: "", counts: null };
+  }
+  const verdict = classifyOutboundIdResponse(block);
+  if (verdict.ok) {
+    return { state: "accepted", reason: "", counts: block };
+  }
+  if (verdict.reason) {
+    return {
+      state: "declined", reason: verdict.reason,
+      permanent: verdict.permanent, counts: block,
+    };
+  }
+  // It answered, and nothing in the answer is an outcome this side knows.
+  return { state: "unreadable", reason: "", counts: block };
+}
+
 // -- Instrument (spec Phase A) ----------------------------------------------
 
 /** Every counter this feature can report. Reasons are NAMED, never lumped. */
@@ -5206,6 +5259,11 @@ export function newOutboundIdStats() {
     chunkedLowerBound: 0,
     sendingHookEvents: 0,
     carriedExact: 0,
+    ackAccepted: 0,
+    ackDeclined: 0,
+    ackAbsent: 0,
+    ackUnreadable: 0,
+    ackDeclinedByReason: new Map(),
     evictedPending: 0,
     refusedByReason: new Map(),
     // Which agent scopes are delivering. Pairs against which ones ingest:
@@ -5217,6 +5275,45 @@ export function newOutboundIdStats() {
     firstEventAt: null,
     lastEventAt: null,
   };
+}
+
+/**
+ * Record an acknowledgement against the identities that were carried.
+ *
+ * THE POINT OF THIS FUNCTION: before it existed, `carriedExact` read the same
+ * whether every identity was accepted or every one was refused — a
+ * producer-side number reported as an end-to-end one. It is what let a live
+ * 100%-decline condition sit undetected until someone read the receiver's
+ * container logs.
+ *
+ * A DECLINE IS LOGGED LOUDLY AND IMMEDIATELY, not left to the periodic report,
+ * because the periodic report is itself blind between events 6 and 24.
+ */
+export function noteOutboundIdAck(stats, ack, carried, log = null) {
+  if (!stats || !ack) return;
+  if (ack.state === "accepted") {
+    stats.ackAccepted += carried;
+    return;
+  }
+  if (ack.state === "declined") {
+    stats.ackDeclined += carried;
+    const reason = ack.reason || "unspecified";
+    stats.ackDeclinedByReason.set(
+      reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + 1,
+    );
+    log?.warn?.(
+      `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +
+      `permanent=${ack.permanent === true} carried=${carried}. ` +
+      `Those identities are NOT on record. This is the receiver's verdict, ` +
+      `not a transport failure — the turn itself was accepted.`,
+    );
+    return;
+  }
+  // absent and unreadable are BOTH unknown and neither is zero. Counted apart
+  // so a reader can tell "the receiver said nothing" from "the receiver
+  // answered and this side could not read it".
+  if (ack.state === "absent") stats.ackAbsent += carried;
+  else stats.ackUnreadable += carried;
 }
 
 /** Name every refusal. A lumped "dropped" count cannot locate a blind spot. */
@@ -5273,6 +5370,9 @@ export function renderOutboundIdReport(stats, context = {}) {
     `withSessionKey=${stats.withSessionKey} withRunId=${stats.withRunId} ` +
     `witnessed=${stats.witnessed} duplicates=${stats.duplicates} ` +
     `carried=${stats.carried} carriedExact=${stats.carriedExact} ` +
+    `ackAccepted=${stats.ackAccepted} ackDeclined=${stats.ackDeclined} ` +
+    `ackAbsent=${stats.ackAbsent} ackUnreadable=${stats.ackUnreadable} ` +
+    `ackDeclinedBy[${tally(stats?.ackDeclinedByReason) || "none"}] ` +
     `queued=${stats.queued} ` +
     `queuedDuplicate=${stats.queuedDuplicate} ` +
     `queueRefused=${stats.queueRefused} unbackedFast=${stats.unbackedFast} ` +
@@ -5290,6 +5390,10 @@ export function renderOutboundIdReport(stats, context = {}) {
       : "NO_DATA"} ` +
     `capture_rate=UNKNOWN | ` +
     `LIMITATIONS: this measures PRESENCE, not correctness. ` +
+    `carried/carriedExact count what was ATTACHED TO A REQUEST and say ` +
+    `nothing about whether anything was recorded; ackAccepted is the ` +
+    `end-to-end number. ackAbsent means the receiver reported no outcome ` +
+    `at all and is UNKNOWN, never zero. ` +
     `TWO DIFFERENT RATIOS, and conflating them is the trap. ` +
     `sent_per_sending compares the post-delivery hook against the ` +
     `PRE-delivery hook this plugin already subscribes to, and it answers ` +
@@ -5707,6 +5811,7 @@ export default {
         const result = await vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
           { ...ingestPayload, ...fields }, 15000, log);
         outboundIdStats.carried += carried;
+        noteOutboundIdAck(outboundIdStats, readOutboundIdAck(result), carried, log);
         return result;
       } catch (error) {
         outboundIdStats.metadataRejected += carried;
