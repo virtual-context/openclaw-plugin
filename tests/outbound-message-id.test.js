@@ -14,6 +14,7 @@ import {
   outboundConvIdFor,
   rememberPendingOutboundId,
   pendingOutboundIdsForConversation,
+  pendingOutboundIdDropCount,
   forgetPendingOutboundIds,
   prunePendingOutboundIds,
   outboundIdDueRecords,
@@ -736,6 +737,63 @@ describe("the report carries its own age and its own falsifier", () => {
     expect(line).toContain("INVALID");
     // The age must sit beside the value, not in the limitations block.
     expect(line.indexOf("reading_taken_at=")).toBeLessThan(line.indexOf("LIMITATIONS"));
+  });
+});
+
+describe("cap truncation is counted rather than silent", () => {
+  // The slice keeps the LAST `limit` entries and discards the oldest with no
+  // counter and no branch. The receiver cannot see it: a dropped identity never
+  // reaches the wire, so there is no decline and no gap to notice. This is the
+  // one quantity with no receiver-side substitute.
+  const bucketOf = (n) => {
+    const inner = new Map();
+    for (let i = 0; i < n; i += 1) inner.set(`k${i}`, { identity: i });
+    return new Map([["c", inner]]);
+  };
+
+  it("counts nothing while the bucket is under the cap", () => {
+    expect(pendingOutboundIdDropCount(bucketOf(32), "c", 32)).toBe(0);
+    expect(pendingOutboundIdDropCount(bucketOf(5), "c", 32)).toBe(0);
+  });
+
+  it("REGRESSION: counts exactly what the slice will discard", () => {
+    expect(pendingOutboundIdDropCount(bucketOf(35), "c", 32)).toBe(3);
+    // And it must agree with what the slice actually drops, or the counter is
+    // measuring a different quantity than the one being lost.
+    const state = bucketOf(35);
+    const kept = pendingOutboundIdsForConversation(state, "c", 32);
+    expect(kept).toHaveLength(32);
+    expect(35 - kept.length).toBe(pendingOutboundIdDropCount(state, "c", 32));
+  });
+
+  it("the OLDEST are the ones dropped, which is what makes it silent", () => {
+    // Newest-first would lose the identity most likely to be quoted next.
+    // Oldest-first loses the ones least likely to be noticed missing.
+    const kept = pendingOutboundIdsForConversation(bucketOf(35), "c", 32);
+    expect(kept[0].identity).toBe(3);
+    expect(kept.at(-1).identity).toBe(34);
+  });
+
+  it("an absent conversation drops nothing rather than throwing", () => {
+    expect(pendingOutboundIdDropCount(new Map(), "missing", 32)).toBe(0);
+    expect(pendingOutboundIdDropCount(null, "c", 32)).toBe(0);
+  });
+
+  it("the report names it as loss the receiver cannot see", () => {
+    const stats = newOutboundIdStats();
+    stats.events = 1; stats.droppedByCap = 3;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("droppedByCap=3");
+    expect(line).toContain("SILENT LOSS");
+    expect(line).toContain("receiver cannot see these");
+  });
+
+  it("stays quiet when nothing was dropped", () => {
+    const stats = newOutboundIdStats();
+    stats.events = 1;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("droppedByCap=0");
+    expect(line).not.toContain("SILENT LOSS");
   });
 });
 

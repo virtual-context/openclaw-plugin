@@ -4551,6 +4551,35 @@ export function rememberPendingOutboundId(state, convId, entry, now, limits = {}
  *
  * Pure against the injected state map; exported for unit testing.
  */
+/**
+ * How many identities the carry would DROP for this conversation.
+ *
+ * `pendingOutboundIdsForConversation` keeps the LAST `limit` entries and
+ * discards the oldest with no counter, no warning and no branch -- so a bucket
+ * past the cap loses its oldest identities invisibly. `carriedExact` still
+ * climbs, `ackAccepted` still matches it, and the receiver's ledger still
+ * fills; the only signature is an identity that never arrives.
+ *
+ * The receiver CANNOT see this. An identity dropped from the slice never
+ * reaches the wire, so there is no line, no decline, and no gap in any sequence
+ * they can check. This is the one quantity here with no receiver-side
+ * substitute, which is why it is worth a counter of its own.
+ *
+ * Never observed in production: peak bucket 16 against a cap of 32 over three
+ * weeks. Reaching it needs ~33 consecutive turns inside the TTL; the longest
+ * run of sub-28-second gaps on record is 1. The speed is reachable -- 17.6s has
+ * occurred -- but sustaining it has not.
+ *
+ * Pure; exported for unit testing.
+ */
+export function pendingOutboundIdDropCount(
+  state, convId, limit = OUTBOUND_ID_MAX_CARRIED_PER_INGEST,
+) {
+  const bucket = state?.get?.(convId);
+  const size = bucket?.size ?? 0;
+  return size > limit ? size - limit : 0;
+}
+
 export function pendingOutboundIdsForConversation(
   state, convId, limit = OUTBOUND_ID_MAX_CARRIED_PER_INGEST,
 ) {
@@ -5362,6 +5391,7 @@ export function newOutboundIdStats() {
     ackUnreadable: 0,
     ackUnaccounted: 0,
     ackOverAccounted: 0,
+    droppedByCap: 0,
     turnsSeen: 0,
     turnsWithSessionId: 0,
     turnsWithRawRunId: 0,
@@ -5729,6 +5759,9 @@ export function renderOutboundIdReport(stats, context = {}) {
     `ackAbsent=${stats.ackAbsent} ackUnreadable=${stats.ackUnreadable} ` +
     `ackUnaccounted=${stats.ackUnaccounted} ` +
     `ackOverAccounted=${stats.ackOverAccounted} ` +
+    `droppedByCap=${stats.droppedByCap}` +
+    `${stats.droppedByCap > 0 ? "(SILENT LOSS: oldest identities never reached the wire; " +
+      "the receiver cannot see these)" : ""} ` +
     `turns=${stats.turnsSeen} sessionId=${stats.turnsWithSessionId} ` +
     `rawRunId=${stats.turnsWithRawRunId} ` +
     `group=${stats.groupTurns} groupNoRunId=${stats.groupTurnsWithoutRunId} ` +
@@ -6385,8 +6418,22 @@ export default {
 
     function outboundIdIngestFields(convId, sessionKey) {
       if (!outboundIdCfg.carry || !convId) return {};
+      const pendingKey = outboundPendingKey(convId, sessionKey);
+      // Count what the slice is about to discard, BEFORE it discards it. This
+      // is the only place the drop is knowable at all.
+      const dropped = pendingOutboundIdDropCount(pendingOutboundIds, pendingKey);
+      if (dropped > 0) {
+        outboundIdStats.droppedByCap += dropped;
+        log.warn?.(
+          `[vc:outbound-id] CAP TRUNCATION — ${dropped} identit(ies) dropped ` +
+          `from this carry because the pending bucket exceeded ` +
+          `${OUTBOUND_ID_MAX_CARRIED_PER_INGEST}. The OLDEST are dropped. The ` +
+          `receiver cannot detect this: they never reach the wire, so there is ` +
+          `no decline and no gap for anyone downstream to notice.`,
+        );
+      }
       const entries = pendingOutboundIdsForConversation(
-        pendingOutboundIds, outboundPendingKey(convId, sessionKey),
+        pendingOutboundIds, pendingKey,
       );
       return outboundIdWireProjection(entries, sessionAgentScopeId(sessionKey));
     }

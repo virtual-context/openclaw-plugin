@@ -401,6 +401,21 @@ MUTATIONS = [
         "    `ack_equals_carry_while_declined_zero=${",
         "    `` + ``.slice(0) + `ack_equals_carry_while_declined_zero_removed=${",
     ),
+    (
+        "cap truncation counted but not warned",
+        "        log.warn?.(\n          `[vc:outbound-id] CAP TRUNCATION",
+        "        (() => {})?.(\n          `[vc:outbound-id] CAP TRUNCATION",
+    ),
+    (
+        "cap truncation counter off by the cap itself",
+        "  return size > limit ? size - limit : 0;",
+        "  return size > limit ? size : 0;",
+    ),
+    (
+        "cap truncation measured after the slice instead of before",
+        "      const dropped = pendingOutboundIdDropCount(pendingOutboundIds, pendingKey);",
+        "      const dropped = 0;",
+    ),
 ]
 
 
