@@ -110,8 +110,9 @@ MUTATIONS = [
         "sent_per_sending divides by zero instead of saying NO_DATA",
         "    `sent_per_sending=${stats.sendingHookEvents > 0\n"
         "      ? (stats.events / stats.sendingHookEvents).toFixed(2)\n"
-        "      : \"NO_DATA\"} ` +",
-        "    `sent_per_sending=${(stats.events / stats.sendingHookEvents).toFixed(2)} ` +",
+        "      : \"NO_DATA\"}(SELF-REFERENTIAL",
+        "    `sent_per_sending=${(stats.events / stats.sendingHookEvents)\n"
+        "      .toFixed(2)}(SELF-REFERENTIAL",
     ),
     (
         "a counts body with no accept is treated as success",
@@ -317,8 +318,8 @@ MUTATIONS = [
     ),
     (
         "exact-path acknowledgement never read",
-        "    noteOutboundIdAck(",
-        "    void 0 && noteOutboundIdAck(",
+        "    noteOutboundIdAck(\n      outboundIdStats, readOutboundIdAck(ingestResult), ackIdentities, log,\n    );",
+        "",
     ),
     (
         "exact-path ack skipped when delivery is dead-lettered",
@@ -399,8 +400,35 @@ def _ratchet_mutation_count():
         pass
 
 
+def _validate_anchors():
+    """Fail BEFORE running when any anchor does not match exactly once.
+
+    Two stale anchors cost a full run each tonight, and one of them was the
+    single most important mutation of its batch -- it never executed and the
+    summary still read as a clean sweep for the file it was pointed at. A
+    substring anchor is also silently non-unique: "    noteOutboundIdAck("
+    matched a deeper-indented call site as well.
+
+    Checking costs one pass over the source. Not checking costs ten minutes and
+    a false result, which is the worse trade in both directions.
+    """
+    source = io.open(INDEX, encoding="utf-8").read()
+    broken = [(title, source.count(old)) for title, old, _ in MUTATIONS
+              if source.count(old) != 1]
+    if not broken:
+        print(f"anchors: all {len(MUTATIONS)} match exactly once")
+        return True
+    print("ABORT: anchors do not match the source exactly once. "
+          "These mutations WOULD NOT RUN and the summary would not say so:")
+    for title, count in broken:
+        print(f"  - {title}  (matched {count}x)")
+    return False
+
+
 def main():
     _ratchet_mutation_count()
+    if not _validate_anchors():
+        return 1
     # A commit taken while this runs captures a MUTATED file. That happened:
     # a background run was in flight during `git add index.js`, and the
     # mutation reached the branch and was pushed. The sentinel exists so the
