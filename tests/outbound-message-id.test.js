@@ -676,7 +676,12 @@ describe("the report carries its own age and its own falsifier", () => {
     const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
     const ratio = line.indexOf("sent_per_sending=");
     expect(line.slice(ratio, ratio + 200)).toContain("SELF-REFERENTIAL");
-    expect(line.slice(ratio, ratio + 200)).toContain("hooks] running message_sent");
+    expect(line.slice(ratio, ratio + 260)).toContain("running message_sent (");
+    // REGRESSION: the documented pattern must not match the line documenting
+    // it. The first version quoted the bare phrase and the grep it recommends
+    // then counted this report line too, returning exactly double the real
+    // dispatch count -- a falsifier that broke the measurement it described.
+    expect(line.match(/hooks\] running message_sent(?!\s*\()/g)).toBeNull();
   });
 
   it("REGRESSION: states the reading's age and that a stale one is INVALID to compare", () => {

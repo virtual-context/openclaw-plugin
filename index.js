@@ -5748,8 +5748,15 @@ export function renderOutboundIdReport(stats, context = {}) {
     `sent_per_sending=${stats.sendingHookEvents > 0
       ? (stats.events / stats.sendingHookEvents).toFixed(2)
       : "NO_DATA"}(SELF-REFERENTIAL: both hooks die together, so 1.00 is also ` +
-    `what total dispatch failure prints; the real denominator is the host's ` +
-    `own "hooks] running message_sent" count) ` +
+    // The pattern is written with a trailing open paren ON PURPOSE. The first
+    // version quoted the bare phrase, which put the search string INTO this
+    // line -- so the documented grep matched the report as well as the hook and
+    // returned exactly double. A falsifier that breaks the measurement it
+    // describes is worse than none; anchor on the hook line's own suffix.
+    `what total dispatch failure prints; count the host's own dispatch lines ` +
+    `instead, matching on: running message_sent ( — the trailing paren is ` +
+    `required, because without it the pattern also matches THIS line and ` +
+    `doubles the count) ` +
     // The reading's OWN AGE, adjacent to the figures rather than buried in the
     // limitations below. Without it a reader at event 11 sees events=5, counts
     // 11 host dispatches, and derives a six-event shortfall that does not
