@@ -331,6 +331,46 @@ MUTATIONS = [
         "    ? record.payload[OUTBOUND_ID_EXACT_PAYLOAD_KEY].length",
         "    ? 1",
     ),
+    (
+        "actor id: a conflict is downgraded to a warning instead of disabling",
+        "        agentActorIds.conflicted.add(platform);",
+        "",
+    ),
+    (
+        "actor id: absent corroboration reported as verified",
+        '      if (verdict.state === "conflict") {',
+        '      if (verdict.state === "conflict" && false) {',
+    ),
+    (
+        "actor id: any truthy value accepted as a platform key",
+        "    if (!platform || !/^[a-z0-9._-]+$/.test(platform)) continue;",
+        "    if (!platform) continue;",
+    ),
+    (
+        "actor id: a majority resolves a disagreement instead of refusing",
+        "  const conflicts = list.filter((entry) => entry.id !== configuredId);\n  if (conflicts.length > 0) return { state: \"conflict\", conflicts };",
+        "  const conflicts = list.filter((entry) => entry.id !== configuredId);\n  if (conflicts.length > list.length / 2) return { state: \"conflict\", conflicts };",
+    ),
+    (
+        "actor id: empty corroboration treated as agreement",
+        '  if (list.length === 0) return { state: "uncorroborated", conflicts: [] };',
+        "",
+    ),
+    (
+        "actor id: tripwire does not disable the platform",
+        "  state.tripped.add(platform);",
+        "",
+    ),
+    (
+        "actor id: a tripped platform still sends its id",
+        '  if (state.tripped.has(platform)) return "";',
+        "",
+    ),
+    (
+        "actor id: a conflicted platform still sends its id",
+        '  if (state.conflicted.has(platform)) return "";',
+        "",
+    ),
 ]
 
 

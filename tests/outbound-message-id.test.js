@@ -20,6 +20,12 @@ import {
   noteOutboundIdAck,
   noteTurnIdentifiers,
   normalizeIngestRetryConfig,
+  normalizeAgentActorIds,
+  readCorroboratingActorIds,
+  classifyAgentActorId,
+  noteInboundActorForTripwire,
+  agentActorIdFor,
+  newAgentActorIdState,
   completionOutboxFingerprint,
   newOutboundIdStats,
   noteOutboundIdRefusal,
@@ -678,6 +684,84 @@ describe("the report carries its own age and its own falsifier", () => {
     expect(line).toContain("INVALID");
     // The age must sit beside the value, not in the limitations block.
     expect(line.indexOf("reading_taken_at=")).toBeLessThan(line.indexOf("LIMITATIONS"));
+  });
+});
+
+describe("the agent's own platform identity", () => {
+  const ID = "1485681229608259666";
+  const HUMAN = "387316537012518913";
+
+  it("is platform-keyed and drops malformed entries rather than repairing them", () => {
+    // A repaired identity is a guess, and a guess here deletes a person's words.
+    const m = normalizeAgentActorIds({
+      discord: ID, TELEGRAM: "tg1", "bad platform": "x", telegram2: "",
+    });
+    expect(m.get("discord")).toBe(ID);
+    expect(m.get("telegram")).toBe("tg1");
+    expect(m.has("bad platform")).toBe(false);
+    expect(m.has("telegram2")).toBe(false);
+  });
+
+  it("rejects a bare string, which is the shape that breaks on a second platform", () => {
+    expect(normalizeAgentActorIds(ID).size).toBe(0);
+    expect(normalizeAgentActorIds(["discord", ID]).size).toBe(0);
+  });
+
+  it("reads corroborating ids out of OTHER plugins' configs", () => {
+    const found = readCorroboratingActorIds({ plugins: { entries: {
+      "discord-link-curator": { config: { botUserId: ID } },
+      "bts-relay": { config: { botUserId: ID } },
+      "virtual-context": { config: {} },
+    } } }, "botUserId");
+    expect(found).toEqual([
+      { source: "discord-link-curator", id: ID },
+      { source: "bts-relay", id: ID },
+    ]);
+  });
+
+  it("REGRESSION: a disagreement is CONFLICT, never resolved by majority", () => {
+    // Two entries agreeing against one is a majority and still not evidence.
+    // A wrong id suppresses a real person's words, so a disagreement is refused.
+    const v = classifyAgentActorId("discord", ID, [
+      { source: "a", id: ID }, { source: "b", id: HUMAN },
+    ]);
+    expect(v.state).toBe("conflict");
+    expect(v.conflicts).toHaveLength(1);
+  });
+
+  it("REGRESSION: absence of corroboration is UNCORROBORATED, never verified", () => {
+    expect(classifyAgentActorId("discord", ID, []).state).toBe("uncorroborated");
+    expect(classifyAgentActorId("telegram", "tg1", []).state).toBe("uncorroborated");
+  });
+
+  it("is verified only when every independent entry agrees", () => {
+    expect(classifyAgentActorId("discord", ID, [
+      { source: "a", id: ID }, { source: "b", id: ID },
+    ]).state).toBe("verified");
+  });
+
+  it("THE TRIPWIRE: an id seen as an inbound sender disables the platform", () => {
+    // Corroboration catches a typo. It cannot catch a value that is wrong in
+    // every config. This is derived from live traffic, so it can.
+    const state = newAgentActorIdState(normalizeAgentActorIds({ discord: HUMAN }));
+    expect(agentActorIdFor(state, "discord")).toBe(HUMAN);
+    expect(noteInboundActorForTripwire(state, "discord", HUMAN)).toBe(true);
+    expect(agentActorIdFor(state, "discord")).toBe("");
+  });
+
+  it("the tripwire does not fire on a different speaker or platform", () => {
+    const state = newAgentActorIdState(normalizeAgentActorIds({ discord: ID }));
+    expect(noteInboundActorForTripwire(state, "discord", HUMAN)).toBe(false);
+    expect(noteInboundActorForTripwire(state, "telegram", ID)).toBe(false);
+    expect(agentActorIdFor(state, "discord")).toBe(ID);
+  });
+
+  it("a conflicted platform sends nothing, and does not disable the others", () => {
+    const state = newAgentActorIdState(
+      normalizeAgentActorIds({ discord: ID, telegram: "tg1" }));
+    state.conflicted.add("discord");
+    expect(agentActorIdFor(state, "discord")).toBe("");
+    expect(agentActorIdFor(state, "telegram")).toBe("tg1");
   });
 });
 

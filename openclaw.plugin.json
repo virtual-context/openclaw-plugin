@@ -125,6 +125,15 @@
             "description": "Arm the retry. Leave unset unless the receiver is known to be returning conversation_lifecycle_busy."
           }
         }
+      },
+      "agentActorIds": {
+        "type": "object",
+        "description": "The agent's own platform actor ids, keyed by platform (e.g. {\"discord\": \"1485...\"}). Supplied to the engine so it can tell its own quoted output from a member's. A WRONG value suppresses a real person's quoted words, so it is cross-checked at boot against other plugins' botUserId entries and disabled on any disagreement.",
+        "additionalProperties": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       }
     },
     "additionalProperties": false

@@ -5496,6 +5496,127 @@ export function noteTurnIdentifiers(stats, { sessionId, rawRunId, isGroup }) {
   }
 }
 
+// ── The agent's own platform identity ──────────────────────────────────────
+//
+// The receiver's guard asks "is this quoted text agent-authored?" and cannot
+// answer, because the engine does not know its own identity. This supplies it.
+//
+// THE FAILURE MODES ARE NOT SYMMETRIC, and every decision below resolves the
+// same way because of it:
+//
+//   too NARROW (never matches)  -> the guard never fires. Ghosts persist.
+//                                  That is today's behaviour: visible, and no
+//                                  worse than now.
+//   too BROAD  (matches a human) -> the guard fires on a REAL PERSON'S quoted
+//                                  words and SUPPRESSES them, leaving nothing
+//                                  behind to show they existed.
+//
+// So a disagreement disables the comparison rather than guessing. The degraded
+// mode must be the one that over-retains.
+const AGENT_ACTOR_ID_MAX_LEN = 128;
+// WHERE CORROBORATION COMES FROM, stated as data rather than inferred.
+// `botUserId` is a Discord convention in this host; nothing corroborates any
+// other platform today, and such a platform must report UNCORROBORATED rather
+// than borrow a Discord value.
+const AGENT_ACTOR_ID_CORROBORATION = [{ platform: "discord", field: "botUserId" }];
+
+/**
+ * Platform-keyed, never a bare string.
+ *
+ * A single string is wrong the day a second platform matters and SILENTLY
+ * wrong before that -- Telegram is already an uncovered population in this
+ * feature, so the shape has to admit it from the start.
+ *
+ * Pure; exported for unit testing.
+ */
+export function normalizeAgentActorIds(raw) {
+  const out = new Map();
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [platformRaw, idRaw] of Object.entries(raw)) {
+    const platform = cleanInboundField(platformRaw, 64).toLowerCase();
+    const id = cleanInboundField(idRaw, AGENT_ACTOR_ID_MAX_LEN);
+    // Both halves must be well-formed. A malformed entry is DROPPED rather
+    // than repaired: a repaired identity is a guess, and a guess here deletes
+    // a person's words.
+    if (!platform || !/^[a-z0-9._-]+$/.test(platform)) continue;
+    if (!id) continue;
+    out.set(platform, id);
+  }
+  return out;
+}
+
+/**
+ * Every `botUserId` any other plugin carries, as {source, id}.
+ *
+ * Read rather than assumed: this is the only independent copy of the value on
+ * this host, and two hand-entries agreeing is the whole corroboration budget.
+ */
+export function readCorroboratingActorIds(ocConfig, field) {
+  const entries = ocConfig?.plugins?.entries;
+  const found = [];
+  if (!entries || typeof entries !== "object") return found;
+  for (const [pluginId, entry] of Object.entries(entries)) {
+    const value = cleanInboundField(entry?.config?.[field], AGENT_ACTOR_ID_MAX_LEN);
+    if (value) found.push({ source: pluginId, id: value });
+  }
+  return found;
+}
+
+/**
+ * verified | conflict | uncorroborated, per platform.
+ *
+ * CONFLICT IS FATAL to the comparison, not a warning. A typo shared between a
+ * config file and a suppression rule is what deletes a member's words, and
+ * this check is the only thing standing between those two.
+ *
+ * ABSENCE IS NOT AGREEMENT. A platform nothing corroborates is `uncorroborated`
+ * and must never read as `verified` -- refusing outright would make the feature
+ * unbuildable on a host without those plugins, which is a different defect.
+ */
+export function classifyAgentActorId(platform, configuredId, corroborating) {
+  if (!configuredId) return { state: "absent", conflicts: [] };
+  const list = Array.isArray(corroborating) ? corroborating : [];
+  if (list.length === 0) return { state: "uncorroborated", conflicts: [] };
+  const conflicts = list.filter((entry) => entry.id !== configuredId);
+  if (conflicts.length > 0) return { state: "conflict", conflicts };
+  return { state: "verified", conflicts: [] };
+}
+
+/**
+ * THE TRIPWIRE. An independent check, not a second copy of the first.
+ *
+ * Corroboration catches a typo. It CANNOT catch a value that is systematically
+ * wrong and copied into every config -- three hand-entries agreeing on a human's
+ * id look stronger than one and are just as wrong. This is derived from live
+ * traffic instead, so it can catch what corroboration structurally cannot:
+ *
+ *   if the configured agent actor id is ever observed as an INBOUND SENDER,
+ *   it is not the agent.
+ *
+ * LIMIT, and it must be reported with the result: this is a tripwire, not a
+ * proof. It fires only if the misconfigured id happens to speak, so SILENCE
+ * FROM IT IS NOT CORROBORATION and may never be counted as such.
+ */
+export function noteInboundActorForTripwire(state, platform, senderId) {
+  if (!state || !platform || !senderId) return false;
+  const configured = state.configured?.get(platform);
+  if (!configured || configured !== senderId) return false;
+  state.tripped.add(platform);
+  return true;
+}
+
+/** The id to send, or "" when anything at all is unresolved. */
+export function agentActorIdFor(state, platform) {
+  if (!state || !platform) return "";
+  if (state.tripped.has(platform)) return "";
+  if (state.conflicted.has(platform)) return "";
+  return state.configured.get(platform) ?? "";
+}
+
+export function newAgentActorIdState(configured) {
+  return { configured, conflicted: new Set(), tripped: new Set() };
+}
+
 /** Name every refusal. A lumped "dropped" count cannot locate a blind spot. */
 export function noteOutboundIdRefusal(stats, reason) {
   stats.refusedByReason.set(
@@ -5955,6 +6076,7 @@ export default {
 
     // ── Outbound message-id capture (SPEC-outbound-message-id.md) ──
     const outboundIdCfg = normalizeOutboundIdConfig(cfg.outboundIdCapture);
+    const agentActorIds = newAgentActorIdState(normalizeAgentActorIds(cfg.agentActorIds));
     const ingestRetryCfg = normalizeIngestRetryConfig(cfg.ingestRetry);
     if (outboundIdCfg.enabled) outboundIdRegistrations += 1;
 
@@ -6203,6 +6325,47 @@ export default {
       `[vc] ingest ${INGEST_RETRY_TYPE} retry: ` +
       `${ingestRetryCfg.enabled ? "ARMED" : "OFF (default)"}`,
     );
+    // Corroborate at boot and state the verdict in the running process, so the
+    // identity it will send is declared rather than inferred from a file
+    // someone may have edited since.
+    for (const { platform, field } of AGENT_ACTOR_ID_CORROBORATION) {
+      const configured = agentActorIds.configured.get(platform) ?? "";
+      const verdict = classifyAgentActorId(
+        platform, configured, readCorroboratingActorIds(ocConfig, field),
+      );
+      if (verdict.state === "conflict") {
+        agentActorIds.conflicted.add(platform);
+        log.error?.(
+          `[vc:actor-id] CONFLICT for ${platform} — configured=${configured} ` +
+          `disagrees with ${verdict.conflicts.map((c) => `${c.source}=${c.id}`).join(", ")}. ` +
+          `The comparison is DISABLED for this platform and behaviour is ` +
+          `unchanged from before it was configured. A wrong id here suppresses ` +
+          `a real person's quoted words, so a disagreement is refused rather ` +
+          `than resolved.`,
+        );
+      } else if (verdict.state === "uncorroborated") {
+        log.warn?.(
+          `[vc:actor-id] ${platform}=${configured} UNCORROBORATED — no ` +
+          `${field} found in any other plugin's config. Absence is not ` +
+          `agreement; this value has one source.`,
+        );
+      } else if (verdict.state === "verified") {
+        log.info?.(
+          `[vc:actor-id] ${platform}=${configured} verified against ` +
+          `${readCorroboratingActorIds(ocConfig, field).length} independent ` +
+          `${field} entr(ies). Corroboration catches a TYPO, never a value ` +
+          `that is wrong everywhere; the inbound tripwire covers that and its ` +
+          `silence is not evidence.`,
+        );
+      }
+    }
+    for (const platform of agentActorIds.configured.keys()) {
+      if (AGENT_ACTOR_ID_CORROBORATION.some((c) => c.platform === platform)) continue;
+      log.warn?.(
+        `[vc:actor-id] ${platform}=${agentActorIds.configured.get(platform)} ` +
+        `UNCORROBORATED — nothing on this host corroborates ${platform}.`,
+      );
+    }
     log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
     // Make per-agent key routing visible at boot. A short SHA-256 fingerprint,
     // never key material. Deliberately not called a tenant id: that equivalence
@@ -6500,6 +6663,25 @@ export default {
           `[vc:identity] captured invoked current speaker ` +
           `actor=${JSON.stringify(invokedSpeaker.actorId)}`
         );
+        // THE TRIPWIRE. This is a live inbound speaker, so if the configured
+        // agent identity appears here it is a person's id, not the agent's --
+        // and the comparison it feeds would suppress that person's quoted
+        // words. Disable on the spot; it can only be re-enabled by fixing the
+        // config and restarting.
+        const speakerMatch = /^actor:([^:]+):(.+)$/.exec(
+          cleanInboundField(invokedSpeaker.actorId, 256),
+        );
+        if (speakerMatch && noteInboundActorForTripwire(
+          agentActorIds, speakerMatch[1].toLowerCase(), speakerMatch[2],
+        )) {
+          log.error?.(
+            `[vc:actor-id] TRIPWIRE — the configured agent identity for ` +
+            `${speakerMatch[1]} was observed as an INBOUND SENDER ` +
+            `(${invokedSpeaker.actorId}). It is a person, not the agent. The ` +
+            `comparison is DISABLED for this platform; behaviour reverts to ` +
+            `before it was configured. Fix the config before re-enabling.`,
+          );
+        }
       }
       // DIAG: log every invocation so we know who's calling
       log.info?.(`[vc:DIAG-bar] entry trigger=${ctx?.trigger ?? "?"} sessionKey=${ctx?.sessionKey ?? "?"} sessionId=${ctx?.sessionId ?? "?"} channel=${ctx?.channel ?? ctx?.messageProvider ?? "?"} channelId=${ctx?.channelId ?? "?"} promptHead=${JSON.stringify(promptText.slice(0,60))}`);

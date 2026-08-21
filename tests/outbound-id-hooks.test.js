@@ -1100,6 +1100,88 @@ function installExactFetch({ ack, status = "accepted", sourceMessageId }) {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 80));
 
+describe("the agent identity is corroborated at boot", () => {
+  const ID = "1485681229608259666";
+  const OTHER = "999999999999999999";
+  const withPlugins = (entries) => ({ plugins: { entries } });
+
+  async function registerWithConfig(home, pluginConfig, ocConfig) {
+    vi.resetModules();
+    vi.doMock("node:os", async () => {
+      const actual = await vi.importActual("node:os");
+      return { ...actual, homedir: () => home };
+    });
+    const mod = await import("../index.js");
+    const handlers = new Map();
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    mod.default.register({
+      logger: log,
+      pluginConfig: { vcKey: "k", baseUrl: "https://api.example.com",
+        convIdentity: "stable", ...pluginConfig },
+      config: ocConfig ?? {},
+      registerTool: vi.fn(),
+      on: vi.fn((name, handler) => handlers.set(name, handler)),
+    });
+    return { handlers, log };
+  }
+
+  it("REGRESSION: a conflicting botUserId is FATAL and says behaviour is unchanged", async () => {
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home,
+      { agentActorIds: { discord: ID } },
+      withPlugins({ "bts-relay": { config: { botUserId: OTHER } } }));
+    const text = logText(log);
+    expect(text).toContain("[vc:actor-id] CONFLICT for discord");
+    expect(text).toContain("DISABLED");
+    expect(text).toContain("suppresses");
+  });
+
+  it("REGRESSION: no corroborating entry logs UNCORROBORATED, not verified", async () => {
+    // Absence is not agreement, and the boot line must not look identical to
+    // a verified one.
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home,
+      { agentActorIds: { discord: ID } }, withPlugins({}));
+    const text = logText(log);
+    expect(text).toContain("UNCORROBORATED");
+    expect(text).not.toContain("verified against");
+  });
+
+  it("POSITIVE CONTROL: agreement logs verified AND says what it cannot catch", async () => {
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home,
+      { agentActorIds: { discord: ID } },
+      withPlugins({
+        "bts-relay": { config: { botUserId: ID } },
+        "discord-link-curator": { config: { botUserId: ID } },
+      }));
+    const text = logText(log);
+    expect(text).toContain("verified against 2 independent");
+    // The boot line must state the limit of its own evidence.
+    expect(text).toContain("catches a TYPO");
+    expect(text).toContain("silence is not evidence");
+  });
+
+  it("a platform nothing corroborates says so rather than staying silent", async () => {
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home,
+      { agentActorIds: { telegram: "tg1" } },
+      withPlugins({ "bts-relay": { config: { botUserId: ID } } }));
+    expect(logText(log)).toContain("nothing on this host corroborates telegram");
+  });
+
+  it("no configuration at all is silent — this is opt-in", async () => {
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home, {}, withPlugins({}));
+    expect(logText(log)).not.toContain("[vc:actor-id]");
+  });
+});
+
 describe("the acknowledgement is read on the EXACT path, not only the legacy one", () => {
   it("REGRESSION: an accepted identity on the exact path moves ackAccepted", async () => {
     // This is the path guild channels actually use. The adapter was wired only
