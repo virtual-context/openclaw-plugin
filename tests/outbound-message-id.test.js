@@ -684,6 +684,22 @@ describe("the report carries its own age and its own falsifier", () => {
     expect(line.match(/hooks\] running message_sent(?!\s*\()/g)).toBeNull();
   });
 
+  it("REGRESSION: says the acknowledgement is one report behind, not missing", () => {
+    // Distinct from the staleness note: that one says the number MAY be old,
+    // this says it is DELIBERATELY behind. A report showing a carry with a
+    // zero acknowledgement was nearly published as a broken fix.
+    const stats = newOutboundIdStats();
+    stats.events = 2; stats.carriedExact = 1;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("ack_lags_carry=BY_ONE_REPORT");
+    expect(line).toContain("EXPECTED");
+    expect(line).toContain("NEXT report");
+    // It must sit with the values, not in the limitations block.
+    expect(line.indexOf("ack_lags_carry=")).toBeLessThan(line.indexOf("LIMITATIONS"));
+    // And it must be a SEPARATE statement from the staleness one.
+    expect(line.indexOf("ack_lags_carry=")).not.toBe(line.indexOf("reading_taken_at="));
+  });
+
   it("REGRESSION: states the reading's age and that a stale one is INVALID to compare", () => {
     // The failure this prevents: a reader at event 11 sees events=5, counts 11
     // dispatches, and reports a six-event shortfall that is entirely the print

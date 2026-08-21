@@ -5763,6 +5763,17 @@ export function renderOutboundIdReport(stats, context = {}) {
     // exist -- by following the instruction above exactly. A number with no
     // stated age cannot be told from a stale one, including by whoever is
     // holding it, and the age has to sit where the value is READ.
+    // A DIFFERENT warning from the staleness one below. Staleness says the
+    // number may be old; this says the number is deliberately behind. The
+    // exact-source POST begins before message_sent and finishes long after it,
+    // so a report -- which prints ON message_sent -- can never carry the
+    // acknowledgement for its own turn. Reading carriedExact=1 with
+    // ackAccepted=0 in a single report as a failure is the mistake this line
+    // exists to prevent; it was nearly published once.
+    `ack_lags_carry=BY_ONE_REPORT(ackAccepted is recorded when the exact-source ` +
+    `response is handled, which is AFTER message_sent prints this line, so a ` +
+    `single report showing carriedExact>0 with ackAccepted=0 is the EXPECTED ` +
+    `shape, not a failure; compare against the NEXT report) ` +
     `reading_taken_at=${new Date().toISOString()}(events=${stats.events}; ` +
     `prints at events<=${OUTBOUND_ID_REPORT_EARLY_THROUGH} then every ` +
     `${OUTBOUND_ID_REPORT_EVERY}, so between those it is STALE and any ` +

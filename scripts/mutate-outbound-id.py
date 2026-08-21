@@ -381,6 +381,16 @@ MUTATIONS = [
         "`NOT DELIVERED ANYWHERE. This package sends no identity on any wire; ` +",
         "`` +",
     ),
+    (
+        "ack-lag warning removed from the report",
+        "    `ack_lags_carry=BY_ONE_REPORT(ackAccepted is recorded when the exact-source ` +",
+        "",
+    ),
+    (
+        "ack-lag warning demoted into the limitations block",
+        "    `ack_lags_carry=BY_ONE_REPORT",
+        "    `LIMITATIONS_ack_lags_carry=BY_ONE_REPORT",
+    ),
 ]
 
 
