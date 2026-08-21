@@ -5903,12 +5903,29 @@ export default {
      * Retry an ingest that failed for a reason the receiver has verified is
      * raised BEFORE anything is written.
      *
-     * COVERAGE, stated here because it travels with the fix: over 7 days there
-     * were 7 dropped turns. This covers 1. The other 6 were TIMEOUTS, which
-     * carry no status, no body and no type -- so no rule keyed on the
-     * receiver's answer can cover them, and a timeout is also the case where
-     * the write may have committed and only the reply was lost. Anyone reading
-     * "retry added" without this paragraph will believe turn loss is solved.
+     * COVERAGE, stated here because it travels with the fix, and it is ZERO
+     * against the naturally-occurring record:
+     *
+     *   7 dropped turns over 7 days
+     *     5  TimeoutError            Aug 16-17   natural
+     *     1  503 (this type)         Aug 21      SELF-INFLICTED
+     *     1  TimeoutError            Aug 21      SELF-INFLICTED
+     *
+     * Both Aug 21 failures fall inside a window where one of our own
+     * diagnostics pegged a production core for 25 minutes; two prepares that
+     * had hung for 23 and 12 minutes completed within 15 seconds of it being
+     * killed. Deduplicated and split by path, there is NO occurrence of this
+     * error type on the ingest route before that window.
+     *
+     * So this is a correct fix for a condition that has never occurred on its
+     * own. The natural population is FIVE, and all five are TIMEOUTS -- which
+     * carry no status, no body and no type, so no rule keyed on the receiver's
+     * answer can reach them, and a timeout is also the case where the write may
+     * have committed and only the reply was lost. An idempotency key is the
+     * only thing that makes those safely retryable.
+     *
+     * Anyone reading "retry added" without this paragraph will believe turn
+     * loss is solved. It is not, and this does not begin to solve it.
      *
      * Keyed on the TYPE, never the status code and never `retryable` alone:
      * the flag is set on failures elsewhere that are not safe to retry, and the
