@@ -1,9 +1,4 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, statSync,
-  existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import {
   normalizeOutboundIdConfig,
   normalizeOutboundIdentity,
@@ -26,8 +21,6 @@ import {
   noteOutboundIdAck,
   noteTurnIdentifiers,
   normalizeIngestRetryConfig,
-  capturePromptForAudit,
-  promptAuditState,
   normalizeAgentActorIds,
   readCorroboratingActorIds,
   classifyAgentActorId,
@@ -794,57 +787,6 @@ describe("cap truncation is counted rather than silent", () => {
     const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
     expect(line).toContain("droppedByCap=0");
     expect(line).not.toContain("SILENT LOSS");
-  });
-});
-
-describe("the temporary prompt-capture audit", () => {
-  // The instrument that answers the forgeability question. It writes real
-  // conversations, so its OFF state and its CAP are the load-bearing parts,
-  // not its happy path.
-  const tmp = () => mkdtempSync(join(tmpdir(), "vc-audit-"));
-
-  it("REGRESSION: captures NOTHING when the directory does not exist", () => {
-    // Arming is a deliberate act. A build that captures by default would write
-    // user conversations on every host it lands on.
-    const dir = join(tmpdir(), "vc-audit-absent-" + randomUUID());
-    expect(capturePromptForAudit("a prompt", { dir, max: 10 })).toBe("disarmed");
-    expect(existsSync(dir)).toBe(false);
-  });
-
-  it("POSITIVE CONTROL: it does capture when armed — so 'disarmed' is a real result", () => {
-    // Without this the off-switch test passes against a build that can never
-    // capture anything at all.
-    const dir = tmp();
-    expect(capturePromptForAudit("a prompt", { dir, max: 10 })).toBe("");
-    const files = readdirSync(dir).filter((f) => f.endsWith(".txt"));
-    expect(files).toHaveLength(1);
-    expect(readFileSync(join(dir, files[0]), "utf8")).toBe("a prompt");
-    expect(statSync(join(dir, files[0])).mode & 0o777).toBe(0o600);
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("REGRESSION: stops at the cap on its own", () => {
-    // Bounded by construction. Nothing here waits for someone to remember.
-    const dir = tmp();
-    for (let i = 0; i < 3; i += 1) capturePromptForAudit(`p${i}`, { dir, max: 3 });
-    expect(capturePromptForAudit("overflow", { dir, max: 3 })).toBe("cap_reached");
-    expect(readdirSync(dir).filter((f) => f.endsWith(".txt"))).toHaveLength(3);
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("counts existing files, so a restart cannot re-open the budget", () => {
-    // A cap counted from zero on every boot is not a cap.
-    const dir = tmp();
-    writeFileSync(join(dir, "0000-existing.txt"), "x", { mode: 0o600 });
-    writeFileSync(join(dir, "0001-existing.txt"), "x", { mode: 0o600 });
-    expect(capturePromptForAudit("third", { dir, max: 2 })).toBe("cap_reached");
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("never throws into the turn path", () => {
-    // An audit that can break a turn is not worth the answer.
-    expect(() => capturePromptForAudit(null, { dir: "/nonexistent", max: 1 })).not.toThrow();
-    expect(capturePromptForAudit("", { dir: "/nonexistent", max: 1 })).toBe("empty");
   });
 });
 

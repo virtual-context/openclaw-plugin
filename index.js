@@ -32,7 +32,7 @@ import {
   statSync, openSync, readSync, closeSync, mkdirSync,
   renameSync, readdirSync, unlinkSync, fsyncSync,
 } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -5659,60 +5659,6 @@ export function newAgentActorIdState(configured) {
   return { configured, conflicted: new Set(), tripped: new Set() };
 }
 
-// ── TEMPORARY: prompt capture for the envelope-forgeability audit ─────────
-//
-// REMOVE THIS BLOCK AND ITS CALL SITE WHEN THE AUDIT IS DONE. It exists to
-// answer one question -- whether member-written text can produce a parsed
-// "Conversation info (untrusted metadata):" block and be SELECTED over the
-// host's -- which nothing already on disk can answer, because every existing
-// capture records a DIFFERENT string than the one this parser reads.
-//
-// It writes real prompts, which contain real conversations. Authorised
-// explicitly with that cost visible.
-//
-// BOUNDED BY CONSTRUCTION, NOT BY INTENTION:
-//   * capture only if the directory ALREADY EXISTS -- creating it is the
-//     deliberate act, deleting it is both the off switch and the cleanup;
-//   * a hard cap counted in-process, after which it stops on its own;
-//   * 0600 files in a 0700 directory, outside the plugin tree and outside
-//     ~/.openclaw entirely, so no deploy, bundle or rsync can carry it.
-const PROMPT_AUDIT_DIR = "/root/.vc-prompt-audit";
-const PROMPT_AUDIT_MAX = 200;
-let promptAuditWritten = null;   // null = uncounted; number = written so far
-let promptAuditCountedDir = "";  // which directory that count belongs to
-
-export function promptAuditState() {
-  return { dir: PROMPT_AUDIT_DIR, max: PROMPT_AUDIT_MAX, written: promptAuditWritten };
-}
-
-/**
- * Write one prompt if the audit is armed and under its cap. Returns the reason
- * it did nothing, so the caller can log a refusal rather than a silence.
- *
- * Never throws into the hook: an audit must not be able to break a turn.
- */
-export function capturePromptForAudit(promptText, { dir = PROMPT_AUDIT_DIR, max = PROMPT_AUDIT_MAX } = {}) {
-  try {
-    if (typeof promptText !== "string" || !promptText) return "empty";
-    if (!existsSync(dir)) return "disarmed";
-    if (promptAuditWritten === null || promptAuditCountedDir !== dir) {
-      // Counted from disk ONCE PER DIRECTORY, so a restart cannot reset the cap
-      // and quietly capture another full batch. Production uses a single fixed
-      // directory, so this recounts exactly once there; keying it by directory
-      // is what makes the property testable without weakening it.
-      promptAuditWritten = readdirSync(dir).filter((f) => f.endsWith(".txt")).length;
-      promptAuditCountedDir = dir;
-    }
-    if (promptAuditWritten >= max) return "cap_reached";
-    const name = `${String(promptAuditWritten).padStart(4, "0")}-${randomUUID()}.txt`;
-    writeFileSync(join(dir, name), promptText, { mode: 0o600 });
-    promptAuditWritten += 1;
-    return "";
-  } catch {
-    return "error";
-  }
-}
-
 /** Name every refusal. A lumped "dropped" count cannot locate a blind spot. */
 export function noteOutboundIdRefusal(stats, reason) {
   stats.refusedByReason.set(
@@ -6464,18 +6410,6 @@ export default {
       `[vc] ingest ${INGEST_RETRY_TYPE} retry: ` +
       `${ingestRetryCfg.enabled ? "ARMED" : "OFF (default)"}`,
     );
-    // TEMPORARY, remove with the audit block. States the audit's own state at
-    // boot so "is it capturing right now" is observable rather than inferred
-    // from whether a directory happens to exist.
-    {
-      const audit = promptAuditState();
-      const armed = existsSync(audit.dir);
-      log.info?.(
-        `[vc:prompt-audit] ${armed ? "ARMED" : "disarmed"} dir=${audit.dir} ` +
-        `cap=${audit.max}${armed ? "" : " (directory absent — nothing is captured)"}` +
-        `${armed ? " — CAPTURES REAL CONVERSATIONS; delete the directory to stop and clean up" : ""}`,
-      );
-    }
     // Corroborate at boot and state the verdict in the running process, so the
     // identity it will send is declared rather than inferred from a file
     // someone may have edited since.
@@ -6999,10 +6933,6 @@ export default {
       const continuityTurnKey = preparedContinuityTurnKey(event.prompt);
       const promptConversationInfo = parseCurrentConversationInfo(event.prompt);
       const promptProvenance = currentTurnProvenance(event.prompt, sessionKey);
-      // TEMPORARY, remove with the block above. Captures the exact string this
-      // parser just read -- which is the point: two prior measurements used a
-      // different string and produced coherent, plausible, wrong results.
-      capturePromptForAudit(event.prompt);
       const agentScopeId = sessionAgentScopeId(sessionKey);
       const platform = groupConversationPlatform(sessionKey);
       const boundInboundTurn = bindInboundTurnToInvocation({
