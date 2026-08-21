@@ -1138,6 +1138,29 @@ describe("the acknowledgement is read on the EXACT path, not only the legacy one
     expect(text).toContain("fence_rejection");
   });
 
+  it("REGRESSION: charges the ack against the IDENTITY COUNT, not one per record", async () => {
+    // A mutation survived here: charging 1 instead of N passed every earlier
+    // test, because ackAccepted and ackDeclined come from the RECEIVER's
+    // counts and never touch `carried`. Only the balance does -- so the
+    // discriminating assertion is on what the answer does NOT account for.
+    //
+    // 3 carried, receiver accounts for 1 -> 2 unaccounted.
+    // Charged as 1 per record -> balance 1-1 = 0 -> silently reports a fully
+    // accounted answer for a record whose other two identities vanished.
+    const home = makeHome();
+    const { sourceMessageId } = plantCompletionRecord(home, { identities: 3 });
+    installExactFetch({ sourceMessageId, ack: { accepted: 1 } });
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "carry" },
+    });
+    await settle();
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    const text = logText(log);
+    expect(text).toContain("ackAccepted=1");
+    expect(text).toContain("ackUnaccounted=2");
+    expect(text).toContain("ackOverAccounted=0");
+  });
+
   it("a record carrying no identities does not manufacture an outcome", async () => {
     const home = makeHome();
     const { sourceMessageId } = plantCompletionRecord(home, { identities: 0 });

@@ -315,6 +315,21 @@ MUTATIONS = [
         "    else if (balance < 0) stats.ackOverAccounted += -balance;",
         "    else if (balance < 0) stats.ackUnaccounted += -balance;",
     ),
+    (
+        "exact-path acknowledgement never read",
+        "    noteOutboundIdAck(",
+        "    void 0 && noteOutboundIdAck(",
+    ),
+    (
+        "exact-path ack skipped when delivery is dead-lettered",
+        "  if (ackIdentities > 0) {",
+        "  if (ackIdentities > 0 && ingestResult?.status !== \"permanent_conflict\") {",
+    ),
+    (
+        "exact-path ack charges one per record instead of per identity",
+        "    ? record.payload[OUTBOUND_ID_EXACT_PAYLOAD_KEY].length",
+        "    ? 1",
+    ),
 ]
 
 
@@ -349,7 +364,43 @@ def run_suite():
 SENTINEL = "/tmp/.vc-mutation-in-progress"
 
 
+MUTATION_COUNT_FILE = "/Users/yursilkidwai/.openclaw/.vc-work/.mutation-count"
+
+
+def _ratchet_mutation_count():
+    """Refuse to run a SMALLER mutation set than last time without saying so.
+
+    The gap this closes: an edit that silently fails to apply leaves the set at
+    its old size, and the run then reports a clean sweep for code it never
+    touched. `STALE ANCHORS` cannot see it -- a mutation that was never added
+    to the list cannot have an anchor that drifted. The summary line is true
+    and still misleading, because the number of mutations in the file was never
+    the number the author believed was in it.
+
+    A shrink is not always wrong (a mutation can be legitimately retired), so
+    this warns loudly and continues rather than aborting. Silence is the defect
+    being fixed, not execution.
+    """
+    current = len(MUTATIONS)
+    previous = None
+    try:
+        previous = int(io.open(MUTATION_COUNT_FILE, encoding="utf-8").read().strip())
+    except Exception:
+        pass
+    print(f"mutation set: {current} entries" +
+          (f" (previous run: {previous})" if previous is not None else " (no previous run recorded)"))
+    if previous is not None and current < previous:
+        print(f"*** WARNING: the mutation set SHRANK from {previous} to {current}. ***")
+        print("*** If that was not deliberate, an edit failed to apply and this run "
+              "will report a clean sweep for code it never mutated. ***")
+    try:
+        io.open(MUTATION_COUNT_FILE, "w", encoding="utf-8").write(f"{current}\n")
+    except Exception:
+        pass
+
+
 def main():
+    _ratchet_mutation_count()
     # A commit taken while this runs captures a MUTATED file. That happened:
     # a background run was in flight during `git add index.js`, and the
     # mutation reached the branch and was pushed. The sentinel exists so the

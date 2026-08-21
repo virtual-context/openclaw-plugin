@@ -5572,7 +5572,19 @@ export function renderOutboundIdReport(stats, context = {}) {
     `sendingHook=${stats.sendingHookEvents} ` +
     `sent_per_sending=${stats.sendingHookEvents > 0
       ? (stats.events / stats.sendingHookEvents).toFixed(2)
-      : "NO_DATA"} ` +
+      : "NO_DATA"}(SELF-REFERENTIAL: both hooks die together, so 1.00 is also ` +
+    `what total dispatch failure prints; the real denominator is the host's ` +
+    `own "hooks] running message_sent" count) ` +
+    // The reading's OWN AGE, adjacent to the figures rather than buried in the
+    // limitations below. Without it a reader at event 11 sees events=5, counts
+    // 11 host dispatches, and derives a six-event shortfall that does not
+    // exist -- by following the instruction above exactly. A number with no
+    // stated age cannot be told from a stale one, including by whoever is
+    // holding it, and the age has to sit where the value is READ.
+    `reading_taken_at=${new Date().toISOString()}(events=${stats.events}; ` +
+    `prints at events<=${OUTBOUND_ID_REPORT_EARLY_THROUGH} then every ` +
+    `${OUTBOUND_ID_REPORT_EVERY}, so between those it is STALE and any ` +
+    `comparison against a live count is INVALID) ` +
     `capture_rate=UNKNOWN | ` +
     `LIMITATIONS: this measures PRESENCE, not correctness. ` +
     `carried/carriedExact count what was ATTACHED TO A REQUEST and say ` +

@@ -653,6 +653,34 @@ describe("an acknowledgement that accounts for MORE than was sent", () => {
   });
 });
 
+describe("the report carries its own age and its own falsifier", () => {
+  it("names the independent denominator NEXT TO the ratio, not in a footnote", () => {
+    // A caveat 400 words downstream is a label on an unfixed problem: 1.00 is
+    // the most reassuring value a ratio can take and is also what total
+    // dispatch failure prints.
+    const stats = newOutboundIdStats();
+    stats.events = 3; stats.sendingHookEvents = 3;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    const ratio = line.indexOf("sent_per_sending=");
+    expect(line.slice(ratio, ratio + 200)).toContain("SELF-REFERENTIAL");
+    expect(line.slice(ratio, ratio + 200)).toContain("hooks] running message_sent");
+  });
+
+  it("REGRESSION: states the reading's age and that a stale one is INVALID to compare", () => {
+    // The failure this prevents: a reader at event 11 sees events=5, counts 11
+    // dispatches, and reports a six-event shortfall that is entirely the print
+    // schedule -- having followed the instruction exactly.
+    const stats = newOutboundIdStats();
+    stats.events = 5;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("reading_taken_at=");
+    expect(line).toContain("STALE");
+    expect(line).toContain("INVALID");
+    // The age must sit beside the value, not in the limitations block.
+    expect(line.indexOf("reading_taken_at=")).toBeLessThan(line.indexOf("LIMITATIONS"));
+  });
+});
+
 describe("the ingest-retry gate", () => {
   it("DEFAULTS TO OFF, and this test failing means the default flipped", () => {
     expect(normalizeIngestRetryConfig(undefined).enabled).toBe(false);
