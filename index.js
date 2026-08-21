@@ -5935,7 +5935,7 @@ export default {
       // deployment to "observe" would deliver everything previously queued and
       // activate suppression -- the opposite of a measurement-only rollout, and
       // the one mode whose entire purpose is having no network effect.
-      if (!outboundIdCfg.latePath) return;
+      if (!outboundIdCfg.carry || !outboundIdCfg.latePath) return;
       for (const key of allConfiguredVcKeys(vcKey, agentKeyIndex)) {
         startOutboundIdDrain({
           baseUrl, vcKey: key, latePath: outboundIdCfg.latePath, log, debug,
