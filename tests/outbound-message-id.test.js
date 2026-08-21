@@ -18,6 +18,7 @@ import {
   classifyOutboundIdResponse,
   readOutboundIdAck,
   noteOutboundIdAck,
+  noteTurnIdentifiers,
   completionOutboxFingerprint,
   newOutboundIdStats,
   noteOutboundIdRefusal,
@@ -613,6 +614,57 @@ describe("the exact-completion fingerprint ignores outbound ids", () => {
     for (const payload of [null, undefined, "x", 7]) {
       expect(completionOutboxFingerprint("sk:c", payload)).toMatch(/^[a-f0-9]{64}$/);
     }
+  });
+});
+
+describe("identifier availability counted from the turn path", () => {
+  const mk = () => newOutboundIdStats();
+
+  it("counts EVERY turn, including ones with nothing to report", () => {
+    // The point of the instrument: a grep over a line that prints an id can
+    // only find turns that had one. This must count the absences too, or a
+    // zero means "not looked at" rather than "absent".
+    const stats = mk();
+    noteTurnIdentifiers(stats, { sessionId: "s1", rawRunId: "r1", isGroup: false });
+    noteTurnIdentifiers(stats, { sessionId: "", rawRunId: "", isGroup: false });
+    expect(stats.turnsSeen).toBe(2);
+    expect(stats.turnsWithSessionId).toBe(1);
+    expect(stats.turnsWithRawRunId).toBe(1);
+  });
+
+  it("REGRESSION: counts the RAW runId, never the derived fallback", () => {
+    // hookInvocationRunId substitutes the SESSION id on non-group transports.
+    // Counting the derived value would report a per-turn identifier that does
+    // not exist -- availability the design cannot actually use.
+    const stats = mk();
+    noteTurnIdentifiers(stats, { sessionId: "s1", rawRunId: "", isGroup: false });
+    expect(stats.turnsWithSessionId).toBe(1);
+    expect(stats.turnsWithRawRunId).toBe(0);
+  });
+
+  it("isolates the group population, where the identifier is structurally absent", () => {
+    const stats = mk();
+    noteTurnIdentifiers(stats, { sessionId: "s", rawRunId: "", isGroup: true });
+    noteTurnIdentifiers(stats, { sessionId: "s", rawRunId: "r", isGroup: true });
+    noteTurnIdentifiers(stats, { sessionId: "s", rawRunId: "", isGroup: false });
+    expect(stats.groupTurns).toBe(2);
+    expect(stats.groupTurnsWithoutRunId).toBe(1);
+  });
+
+  it("reports all five figures so no ratio can be quoted without its base", () => {
+    const stats = mk();
+    stats.events = 1;
+    stats.turnsSeen = 10;
+    stats.turnsWithSessionId = 10;
+    stats.turnsWithRawRunId = 4;
+    stats.groupTurns = 6;
+    stats.groupTurnsWithoutRunId = 6;
+    const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
+    expect(line).toContain("turns=10");
+    expect(line).toContain("sessionId=10");
+    expect(line).toContain("rawRunId=4");
+    expect(line).toContain("group=6");
+    expect(line).toContain("groupNoRunId=6");
   });
 });
 

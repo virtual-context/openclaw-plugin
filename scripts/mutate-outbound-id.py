@@ -273,6 +273,16 @@ MUTATIONS = [
         '    error.vcType = typeof error.body?.type === "string"\n'
         "      ? error.body.type\n      : null;",
     ),
+    (
+        "identifier counter counts the derived runId instead of the raw one",
+        "        rawRunId: cleanInboundField(ctx?.runId),",
+        "        rawRunId: contextRunId,",
+    ),
+    (
+        "turns without an identifier are not counted at all",
+        "  stats.turnsSeen += 1;",
+        "  if (!sessionId) return;\n  stats.turnsSeen += 1;",
+    ),
 ]
 
 

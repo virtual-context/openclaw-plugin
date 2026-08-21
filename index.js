@@ -5320,6 +5320,11 @@ export function newOutboundIdStats() {
     ackAbsent: 0,
     ackUnreadable: 0,
     ackUnaccounted: 0,
+    turnsSeen: 0,
+    turnsWithSessionId: 0,
+    turnsWithRawRunId: 0,
+    groupTurns: 0,
+    groupTurnsWithoutRunId: 0,
     ackDeclinedByReason: new Map(),
     evictedPending: 0,
     refusedByReason: new Map(),
@@ -5414,6 +5419,29 @@ export function noteOutboundIdAck(stats, ack, carried, log = null) {
   else stats.ackUnreadable += carried;
 }
 
+/**
+ * Count identifier availability per turn, from the turn path itself.
+ *
+ * Exists because the obvious measurement is circular: grepping a log line that
+ * prints an identifier can only ever find turns that had one. Every counter
+ * here increments on EVERY turn, so a zero is a measured absence.
+ *
+ * Pure against the injected stats object; exported for unit testing.
+ */
+export function noteTurnIdentifiers(stats, { sessionId, rawRunId, isGroup }) {
+  if (!stats) return;
+  stats.turnsSeen += 1;
+  if (sessionId) stats.turnsWithSessionId += 1;
+  // The RAW hook value, not the derived one. The derived value substitutes the
+  // session id on non-group transports, which would make this counter report
+  // availability it does not have.
+  if (rawRunId) stats.turnsWithRawRunId += 1;
+  if (isGroup) {
+    stats.groupTurns += 1;
+    if (!rawRunId) stats.groupTurnsWithoutRunId += 1;
+  }
+}
+
 /** Name every refusal. A lumped "dropped" count cannot locate a blind spot. */
 export function noteOutboundIdRefusal(stats, reason) {
   stats.refusedByReason.set(
@@ -5471,6 +5499,9 @@ export function renderOutboundIdReport(stats, context = {}) {
     `ackAccepted=${stats.ackAccepted} ackDeclined=${stats.ackDeclined} ` +
     `ackAbsent=${stats.ackAbsent} ackUnreadable=${stats.ackUnreadable} ` +
     `ackUnaccounted=${stats.ackUnaccounted} ` +
+    `turns=${stats.turnsSeen} sessionId=${stats.turnsWithSessionId} ` +
+    `rawRunId=${stats.turnsWithRawRunId} ` +
+    `group=${stats.groupTurns} groupNoRunId=${stats.groupTurnsWithoutRunId} ` +
     `ackDeclinedBy[${tally(stats?.ackDeclinedByReason) || "none"}] ` +
     `queued=${stats.queued} ` +
     `queuedDuplicate=${stats.queuedDuplicate} ` +
@@ -7491,6 +7522,23 @@ export default {
       // it; nothing can be cleaned up if this throws.
       const sessionId = hookSessionIdentity(ctx);
       const contextRunId = hookInvocationRunId(ctx, sessionId);
+      // SECOND INSTRUMENT for the identifier-availability question, deliberately
+      // independent of the "[vc] ingest — session=" log line that was grepped to
+      // answer it. That grep could only observe turns whose line printed, and a
+      // line that prints an id cannot report the turns that had none: presence
+      // measured conditional on presence. This counts EVERY agent_end,
+      // including the ones with nothing to report, which is the only way a zero
+      // here means "absent" rather than "not looked at".
+      //
+      // runId is counted apart because it is NOT equivalent to a per-turn id:
+      // hookInvocationRunId falls back to the SESSION id on non-group
+      // transports and returns "" on group ones, so a present-looking value may
+      // be neither absent nor unique.
+      noteTurnIdentifiers(outboundIdStats, {
+        sessionId,
+        rawRunId: cleanInboundField(ctx?.runId),
+        isGroup: groupConversationSession(ctx?.sessionKey ?? ""),
+      });
       const eventRunId = cleanInboundField(event?.runId);
       const runIdConflict = Boolean(
         eventRunId && contextRunId && eventRunId !== contextRunId,

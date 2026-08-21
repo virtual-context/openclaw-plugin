@@ -453,6 +453,41 @@ describe("the conversation gate is consulted at runtime (codex P0-3)", () => {
     expect(logText(log)).toContain("unstable_conv_identity=1");
   });
 
+  it("REGRESSION: counts the RAW runId at the call site, not the derived fallback", async () => {
+    // Kills a mutation the pure-function test cannot reach. hookInvocationRunId
+    // SUBSTITUTES the session id on non-group transports, so wiring the counter
+    // to the derived value would report a per-turn identifier on every direct
+    // turn -- availability that does not exist. SESSION_KEY here is a `direct:`
+    // key precisely so the fallback would fire and be visible.
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    await driveTurn(handlers, { ...turnCtx(), runId: undefined });
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    const text = logText(log);
+    expect(text).toContain("turns=1");
+    expect(text).toContain("sessionId=1");
+    // The whole point. The derived value here is the session id, i.e. truthy.
+    expect(text).toContain("rawRunId=0");
+  });
+
+  it("counts a turn that produced no outbound identifier at all", async () => {
+    // A denominator that only counts turns which reported something is not a
+    // denominator. This is the case the grepped log line was structurally
+    // unable to see.
+    const home = makeHome();
+    installFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "observe" },
+    });
+    await driveTurn(handlers, turnCtx());
+    await driveTurn(handlers, turnCtx());
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    expect(logText(log)).toContain("turns=2");
+  });
+
   it("reports Telegram as an UNCOVERED population by name", async () => {
     const home = makeHome();
     installFetch();
