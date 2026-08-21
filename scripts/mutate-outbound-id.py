@@ -19,8 +19,8 @@ NUL = chr(0)
 MUTATIONS = [
     (
         "P0 metadata failure no longer retries the turn clean",
-        "        return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,\n"
-        "          ingestPayload, 15000, log);\n"
+        "        return postIngestWithLifecycleRetry(\n"
+        "          path, vcKeyFor(sessionKey), convId, ingestPayload);\n"
         "      }\n"
         "    }",
         "        throw error;\n      }\n    }",
@@ -177,6 +177,101 @@ MUTATIONS = [
         "the wire key drops to a bare name the receiver never reads",
         'const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "_vc_agent_outbound_ids";',
         'const OUTBOUND_ID_EXACT_PAYLOAD_KEY = "agent_outbound_ids";',
+    ),
+    (
+        "absent and unreadable collapse into one state",
+        '    return { state: "absent", reason: "", counts: null };\n  }\n'
+        '  const block = response[OUTBOUND_ID_ACK_KEY];\n'
+        '  if (!block || typeof block !== "object" || Array.isArray(block)) {\n'
+        '    return { state: "unreadable", reason: "", counts: null };',
+        '    return { state: "absent", reason: "", counts: null };\n  }\n'
+        '  const block = response[OUTBOUND_ID_ACK_KEY];\n'
+        '  if (!block || typeof block !== "object" || Array.isArray(block)) {\n'
+        '    return { state: "absent", reason: "", counts: null };',
+    ),
+    (
+        "an unrecognised ack body is read as accepted",
+        '  // It answered, and nothing in the answer is an outcome this side knows.\n'
+        '  return { state: "unreadable", reason: "", counts: block };',
+        '  return { state: "accepted", reason: "", counts: block };',
+    ),
+    (
+        "the ack is read from top level instead of the nested key",
+        "  const block = response[OUTBOUND_ID_ACK_KEY];",
+        "  const block = response;",
+    ),
+    (
+        "a decline is counted but never logged",
+        '        log?.warn?.(\n'
+        '          `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +',
+        '        if (false) log?.warn?.(\n'
+        '          `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +',
+    ),
+    (
+        "declines are counted as accepted",
+        "    stats.ackAccepted += acceptedCount;\n    stats.ackDeclined += declinedCount;",
+        "    stats.ackAccepted += acceptedCount + declinedCount;",
+    ),
+    (
+        "acknowledgement attributed from the sent count, not the receiver's",
+        "    stats.ackAccepted += acceptedCount;\n    stats.ackDeclined += declinedCount;",
+        "    if (ack.state === \"accepted\") stats.ackAccepted += carried;\n"
+        "    else stats.ackDeclined += carried;",
+    ),
+    (
+        "unaccounted identities are silently dropped",
+        "    if (unaccounted > 0) stats.ackUnaccounted += unaccounted;",
+        "",
+    ),
+    (
+        "a mixed ack returns before recording the decline reason",
+        "  if (declinedCount > 0) {\n    for (const reason of [",
+        "  if (ack.state === \"accepted\") return;\n  if (declinedCount > 0) {\n    for (const reason of [",
+    ),
+    (
+        "decline reasons counted per response instead of per identity",
+        "          reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + count,",
+        "          reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + 1,",
+    ),
+    (
+        "retry keys on the status code instead of the verified type",
+        "          const retryable = error?.vcType === INGEST_RETRY_TYPE\n"
+        "            && attempt < INGEST_RETRY_MAX_ATTEMPTS;",
+        "          const retryable = error?.status === 503\n"
+        "            && attempt < INGEST_RETRY_MAX_ATTEMPTS;",
+    ),
+    (
+        "retry keys on the retryable flag alone",
+        "          const retryable = error?.vcType === INGEST_RETRY_TYPE\n"
+        "            && attempt < INGEST_RETRY_MAX_ATTEMPTS;",
+        "          const retryable = error?.retryable === true\n"
+        "            && attempt < INGEST_RETRY_MAX_ATTEMPTS;",
+    ),
+    (
+        "terminal loss stops being logged",
+        "              log.error?.(\n"
+        "                `[vc] TURN LOST — ingest exhausted retries for ` +",
+        "              if (false) log.error?.(\n"
+        "                `[vc] TURN LOST — ingest exhausted retries for ` +",
+    ),
+    (
+        "the retry loop becomes unbounded",
+        "            && attempt < INGEST_RETRY_MAX_ATTEMPTS;",
+        "            && attempt < 9999;",
+    ),
+    (
+        "a missing Retry-After is treated as zero delay",
+        "          const advised = Number.isFinite(error?.retryAfterMs)\n"
+        "            ? error.retryAfterMs\n"
+        "            : INGEST_RETRY_DEFAULT_DELAY_MS;",
+        "          const advised = error?.retryAfterMs ?? 0;",
+    ),
+    (
+        "the vc error type is read from the top level instead of nested",
+        '    error.vcType = typeof error.body?.error?.type === "string"\n'
+        "      ? error.body.error.type\n      : null;",
+        '    error.vcType = typeof error.body?.type === "string"\n'
+        "      ? error.body.type\n      : null;",
     ),
 ]
 

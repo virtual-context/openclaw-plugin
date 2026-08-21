@@ -3501,6 +3501,51 @@ export function normalizePreparedMessagesForOpenClaw(messages) {
   });
 }
 
+/**
+ * Attach the facts a caller needs to decide what to do, WITHOUT changing the
+ * error's shape.
+ *
+ * The message is untouched, so every existing catcher behaves identically.
+ * That is not asserted -- it is measured: no catcher in this file serialises an
+ * error. All 30 uses are `${err}`, `.message`, `.stack`, `.name` or `.code`,
+ * and none of those is affected by added properties. `JSON.stringify(err)`,
+ * spreading, and `Object.keys(err)` would each be affected and none occurs.
+ *
+ * Why this exists at all: without it, the ONLY way to recover a status or a
+ * reason from a failure is to regex the message string -- a string this same
+ * function formats. Two rulers for one fact, silently wrong the day the format
+ * changes. `Retry-After` is likewise unreachable, so a receiver asking to be
+ * retried cannot be heard.
+ *
+ * Never throws while enriching: a failure to parse a failure must not replace
+ * the original error with a worse one.
+ */
+function enrichVcError(error, res, text) {
+  try {
+    error.status = res?.status ?? null;
+    const header = res?.headers?.get?.("retry-after");
+    // Seconds per RFC. An HTTP-date form is also legal and is NOT parsed here;
+    // it resolves to null, which the caller must treat as "no advice given"
+    // rather than as zero.
+    const seconds = header != null ? Number(header) : Number.NaN;
+    error.retryAfterMs = Number.isFinite(seconds) && seconds >= 0
+      ? Math.round(seconds * 1000)
+      : null;
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+    error.body = body && typeof body === "object" ? body : null;
+    // NESTED. The receiver puts these under `error`, not at the top level, and
+    // reading the top level would miss every real failure.
+    error.vcType = typeof error.body?.error?.type === "string"
+      ? error.body.error.type
+      : null;
+    error.retryable = typeof error.body?.error?.retryable === "boolean"
+      ? error.body.error.retryable
+      : null;
+  } catch { /* enrichment is best-effort; the original error still stands */ }
+  return error;
+}
+
 export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 15000, log = null, urlOpts = {}) {
   const url = buildUrl(baseUrl, path, vcKey, convId, urlOpts);
   const serialized = JSON.stringify(body);
@@ -3521,7 +3566,9 @@ export async function vcPost(baseUrl, path, vcKey, convId, body, timeoutMs = 150
   if (log) log.info?.(`[vc:wire] POST ${path} — HTTP ${res.status} ${res.statusText}`);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`VC API ${res.status}: ${text.slice(0, 200)}`);
+    throw enrichVcError(
+      new Error(`VC API ${res.status}: ${text.slice(0, 200)}`), res, text,
+    );
   }
   return res.json();
 }
@@ -4110,6 +4157,15 @@ const OUTBOUND_ID_MAX_PENDING_CONVERSATIONS = 256;
 const OUTBOUND_ID_MAX_PENDING_PER_CONVERSATION = 64;
 const OUTBOUND_ID_MAX_CARRIED_PER_INGEST = 32;
 const OUTBOUND_ID_REPORT_EVERY = 25;
+// The one ingest failure the receiver has verified is raised strictly before
+// the write. Retrying it cannot duplicate a turn; retrying anything else on
+// this route can.
+const INGEST_RETRY_TYPE = "conversation_lifecycle_busy";
+const INGEST_RETRY_MAX_ATTEMPTS = 2;
+const INGEST_RETRY_DEFAULT_DELAY_MS = 1000;
+const INGEST_RETRY_MAX_DELAY_MS = 3000;
+// Total wall clock, kept well under the 30s run-bound group finalizer.
+const INGEST_RETRY_BUDGET_MS = 8000;
 // The first few events are the ones that calibrate the instrument, and between
 // event 1 and event 25 the running count was unreadable from outside the
 // process -- during exactly the measurement phase the report exists for. The
@@ -5843,16 +5899,74 @@ export default {
      * is to try the turn again clean. The bare payload is byte-identical to
      * what would have been sent with the feature off.
      */
+    /**
+     * Retry an ingest that failed for a reason the receiver has verified is
+     * raised BEFORE anything is written.
+     *
+     * COVERAGE, stated here because it travels with the fix: over 7 days there
+     * were 7 dropped turns. This covers 1. The other 6 were TIMEOUTS, which
+     * carry no status, no body and no type -- so no rule keyed on the
+     * receiver's answer can cover them, and a timeout is also the case where
+     * the write may have committed and only the reply was lost. Anyone reading
+     * "retry added" without this paragraph will believe turn loss is solved.
+     *
+     * Keyed on the TYPE, never the status code and never `retryable` alone:
+     * the flag is set on failures elsewhere that are not safe to retry, and the
+     * type is the thing the receiver has actually verified as pre-write. The
+     * type is read from the parsed body, NOT matched against the message
+     * string.
+     */
+    async function postIngestWithLifecycleRetry(path, vcKey, convId, payload) {
+      const started = Date.now();
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await vcPost(baseUrl, path, vcKey, convId, payload, 15000, log);
+        } catch (error) {
+          const retryable = error?.vcType === INGEST_RETRY_TYPE
+            && attempt < INGEST_RETRY_MAX_ATTEMPTS;
+          // Honour the receiver's own advice; it knows how long its condition
+          // lasts and this side does not. Absent advice gets a small default.
+          const advised = Number.isFinite(error?.retryAfterMs)
+            ? error.retryAfterMs
+            : INGEST_RETRY_DEFAULT_DELAY_MS;
+          const delay = Math.min(advised, INGEST_RETRY_MAX_DELAY_MS);
+          // WALL-CLOCK bound, not just an attempt bound. The run-bound group
+          // finalizer fires at 30s, logs `ingest SKIPPED` and releases state in
+          // a finally -- so a retry still in flight past it would make the
+          // instrument report a loss that did not happen while the write was
+          // still going.
+          if (!retryable || Date.now() - started + delay > INGEST_RETRY_BUDGET_MS) {
+            if (error?.vcType === INGEST_RETRY_TYPE) {
+              log.error?.(
+                `[vc] TURN LOST — ingest exhausted retries for ` +
+                `${INGEST_RETRY_TYPE} after ${attempt + 1} attempt(s), ` +
+                `${Date.now() - started}ms. The assistant message for this ` +
+                `turn is NOT stored.`,
+              );
+            }
+            throw error;
+          }
+          log.warn?.(
+            `[vc] ingest ${INGEST_RETRY_TYPE} — retrying in ${delay}ms ` +
+            `(attempt ${attempt + 1}/${INGEST_RETRY_MAX_ATTEMPTS + 1}, ` +
+            `advised=${error?.retryAfterMs ?? "none"}). Verified pre-write, ` +
+            `so this cannot duplicate the turn.`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
     async function ingestWithOutboundIds(path, sessionKey, convId, ingestPayload) {
       const fields = outboundIdIngestFields(convId, sessionKey);
       const carried = fields[OUTBOUND_ID_WIRE_KEY]?.length ?? 0;
       if (carried === 0) {
-        return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
-          ingestPayload, 15000, log);
+        return postIngestWithLifecycleRetry(
+          path, vcKeyFor(sessionKey), convId, ingestPayload);
       }
       try {
-        const result = await vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
-          { ...ingestPayload, ...fields }, 15000, log);
+        const result = await postIngestWithLifecycleRetry(
+          path, vcKeyFor(sessionKey), convId, { ...ingestPayload, ...fields });
         outboundIdStats.carried += carried;
         noteOutboundIdAck(outboundIdStats, readOutboundIdAck(result), carried, log);
         return result;
@@ -5863,8 +5977,8 @@ export default {
           `WITHOUT METADATA — ids=${carried} error=${error}. The ids become ` +
           `UNKNOWN to the engine; the turn is not.`,
         );
-        return vcPost(baseUrl, path, vcKeyFor(sessionKey), convId,
-          ingestPayload, 15000, log);
+        return postIngestWithLifecycleRetry(
+          path, vcKeyFor(sessionKey), convId, ingestPayload);
       }
     }
 

@@ -208,8 +208,12 @@ function installMetadataRejectingFetch() {
   return fetchSpy;
 }
 
-const logText = (log) => [...log.info.mock.calls, ...log.warn.mock.calls]
-  .map((call) => String(call[0])).join("\n");
+// ALL THREE LEVELS. This helper read only info and warn, so every
+// error-level assertion silently could not fail -- a test instrument blind to
+// exactly the level that reports loss.
+const logText = (log) => [
+  ...log.info.mock.calls, ...log.warn.mock.calls, ...log.error.mock.calls,
+].map((call) => String(call[0])).join("\n");
 
 describe("message_sent wiring", () => {
   it("registers NO hook when the feature is off, so an unconfigured deploy is untouched", async () => {
@@ -462,6 +466,122 @@ describe("the conversation gate is consulted at runtime (codex P0-3)", () => {
     expect(text).toContain("no_channel_ruler:telegram=1");
     expect(text).toContain("witnessed=0");
     expect(text).toContain("UNCOVERED");
+  });
+});
+
+describe("ingest retry on the verified pre-write failure", () => {
+  const BUSY = {
+    error: { type: "conversation_lifecycle_busy",
+             message: "Conversation state is busy; retry the request.",
+             retryable: true },
+  };
+
+  function installFlakyFetch({ failures, body = BUSY, status = 503, retryAfter = "1" }) {
+    let seen = 0;
+    const fetchSpy = vi.fn(async (url, options = {}) => {
+      if (String(url).includes("capabilities")) {
+        return new Response(JSON.stringify({ exact_source_admission_version: 2 }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (String(url).includes("/api/v1/context/ingest")) {
+        seen += 1;
+        if (seen <= failures) {
+          const h = { "Content-Type": "application/json" };
+          if (retryAfter !== null) h["Retry-After"] = retryAfter;
+          return new Response(JSON.stringify(body), { status, headers: h });
+        }
+        return new Response(JSON.stringify({ conversation_id: "conv", status: "ok" }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      const b = JSON.parse(options.body ?? "{}");
+      return new Response(JSON.stringify({
+        conversation_id: "conv", body: { messages: b.messages ?? [] },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    globalThis.fetch = fetchSpy;
+    return fetchSpy;
+  }
+
+  const ingestCalls = (spy) => spy.mock.calls
+    .filter(([url]) => String(url).includes("/api/v1/context/ingest")).length;
+
+  it("REGRESSION: retries the named type and the turn survives", async () => {
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 1 });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(2);
+    expect(logText(log)).toContain("conversation_lifecycle_busy — retrying");
+    expect(logText(log)).toContain("cannot duplicate the turn");
+    expect(logText(log)).not.toContain("TURN LOST");
+  });
+
+  it("does NOT retry a different type, however retryable it claims to be", async () => {
+    // The flag is set on failures elsewhere that are unsafe to retry. Only the
+    // type the receiver verified as pre-write may be retried.
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({
+      failures: 1,
+      body: { error: { type: "something_else", message: "x", retryable: true } },
+    });
+    const { handlers } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(1);
+  });
+
+  it("does NOT retry on a bare 503 with no type", async () => {
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 1, body: { oops: true } });
+    const { handlers } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(1);
+  });
+
+  it("gives up after the attempt bound and LOGS THE LOSS explicitly", async () => {
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 99 });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(3);
+    const text = logText(log);
+    expect(text).toContain("TURN LOST");
+    expect(text).toContain("is NOT stored");
+  });
+
+  it("survives a missing Retry-After rather than treating it as zero", async () => {
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 1, retryAfter: null });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(2);
+    expect(logText(log)).toContain("advised=none");
+    // Assert the DELAY ACTUALLY USED, not just the label. Without this, a
+    // zero-delay fallback passes -- it would still log "advised=none" while
+    // hammering the receiver instantly during a contention window.
+    expect(logText(log)).toContain("retrying in 1000ms");
+  });
+
+  it("uses the receiver's advice when it gives some", async () => {
+    const home = makeHome();
+    installFlakyFetch({ failures: 1, retryAfter: "2" });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(logText(log)).toContain("retrying in 2000ms");
+    expect(logText(log)).toContain("advised=2000");
+  });
+
+  it("caps an absurd Retry-After rather than obeying it", async () => {
+    // A receiver asking for 10 minutes must not hold the turn path open past
+    // the 30s group finalizer.
+    const home = makeHome();
+    installFlakyFetch({ failures: 1, retryAfter: "600" });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    const text = logText(log);
+    expect(text).not.toContain("retrying in 600000ms");
+    expect(text.includes("retrying in 3000ms") || text.includes("TURN LOST")).toBe(true);
   });
 });
 
