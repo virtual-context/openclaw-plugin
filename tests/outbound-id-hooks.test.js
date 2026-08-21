@@ -545,7 +545,7 @@ describe("ingest retry on the verified pre-write failure", () => {
   it("REGRESSION: retries the named type and the turn survives", async () => {
     const home = makeHome();
     const fetchSpy = installFlakyFetch({ failures: 1 });
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(ingestCalls(fetchSpy)).toBe(2);
     expect(logText(log)).toContain("conversation_lifecycle_busy — retrying");
@@ -561,7 +561,7 @@ describe("ingest retry on the verified pre-write failure", () => {
       failures: 1,
       body: { error: { type: "something_else", message: "x", retryable: true } },
     });
-    const { handlers } = await registerPlugin(home, {});
+    const { handlers } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(ingestCalls(fetchSpy)).toBe(1);
   });
@@ -569,7 +569,7 @@ describe("ingest retry on the verified pre-write failure", () => {
   it("does NOT retry on a bare 503 with no type", async () => {
     const home = makeHome();
     const fetchSpy = installFlakyFetch({ failures: 1, body: { oops: true } });
-    const { handlers } = await registerPlugin(home, {});
+    const { handlers } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(ingestCalls(fetchSpy)).toBe(1);
   });
@@ -577,7 +577,7 @@ describe("ingest retry on the verified pre-write failure", () => {
   it("gives up after the attempt bound and LOGS THE LOSS explicitly", async () => {
     const home = makeHome();
     const fetchSpy = installFlakyFetch({ failures: 99 });
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(ingestCalls(fetchSpy)).toBe(3);
     const text = logText(log);
@@ -588,7 +588,7 @@ describe("ingest retry on the verified pre-write failure", () => {
   it("survives a missing Retry-After rather than treating it as zero", async () => {
     const home = makeHome();
     const fetchSpy = installFlakyFetch({ failures: 1, retryAfter: null });
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(ingestCalls(fetchSpy)).toBe(2);
     expect(logText(log)).toContain("advised=none");
@@ -601,7 +601,7 @@ describe("ingest retry on the verified pre-write failure", () => {
   it("uses the receiver's advice when it gives some", async () => {
     const home = makeHome();
     installFlakyFetch({ failures: 1, retryAfter: "2" });
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     expect(logText(log)).toContain("retrying in 2000ms");
     expect(logText(log)).toContain("advised=2000");
@@ -612,14 +612,64 @@ describe("ingest retry on the verified pre-write failure", () => {
     // the 30s group finalizer.
     const home = makeHome();
     installFlakyFetch({ failures: 1, retryAfter: "600" });
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
     await driveTurn(handlers, turnCtx());
     const text = logText(log);
     expect(text).not.toContain("retrying in 600000ms");
     expect(text.includes("retrying in 3000ms") || text.includes("TURN LOST")).toBe(true);
   });
-});
 
+  it("THE GATE: unset config means ONE attempt and no retry, ever", async () => {
+    // Default off. If this test fails, the default flipped -- which is the
+    // whole reason the gate exists, because "not running in production" was
+    // previously maintained only by prod happening to be on an older commit.
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 1 });
+    const { handlers, log } = await registerPlugin(home, {});
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(1);
+    const text = logText(log);
+    expect(text).not.toContain("conversation_lifecycle_busy — retrying");
+    expect(text).toContain("retry: OFF (default)");
+  });
+
+  it("THE GATE: only the boolean true arms it", async () => {
+    // A hand-edited config carrying a truthy string must not arm a retry path
+    // whose covered failure population is empty.
+    for (const value of ["true", 1, {}, null]) {
+      const home = makeHome();
+      const fetchSpy = installFlakyFetch({ failures: 1 });
+      const { handlers } = await registerPlugin(home, { ingestRetry: { enabled: value } });
+      await driveTurn(handlers, turnCtx());
+      expect(ingestCalls(fetchSpy)).toBe(1);
+    }
+  });
+
+  it("POSITIVE CONTROL: the gate can be armed, so OFF is a real result", async () => {
+    // Without this, every gate test above would pass against a build in which
+    // the retry had simply been deleted.
+    const home = makeHome();
+    const fetchSpy = installFlakyFetch({ failures: 1 });
+    const { handlers, log } = await registerPlugin(home, { ingestRetry: { enabled: true } });
+    await driveTurn(handlers, turnCtx());
+    expect(ingestCalls(fetchSpy)).toBe(2);
+    expect(logText(log)).toContain("retry: ARMED");
+  });
+
+  it("the gate does not swallow a failure it declines to retry", async () => {
+    // Gated off must still deliver the error to the caller, or the clean
+    // fallback in ingestWithOutboundIds silently stops firing.
+    const home = makeHome();
+    const fetchSpy = installMetadataRejectingFetch();
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "carry" },
+    });
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    await driveTurn(handlers, turnCtx());
+    expect(requireIngestBodies(fetchSpy)).toHaveLength(2);
+    expect(logText(log)).toContain("RETRYING THE TURN WITHOUT METADATA");
+  });
+});
 describe("a metadata rejection must never cost the turn (I-4)", () => {
   it("REGRESSION: retries the ingest WITHOUT metadata when the receiver rejects it", async () => {
     // The metadata rode the ONLY completion request for the turn. An old

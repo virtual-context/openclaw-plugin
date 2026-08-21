@@ -68,13 +68,13 @@
         "additionalProperties": false
       },
       "agentKeyFiles": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Map of agent id -> absolute path to a file containing that agent's VC key. That agent's traffic is sent with that key, and therefore resolves to that key's tenant; every other agent uses vcKey. The config names a FILE so no key material is stored here. Invalid or unreadable entries are skipped with a log and fall back to vcKey."
       },
-      "description": "Map of agent id -> absolute path to a file containing that agent's VC key. That agent's traffic is sent with that key, and therefore resolves to that key's tenant; every other agent uses vcKey. The config names a FILE so no key material is stored here. Invalid or unreadable entries are skipped with a log and fall back to vcKey."
-    },
-    "convIdentity": {
+      "convIdentity": {
         "type": "string",
         "enum": [
           "session",
@@ -89,7 +89,11 @@
         "properties": {
           "mode": {
             "type": "string",
-            "enum": ["off", "observe", "carry"],
+            "enum": [
+              "off",
+              "observe",
+              "carry"
+            ],
             "default": "off",
             "description": "\"off\" registers no hook and changes no byte on the wire. \"observe\" captures and reports with no network effect. \"carry\" adds the ids to the ingest body and, when latePath is set, to a durable delta queue delivered by its own non-blocking worker."
           },
@@ -109,6 +113,18 @@
           }
         },
         "description": "Map of group session key -> member session keys. Every member shares the group key's stable VC conversation. Requires convIdentity=\"stable\". Exact stable keys are supported; a terminal agent:<agent>:discord:channel:* wildcard is accepted only when OpenClaw binds that agent to an allowlisted Discord account with exactly one explicit guild, and the group key names that guild. Discord DMs and group DMs remain separate."
+      },
+      "ingestRetry": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Retry an ingest the receiver rejects with conversation_lifecycle_busy. Default off: this covers no naturally-occurring failure mode observed to date, and the failures that do occur are timeouts, which are not safe to retry.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Arm the retry. Leave unset unless the receiver is known to be returning conversation_lifecycle_busy."
+          }
+        }
       }
     },
     "additionalProperties": false

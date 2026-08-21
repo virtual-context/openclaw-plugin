@@ -4224,6 +4224,27 @@ const outboundIdWorkers = new Map();
  *
  * Pure function; exported for unit testing.
  */
+/**
+ * Gate for the conversation_lifecycle_busy ingest retry. DEFAULT OFF.
+ *
+ * Off by default because the retry covers ZERO naturally-occurring failures:
+ * the only ingest 503s on record were self-inflicted by a runaway process
+ * pegging a core, and the natural failure population is timeouts, which are
+ * NOT safe to retry -- the receiver may have committed and only the reply was
+ * lost. Anyone turning this on should read that first.
+ *
+ * The gate exists because "not running in production" was previously a
+ * property of which commit happened to be checked out, which a routine
+ * fast-forward would have silently undone. This makes it enforceable by code.
+ *
+ * Strict `=== true`: a truthy string or 1 in a hand-edited config must not arm
+ * a retry path, and defaulting to off on anything unrecognised is the safe
+ * direction for a gate whose covered population is empty.
+ */
+export function normalizeIngestRetryConfig(raw) {
+  return { enabled: raw?.enabled === true };
+}
+
 export function normalizeOutboundIdConfig(raw) {
   const mode = ["off", "observe", "carry"].includes(raw?.mode) ? raw.mode : "off";
   const latePath = typeof raw?.latePath === "string" && raw.latePath.startsWith("/")
@@ -5888,6 +5909,7 @@ export default {
 
     // ── Outbound message-id capture (SPEC-outbound-message-id.md) ──
     const outboundIdCfg = normalizeOutboundIdConfig(cfg.outboundIdCapture);
+    const ingestRetryCfg = normalizeIngestRetryConfig(cfg.ingestRetry);
     if (outboundIdCfg.enabled) outboundIdRegistrations += 1;
 
     // Conversation gate. See outboundConvIdFor.
@@ -5965,6 +5987,12 @@ export default {
      * string.
      */
     async function postIngestWithLifecycleRetry(path, vcKey, convId, payload) {
+      // THE GATE. Default off, and the early return is deliberate: the retry
+      // loop below must be unreachable rather than merely bounded to one
+      // attempt, so that no future edit to the loop's conditions can arm it.
+      if (!ingestRetryCfg.enabled) {
+        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log);
+      }
       const started = Date.now();
       for (let attempt = 0; ; attempt += 1) {
         try {
@@ -6120,6 +6148,15 @@ export default {
       return;
     }
 
+    // Emitted from the same value the gate branches on, so the running process
+    // states its own configuration rather than leaving it to be inferred from
+    // a config file. NOT proof the branch executes -- see the deployment note
+    // in SPEC-ingest-retry.md; with zero natural failures, an inert path and a
+    // live one that never fires look identical from outside.
+    log.info?.(
+      `[vc] ingest ${INGEST_RETRY_TYPE} retry: ` +
+      `${ingestRetryCfg.enabled ? "ARMED" : "OFF (default)"}`,
+    );
     log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
     // Make per-agent key routing visible at boot. A short SHA-256 fingerprint,
     // never key material. Deliberately not called a tenant id: that equivalence

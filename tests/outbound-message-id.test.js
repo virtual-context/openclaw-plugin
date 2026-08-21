@@ -19,6 +19,7 @@ import {
   readOutboundIdAck,
   noteOutboundIdAck,
   noteTurnIdentifiers,
+  normalizeIngestRetryConfig,
   completionOutboxFingerprint,
   newOutboundIdStats,
   noteOutboundIdRefusal,
@@ -614,6 +615,19 @@ describe("the exact-completion fingerprint ignores outbound ids", () => {
     for (const payload of [null, undefined, "x", 7]) {
       expect(completionOutboxFingerprint("sk:c", payload)).toMatch(/^[a-f0-9]{64}$/);
     }
+  });
+});
+
+describe("the ingest-retry gate", () => {
+  it("DEFAULTS TO OFF, and this test failing means the default flipped", () => {
+    expect(normalizeIngestRetryConfig(undefined).enabled).toBe(false);
+    expect(normalizeIngestRetryConfig({}).enabled).toBe(false);
+  });
+
+  it("accepts only the boolean true", () => {
+    for (const value of ["true", 1, "yes", {}, [], null])
+      expect(normalizeIngestRetryConfig({ enabled: value }).enabled).toBe(false);
+    expect(normalizeIngestRetryConfig({ enabled: true }).enabled).toBe(true);
   });
 });
 

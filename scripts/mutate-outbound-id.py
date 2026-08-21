@@ -283,6 +283,26 @@ MUTATIONS = [
         "  stats.turnsSeen += 1;",
         "  if (!sessionId) return;\n  stats.turnsSeen += 1;",
     ),
+    (
+        "ingest-retry gate defaults to ARMED instead of off",
+        "  return { enabled: raw?.enabled === true };",
+        "  return { enabled: raw?.enabled !== false };",
+    ),
+    (
+        "ingest-retry gate accepts any truthy value",
+        "  return { enabled: raw?.enabled === true };",
+        "  return { enabled: Boolean(raw?.enabled) };",
+    ),
+    (
+        "ingest-retry gate removed entirely",
+        "      if (!ingestRetryCfg.enabled) {\n        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log);\n      }",
+        "",
+    ),
+    (
+        "gated-off path swallows the error instead of returning it",
+        "        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log);",
+        "        return vcPost(baseUrl, path, vcKey, convId, payload, 15000, log).catch(() => null);",
+    ),
 ]
 
 
