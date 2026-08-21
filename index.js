@@ -5315,19 +5315,40 @@ export function noteOutboundIdAck(stats, ack, carried, log = null) {
     const unaccounted = Math.max(0, carried - acceptedCount - declinedCount);
     if (unaccounted > 0) stats.ackUnaccounted += unaccounted;
   }
+  // Reasons are recorded INDEPENDENTLY of which outcome "won" the classifier.
+  // A mixed answer -- accepted:1, fence_rejection:2 -- classifies as accepted
+  // because something was recorded, and an early return there would count the
+  // two declines numerically while losing the REASON and the warning. The
+  // named reason is the operator signal; the number alone cannot be acted on.
+  if (declinedCount > 0) {
+    for (const reason of [
+      ...OUTBOUND_ID_PERMANENT_REASONS, ...OUTBOUND_ID_RETRYABLE_REASONS,
+    ]) {
+      const count = n(reason);
+      if (count > 0) {
+        stats.ackDeclinedByReason.set(
+          reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + count,
+        );
+        log?.warn?.(
+          `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +
+          `identities=${count} of carried=${carried} ` +
+          `(accepted=${acceptedCount} declined=${declinedCount}). ` +
+          `Those identities are NOT on record. This is the receiver's ` +
+          `verdict, not a transport failure -- the turn itself was accepted.`,
+        );
+      }
+    }
+  }
   if (ack.state === "accepted") return;
   if (ack.state === "declined") {
-    const reason = ack.reason || "unspecified";
-    stats.ackDeclinedByReason.set(
-      reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + 1,
-    );
-    log?.warn?.(
-      `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +
-      `permanent=${ack.permanent === true} carried=${carried} ` +
-      `accepted=${acceptedCount} declined=${declinedCount}. ` +
-      `Those identities are NOT on record. This is the receiver's verdict, ` +
-      `not a transport failure — the turn itself was accepted.`,
-    );
+    // A decline the count-scan could not attribute to a named reason still
+    // needs recording, or it vanishes between the two paths.
+    if (declinedCount === 0) {
+      const reason = ack.reason || "unspecified";
+      stats.ackDeclinedByReason.set(
+        reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + 1,
+      );
+    }
     return;
   }
   // absent and unreadable are BOTH unknown and neither is zero. Counted apart

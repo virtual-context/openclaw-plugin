@@ -676,7 +676,9 @@ describe("acknowledgement counters separate producer from end-to-end", () => {
     expect(stats.ackDeclined).toBe(3);
     expect(stats.ackAccepted).toBe(0);
     expect(stats.ackUnaccounted).toBe(0);
-    expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(1);
+    // Counted by IDENTITY, not by response: three identities were refused.
+    // A per-response count cannot be compared against carried or accepted.
+    expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(3);
     expect(lines[0]).toContain("DECLINED by receiver");
     expect(lines[0]).toContain("NOT on record");
     expect(lines[0]).toContain("not a transport failure");
@@ -694,6 +696,37 @@ describe("acknowledgement counters separate producer from end-to-end", () => {
     expect(stats.ackAccepted).toBe(1);
     expect(stats.ackDeclined).toBe(2);
     expect(stats.ackUnaccounted).toBe(0);
+  });
+
+  it("REGRESSION: a MIXED answer still records the reason AND warns", () => {
+    // accepted:1 + fence_rejection:2 classifies as "accepted" because
+    // something was recorded. Returning early there would count the two
+    // declines numerically and lose the reason and the warning -- and the
+    // named reason is the only part an operator can act on.
+    const stats = mk();
+    const lines = [];
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 1, duplicate: 0, fence_rejection: 2 },
+    }), 3, { warn: (l) => lines.push(l) });
+    expect(stats.ackAccepted).toBe(1);
+    expect(stats.ackDeclined).toBe(2);
+    expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(2);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("identities=2 of carried=3");
+    expect(lines[0]).toContain("accepted=1");
+  });
+
+  it("records every distinct reason in a multi-reason answer", () => {
+    const stats = mk();
+    const lines = [];
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: {
+        accepted: 0, duplicate: 0, fence_rejection: 1, store_unavailable: 2,
+      },
+    }), 3, { warn: (l) => lines.push(l) });
+    expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(1);
+    expect(stats.ackDeclinedByReason.get("store_unavailable")).toBe(2);
+    expect(lines).toHaveLength(2);
   });
 
   it("counts what the answer does not account for as UNACCOUNTED, not accepted", () => {
