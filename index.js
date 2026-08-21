@@ -3995,6 +3995,26 @@ async function deliverCompletionOutboxRecord(
     log,
     { correlationId: `completion:${record.source_message_id}` },
   );
+  // READ THE ACKNOWLEDGEMENT ON THIS PATH TOO.
+  //
+  // This is the path guild channels actually use, and until now the adapter
+  // was wired ONLY into the legacy ingest. So every ack counter sat at 0 while
+  // identities were being accepted -- `ackAccepted=0` reported "nothing
+  // measured" in the exact shape of "nothing accepted", on the one number the
+  // team intends to judge the chain by.
+  //
+  // Placed BEFORE the conflict and validation branches below: an outcome the
+  // receiver reported must be recorded even when the surrounding delivery is
+  // about to be dead-lettered, or the counters lose exactly the cases worth
+  // counting.
+  const ackIdentities = Array.isArray(record?.payload?.[OUTBOUND_ID_EXACT_PAYLOAD_KEY])
+    ? record.payload[OUTBOUND_ID_EXACT_PAYLOAD_KEY].length
+    : 0;
+  if (ackIdentities > 0) {
+    noteOutboundIdAck(
+      outboundIdStats, readOutboundIdAck(ingestResult), ackIdentities, log,
+    );
+  }
   if (ingestResult?.status === "permanent_conflict") {
     deadLetterCompletion(record, ingestResult);
     log?.error?.(

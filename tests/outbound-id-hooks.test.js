@@ -1020,6 +1020,139 @@ describe("a diagnostic may never stop the plugin loading", () => {
   });
 });
 
+/**
+ * Plant a completion-outbox record, recomputed here rather than imported.
+ *
+ * A planter that called the shipped helpers would agree with the reader even
+ * if both were wrong. Same reasoning as plantQueuedRecord above.
+ */
+function plantCompletionRecord(
+  home, { baseUrl = "https://api.example.com", vcKey = "k", identities = 1 } = {},
+) {
+  const scope = deploymentScope(baseUrl, vcKey);
+  const convId = "conv-guild";
+  const sourceMessageId = "1529000000000000777";
+  const key = createHash("sha256")
+    .update(`${scope.deployment_id}${NUL}${convId}${NUL}${sourceMessageId}`, "utf8")
+    .digest("hex");
+  // Built with the identity key LAST, so removing it leaves the covered object
+  // in the same key order the shipped rest-spread produces. Order matters
+  // because the fingerprint is a hash of JSON.stringify output.
+  const covered = {
+    assistant_message: "a guild reply",
+    source_message_id: sourceMessageId,
+    exact_source_admission: {
+      version: 2, owner_conversation_id: convId,
+      conversation_generation: 0, lifecycle_epoch: 2,
+    },
+  };
+  const payload = { ...covered };
+  if (identities > 0) {
+    payload._vc_agent_outbound_ids = Array.from({ length: identities }, (_, i) => ({
+      platform: "discord", account_id: "vast",
+      channel_id: CHANNEL, message_id: `15290000000000009${i}0`,
+      agent_scope_id: "vast",
+    }));
+  }
+  // Recomputed here, NOT imported: the identity key is excluded from the
+  // covered region, which is the property that lets a re-queue with a changed
+  // set survive. A planter that called the shipped helper could not detect if
+  // that exclusion were removed.
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ conv_id: convId, payload: covered }), "utf8")
+    .digest("hex");
+  const dir = join(home, ".openclaw", "state", "virtual-context",
+    "completion-outbox", scope.deployment_id);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${key}.json`), JSON.stringify({
+    version: 2, ...scope, key, conv_id: convId,
+    source_message_id: sourceMessageId,
+    fingerprint, enqueued_at: new Date().toISOString(),
+    enqueue_ordinal: 1, payload,
+  }));
+  return { sourceMessageId, convId };
+}
+
+/** Fetch that answers the EXACT ingest path, with a controllable ack block. */
+function installExactFetch({ ack, status = "accepted", sourceMessageId }) {
+  const fetchSpy = vi.fn(async (url, options = {}) => {
+    const u = String(url);
+    if (u.includes("/api/v1/context/capabilities")) {
+      return new Response(JSON.stringify({ exact_source_admission_version: 2 }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (u.includes("__vc_exact_source_ingest_v2")) {
+      return new Response(JSON.stringify({
+        status, canonical_persisted: true,
+        source_message_id: sourceMessageId,
+        ...(ack ? { agent_outbound_ids_result: ack } : {}),
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    const body = JSON.parse(options.body ?? "{}");
+    return new Response(JSON.stringify({
+      conversation_id: "conv", body: { messages: body.messages ?? [] },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  globalThis.fetch = fetchSpy;
+  return fetchSpy;
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 80));
+
+describe("the acknowledgement is read on the EXACT path, not only the legacy one", () => {
+  it("REGRESSION: an accepted identity on the exact path moves ackAccepted", async () => {
+    // This is the path guild channels actually use. The adapter was wired only
+    // into the legacy ingest, so every ack counter sat at 0 while identities
+    // were being accepted in production -- "nothing measured" printed in the
+    // exact shape of "nothing accepted", on the number the chain is judged by.
+    const home = makeHome();
+    const { sourceMessageId } = plantCompletionRecord(home, { identities: 1 });
+    installExactFetch({ sourceMessageId, ack: { accepted: 1 } });
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "carry" },
+    });
+    await settle();
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    expect(logText(log)).toContain("ackAccepted=1");
+  });
+
+  it("records the outcome even when the delivery is about to dead-letter", async () => {
+    // A receiver that reported a verdict must be counted regardless of what
+    // happens to the surrounding delivery, or the counters lose exactly the
+    // cases worth counting.
+    const home = makeHome();
+    const { sourceMessageId } = plantCompletionRecord(home, { identities: 2 });
+    installExactFetch({
+      sourceMessageId, status: "permanent_conflict",
+      ack: { accepted: 1, fence_rejection: 1 },
+    });
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "carry" },
+    });
+    await settle();
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    const text = logText(log);
+    expect(text).toContain("ackAccepted=1");
+    expect(text).toContain("ackDeclined=1");
+    expect(text).toContain("fence_rejection");
+  });
+
+  it("a record carrying no identities does not manufacture an outcome", async () => {
+    const home = makeHome();
+    const { sourceMessageId } = plantCompletionRecord(home, { identities: 0 });
+    installExactFetch({ sourceMessageId, ack: { accepted: 9 } });
+    const { handlers, log } = await registerPlugin(home, {
+      outboundIdCapture: { mode: "carry" },
+    });
+    await settle();
+    await handlers.get("message_sent")(sentEvent(), sentCtx());
+    const text = logText(log);
+    expect(text).toContain("ackAccepted=0");
+    expect(text).toContain("ackAbsent=0");
+  });
+});
+
 describe("Discord guild channels reach the store via the exact path", () => {
   it("carries ids under the sibling key, NOT the legacy ingest field", async () => {
     // agent:<a>:discord:channel:<id> requires exact source attestation, so its
