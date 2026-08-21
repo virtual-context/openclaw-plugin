@@ -675,10 +675,45 @@ describe("acknowledgement counters separate producer from end-to-end", () => {
     }), 3, { warn: (l) => lines.push(l) });
     expect(stats.ackDeclined).toBe(3);
     expect(stats.ackAccepted).toBe(0);
+    expect(stats.ackUnaccounted).toBe(0);
     expect(stats.ackDeclinedByReason.get("fence_rejection")).toBe(1);
     expect(lines[0]).toContain("DECLINED by receiver");
     expect(lines[0]).toContain("NOT on record");
     expect(lines[0]).toContain("not a transport failure");
+  });
+
+  it("REGRESSION: a MIXED answer is split by the receiver's numbers, not the sent count", () => {
+    // 3 carried, 1 accepted, 2 declined. Charging all 3 to whichever outcome
+    // won the classifier would overstate acceptance by 2 -- the same
+    // producer-side lie this adapter exists to remove, reintroduced by the
+    // adapter itself.
+    const stats = mk();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 1, duplicate: 0, fence_rejection: 2 },
+    }), 3);
+    expect(stats.ackAccepted).toBe(1);
+    expect(stats.ackDeclined).toBe(2);
+    expect(stats.ackUnaccounted).toBe(0);
+  });
+
+  it("counts what the answer does not account for as UNACCOUNTED, not accepted", () => {
+    // 5 carried, the receiver reports on 1. The other 4 are unknown.
+    const stats = mk();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 1, duplicate: 0 },
+    }), 5);
+    expect(stats.ackAccepted).toBe(1);
+    expect(stats.ackDeclined).toBe(0);
+    expect(stats.ackUnaccounted).toBe(4);
+  });
+
+  it("duplicate counts toward accepted, since the identity is on record", () => {
+    const stats = mk();
+    noteOutboundIdAck(stats, readOutboundIdAck({
+      agent_outbound_ids_result: { accepted: 0, duplicate: 2 },
+    }), 2);
+    expect(stats.ackAccepted).toBe(2);
+    expect(stats.ackUnaccounted).toBe(0);
   });
 
   it("counts absent and unreadable apart, and neither as accepted", () => {

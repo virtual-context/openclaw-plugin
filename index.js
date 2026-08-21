@@ -5263,6 +5263,7 @@ export function newOutboundIdStats() {
     ackDeclined: 0,
     ackAbsent: 0,
     ackUnreadable: 0,
+    ackUnaccounted: 0,
     ackDeclinedByReason: new Map(),
     evictedPending: 0,
     refusedByReason: new Map(),
@@ -5291,19 +5292,39 @@ export function newOutboundIdStats() {
  */
 export function noteOutboundIdAck(stats, ack, carried, log = null) {
   if (!stats || !ack) return;
-  if (ack.state === "accepted") {
-    stats.ackAccepted += carried;
-    return;
+  const n = (key) => {
+    const v = ack.counts?.[key];
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  // Attribute from the RECEIVER'S OWN NUMBERS, never from how many were sent.
+  // A mixed answer -- 3 carried, 1 accepted, 2 declined -- is a real shape, and
+  // charging all 3 to whichever outcome won the classifier would overstate
+  // acceptance by 2. That is the same producer-side lie this adapter exists to
+  // remove, so it must not be reintroduced by the adapter itself.
+  // `carried` is used only to detect what the answer does not account for.
+  const acceptedCount = n("accepted") + n("duplicate");
+  let declinedCount = 0;
+  for (const reason of [
+    ...OUTBOUND_ID_PERMANENT_REASONS, ...OUTBOUND_ID_RETRYABLE_REASONS,
+  ]) declinedCount += n(reason);
+  if (ack.state === "accepted" || ack.state === "declined") {
+    stats.ackAccepted += acceptedCount;
+    stats.ackDeclined += declinedCount;
+    // Anything the request carried that the answer does not account for is
+    // UNACCOUNTED -- not accepted, not refused, and not zero.
+    const unaccounted = Math.max(0, carried - acceptedCount - declinedCount);
+    if (unaccounted > 0) stats.ackUnaccounted += unaccounted;
   }
+  if (ack.state === "accepted") return;
   if (ack.state === "declined") {
-    stats.ackDeclined += carried;
     const reason = ack.reason || "unspecified";
     stats.ackDeclinedByReason.set(
       reason, (stats.ackDeclinedByReason.get(reason) ?? 0) + 1,
     );
     log?.warn?.(
       `[vc:outbound-id] DECLINED by receiver reason=${reason} ` +
-      `permanent=${ack.permanent === true} carried=${carried}. ` +
+      `permanent=${ack.permanent === true} carried=${carried} ` +
+      `accepted=${acceptedCount} declined=${declinedCount}. ` +
       `Those identities are NOT on record. This is the receiver's verdict, ` +
       `not a transport failure — the turn itself was accepted.`,
     );
@@ -5372,6 +5393,7 @@ export function renderOutboundIdReport(stats, context = {}) {
     `carried=${stats.carried} carriedExact=${stats.carriedExact} ` +
     `ackAccepted=${stats.ackAccepted} ackDeclined=${stats.ackDeclined} ` +
     `ackAbsent=${stats.ackAbsent} ackUnreadable=${stats.ackUnreadable} ` +
+    `ackUnaccounted=${stats.ackUnaccounted} ` +
     `ackDeclinedBy[${tally(stats?.ackDeclinedByReason) || "none"}] ` +
     `queued=${stats.queued} ` +
     `queuedDuplicate=${stats.queuedDuplicate} ` +
