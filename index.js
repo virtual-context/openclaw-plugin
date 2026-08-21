@@ -4566,9 +4566,21 @@ export function rememberPendingOutboundId(state, convId, entry, now, limits = {}
  * substitute, which is why it is worth a counter of its own.
  *
  * Never observed in production: peak bucket 16 against a cap of 32 over three
- * weeks. Reaching it needs ~33 consecutive turns inside the TTL; the longest
- * run of sub-28-second gaps on record is 1. The speed is reachable -- 17.6s has
- * occurred -- but sustaining it has not.
+ * weeks. Reaching it needs ~33 consecutive turns inside the TTL.
+ *
+ * EVERY FIGURE HERE IS A LOWER BOUND ON THE RISK, and deliberately so. Both
+ * available gap measurements omit events -- one counts deliveries where the
+ * quantity depends on witnesses, the other counts only identities that were
+ * successfully carried -- and a missing event MERGES two real gaps into one
+ * longer one. So measured gaps are inflated and measured streaks are broken.
+ * The longest observed run of sub-28-second gaps is >= 3, not 3; the tightest
+ * observed gap of 17.6s is an upper bound on the true tightest.
+ *
+ * The defensible statement: the SPEED is already reachable, the sustained
+ * DURATION has never approached the cap, and every number either side holds
+ * understates rather than overstates. Getting the exact figure needs
+ * correlating each dispatch back to a turn, which the question does not
+ * currently justify.
  *
  * Pure; exported for unit testing.
  */
