@@ -1133,8 +1133,27 @@ describe("the agent identity is corroborated at boot", () => {
       withPlugins({ "bts-relay": { config: { botUserId: OTHER } } }));
     const text = logText(log);
     expect(text).toContain("[vc:actor-id] CONFLICT for discord");
-    expect(text).toContain("DISABLED");
     expect(text).toContain("suppresses");
+    // ASSERT THE STATE, NOT THE ANNOUNCEMENT. A mutation removing the disabling
+    // left every CONFLICT/DISABLED line intact and survived, because the
+    // description and the behaviour were reported separately. This reads the
+    // effective value back through the same accessor the code uses.
+    expect(text).toContain("effective discord: DISABLED (usable=none)");
+    expect(text).not.toContain(`usable=${ID}`);
+  });
+
+  it("REGRESSION: every boot line says the value is NOT DELIVERED anywhere", async () => {
+    // Whoever configures this after reading the schema would otherwise get a
+    // line asserting a verified agent identity over a value nothing reads.
+    const home = makeHome();
+    installFetch();
+    const { log } = await registerWithConfig(home,
+      { agentActorIds: { discord: ID } },
+      withPlugins({ "bts-relay": { config: { botUserId: ID } } }));
+    const text = logText(log);
+    expect(text).toContain(`effective discord: usable=${ID}`);
+    expect(text).toContain("NOT DELIVERED ANYWHERE");
+    expect(text).toContain("not part of the suppression fix");
   });
 
   it("REGRESSION: no corroborating entry logs UNCORROBORATED, not verified", async () => {

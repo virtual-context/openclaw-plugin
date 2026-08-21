@@ -371,6 +371,16 @@ MUTATIONS = [
         '  if (state.conflicted.has(platform)) return "";',
         "",
     ),
+    (
+        "actor id: effective-state line reports the verdict instead of the value",
+        "      const sendable = agentActorIdFor(agentActorIds, platform);",
+        "      const sendable = agentActorIds.configured.get(platform) ?? \"\";",
+    ),
+    (
+        "actor id: boot lines stop saying the value is not delivered",
+        "`NOT DELIVERED ANYWHERE. This package sends no identity on any wire; ` +",
+        "`` +",
+    ),
 ]
 
 

@@ -6366,6 +6366,26 @@ export default {
         `UNCORROBORATED — nothing on this host corroborates ${platform}.`,
       );
     }
+    // THE EFFECTIVE STATE, read back through the same accessor the rest of the
+    // code would use. Printing the verdict alone was not enough: a mutation
+    // that removed the disabling left every CONFLICT/DISABLED line intact and
+    // no test could tell, because the description and the behaviour were
+    // reported separately. This prints what the value ACTUALLY IS.
+    //
+    // And it states plainly that nothing is delivered. Without that, anyone who
+    // configures this after reading the schema gets a line asserting a verified
+    // agent identity over a value no component reads -- a green check over a
+    // value with no consumer, which is indistinguishable from a working one.
+    for (const platform of agentActorIds.configured.keys()) {
+      const sendable = agentActorIdFor(agentActorIds, platform);
+      log.info?.(
+        `[vc:actor-id] effective ${platform}: ` +
+        `${sendable ? `usable=${sendable}` : "DISABLED (usable=none)"} — ` +
+        `NOT DELIVERED ANYWHERE. This package sends no identity on any wire; ` +
+        `the engine reads agent_actor_ids from its OWN configuration. These ` +
+        `checks guard a local copy and are not part of the suppression fix.`,
+      );
+    }
     log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
     // Make per-agent key routing visible at boot. A short SHA-256 fingerprint,
     // never key material. Deliberately not called a tenant id: that equivalence
