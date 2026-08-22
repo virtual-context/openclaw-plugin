@@ -670,7 +670,7 @@ describe("the report carries its own age and its own falsifier", () => {
     const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
     const ratio = line.indexOf("sent_per_sending=");
     expect(line.slice(ratio, ratio + 200)).toContain("SELF-REFERENTIAL");
-    expect(line.slice(ratio, ratio + 320)).toContain("hook-dispatch lines");
+    expect(line.slice(ratio, ratio + 340)).toContain("RUNBOOK-phase-a-observe.md");
     // REGRESSION, SECOND ATTEMPT. The documented pattern must not appear in the
     // line documenting it, in ANY form. Version one quoted the bare phrase and
     // the recommended grep counted this line too. Version two quoted the
@@ -679,6 +679,11 @@ describe("the report carries its own age and its own falsifier", () => {
     // never reproduce a greppable form of it.
     expect(line).not.toContain("running message_sent");
     expect(line).not.toContain("hooks] running");
+    // THIRD ATTEMPT. Version three still printed "hooks]" while telling the
+    // reader to anchor on it -- a partial pattern is still a pattern. No
+    // literal a reader might grep for may appear here at all.
+    expect(line).not.toContain("hooks]");
+    expect(line).not.toContain("message_sent (");
   });
 
   it("REGRESSION: says agreement with carriedExact is algebraic while declines are zero", () => {

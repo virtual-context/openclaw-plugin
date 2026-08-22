@@ -5744,16 +5744,18 @@ export function renderOutboundIdReport(stats, context = {}) {
     // line -- so the documented grep matched the report as well as the hook and
     // returned exactly double. A falsifier that breaks the measurement it
     // describes is worse than none; anchor on the hook line's own suffix.
-    // DO NOT PRINT THE PATTERN. Two attempts did, and both times the report
-    // line became a match for the very grep it recommends -- first with the
-    // bare phrase, then again with the anchored one, because the correction
-    // quoted the corrected pattern. Describe the target line instead; a
-    // description cannot be grepped for.
-    `what total dispatch failure prints. For a real denominator, count the ` +
-    `host's own hook-dispatch lines: the ones emitted by the hooks subsystem ` +
-    `naming the post-delivery hook, which end with the handler count in ` +
-    `parentheses. Anchor on "hooks]" and the handler-count suffix so this ` +
-    `line cannot match -- it names the hook without being one) ` +
+    // NO LITERAL ANY READER MIGHT GREP FOR APPEARS IN THIS LINE. Three
+    // attempts printed one: the bare phrase, then the anchored phrase in the
+    // sentence explaining the anchor, then a partial anchor in the sentence
+    // explaining THAT. Each version was matched by the command it recommended.
+    // Any literal printed here is, by construction, in the corpus a reader
+    // greps -- so the only stable fix is to print none and point at the
+    // runbook, which is not in that corpus.
+    `what total dispatch failure prints. This ratio cannot be a coverage ` +
+    `figure. A real denominator must come from the host's own delivery ` +
+    `records rather than from this plugin; RUNBOOK-phase-a-observe.md gives ` +
+    `the exact command, deliberately not repeated here because anything ` +
+    `quoted in this line is also matched by it) ` +
     // The reading's OWN AGE, adjacent to the figures rather than buried in the
     // limitations below. Without it a reader at event 11 sees events=5, counts
     // 11 host dispatches, and derives a six-event shortfall that does not
