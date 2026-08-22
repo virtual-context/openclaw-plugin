@@ -670,12 +670,15 @@ describe("the report carries its own age and its own falsifier", () => {
     const line = renderOutboundIdReport(stats, { mode: "carry", convIdentity: "stable" });
     const ratio = line.indexOf("sent_per_sending=");
     expect(line.slice(ratio, ratio + 200)).toContain("SELF-REFERENTIAL");
-    expect(line.slice(ratio, ratio + 260)).toContain("running message_sent (");
-    // REGRESSION: the documented pattern must not match the line documenting
-    // it. The first version quoted the bare phrase and the grep it recommends
-    // then counted this report line too, returning exactly double the real
-    // dispatch count -- a falsifier that broke the measurement it described.
-    expect(line.match(/hooks\] running message_sent(?!\s*\()/g)).toBeNull();
+    expect(line.slice(ratio, ratio + 320)).toContain("hook-dispatch lines");
+    // REGRESSION, SECOND ATTEMPT. The documented pattern must not appear in the
+    // line documenting it, in ANY form. Version one quoted the bare phrase and
+    // the recommended grep counted this line too. Version two quoted the
+    // ANCHORED phrase and did it again -- the correction reintroduced the
+    // defect by quoting the correction. The line must DESCRIBE the target,
+    // never reproduce a greppable form of it.
+    expect(line).not.toContain("running message_sent");
+    expect(line).not.toContain("hooks] running");
   });
 
   it("REGRESSION: says agreement with carriedExact is algebraic while declines are zero", () => {

@@ -5744,10 +5744,16 @@ export function renderOutboundIdReport(stats, context = {}) {
     // line -- so the documented grep matched the report as well as the hook and
     // returned exactly double. A falsifier that breaks the measurement it
     // describes is worse than none; anchor on the hook line's own suffix.
-    `what total dispatch failure prints; count the host's own dispatch lines ` +
-    `instead, matching on: running message_sent ( — the trailing paren is ` +
-    `required, because without it the pattern also matches THIS line and ` +
-    `doubles the count) ` +
+    // DO NOT PRINT THE PATTERN. Two attempts did, and both times the report
+    // line became a match for the very grep it recommends -- first with the
+    // bare phrase, then again with the anchored one, because the correction
+    // quoted the corrected pattern. Describe the target line instead; a
+    // description cannot be grepped for.
+    `what total dispatch failure prints. For a real denominator, count the ` +
+    `host's own hook-dispatch lines: the ones emitted by the hooks subsystem ` +
+    `naming the post-delivery hook, which end with the handler count in ` +
+    `parentheses. Anchor on "hooks]" and the handler-count suffix so this ` +
+    `line cannot match -- it names the hook without being one) ` +
     // The reading's OWN AGE, adjacent to the figures rather than buried in the
     // limitations below. Without it a reader at event 11 sees events=5, counts
     // 11 host dispatches, and derives a six-event shortfall that does not

@@ -416,6 +416,11 @@ MUTATIONS = [
         "      const dropped = pendingOutboundIdDropCount(pendingOutboundIds, pendingKey);",
         "      const dropped = 0;",
     ),
+    (
+        "report reprints a greppable form of the dispatch pattern",
+        "    `host's own hook-dispatch lines: the ones emitted by the hooks subsystem ` +",
+        "    `host's own lines matching: hooks] running message_sent ( ` +",
+    ),
 ]
 
 
