@@ -340,6 +340,9 @@ const MAX_IDENTITY_WARNING_KEYS = 256;
 
 // sessionKey -> last model string that PASSED the provider filter (see noteFilterResult)
 const filterPassState = new Map();
+// sessionKey -> consecutive turns whose serving model could not be resolved
+// (see noteUnresolvedModel). Advanced by prepare, read by ingest.
+const unresolvedModelState = new Map();
 // sessionId -> runId -> request-local continuity projection expected at
 // llm_input. This is observability only; it never influences a request.
 const continuityAdoptionState = new Map();
@@ -2830,6 +2833,73 @@ export function noteFilterResult(state, sessionKey, model, passed) {
     return { transition: true, lastPassed };
   }
   return { transition: false, lastPassed: null };
+}
+
+/**
+ * Grace window for a session whose serving model cannot be resolved.
+ *
+ * A genuinely new session may not have reached OpenClaw's session store when
+ * its first turns run, so its model is briefly unknowable. The original
+ * accommodation applies there: better to prepare and not need it than to skip
+ * and send an unenriched payload. That reasoning covers a TRANSIENT unknown,
+ * and nothing else.
+ *
+ * A model that stays unresolvable is a different population the original
+ * reasoning never contemplated: no sessions.json, no entry under this exact
+ * key, an entry without modelProvider/model, or a key whose case does not
+ * match the store's. For those the allowlist is structurally unable to
+ * evaluate the turn, and proceeding treats an UNKNOWN as an ALLOW. That is how
+ * an agent the operator excluded by model keeps reaching the service forever.
+ *
+ * After the grace window the filter refuses instead of bypassing. Refusing is
+ * the recoverable error of the two: skipped turns can still be re-ingested
+ * from the session JSONL (initial bulk ingest, VCREINGEST), while turns
+ * admitted under an allowlist that was never evaluated land in a conversation
+ * only a destructive cloud-side delete can clean up.
+ */
+const UNRESOLVED_MODEL_GRACE_TURNS = 3;
+
+/**
+ * Track consecutive turns whose serving model could not be resolved.
+ *
+ * Advanced ONCE per turn, from the prepare hook only. The ingest hook reads the
+ * same state through unresolvedModelBypassAllowed so both halves of one turn
+ * reach the SAME verdict: a user half admitted under the grace window must not
+ * be followed by a refused assistant half.
+ *
+ * state: Map<sessionKey, consecutiveUnresolvedTurns>. A resolved model clears
+ * the entry, so an intermittent store read re-arms the full window rather than
+ * accumulating toward a refusal. Returns {consecutive, bypass, refusalOnset}:
+ * bypass holds while inside the window, and refusalOnset is true on exactly the
+ * turn the window closes so the caller reports it once instead of every turn.
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function noteUnresolvedModel(state, sessionKey, resolved) {
+  if (resolved) {
+    state.delete(sessionKey);
+    return { consecutive: 0, bypass: false, refusalOnset: false };
+  }
+  const consecutive = (state.get(sessionKey) ?? 0) + 1;
+  state.set(sessionKey, consecutive);
+  return {
+    consecutive,
+    bypass: consecutive <= UNRESOLVED_MODEL_GRACE_TURNS,
+    refusalOnset: consecutive === UNRESOLVED_MODEL_GRACE_TURNS + 1,
+  };
+}
+
+/**
+ * Read the standing unresolved-model verdict without advancing it.
+ *
+ * The ingest hook runs after prepare on the same turn, so advancing the
+ * counter here too would halve the grace window and let one turn's halves
+ * disagree. A session with no entry has never been seen unresolved and is
+ * allowed, which keeps an ingest that arrives without a preceding prepare
+ * behaving exactly as it did before.
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function unresolvedModelBypassAllowed(state, sessionKey) {
+  return (state.get(sessionKey) ?? 0) <= UNRESOLVED_MODEL_GRACE_TURNS;
 }
 
 /**
@@ -6799,6 +6869,11 @@ export default {
       // DIAG: log every invocation so we know who's calling
       log.info?.(`[vc:DIAG-bar] entry trigger=${ctx?.trigger ?? "?"} sessionKey=${ctx?.sessionKey ?? "?"} sessionId=${ctx?.sessionId ?? "?"} channel=${ctx?.channel ?? ctx?.messageProvider ?? "?"} channelId=${ctx?.channelId ?? "?"} promptHead=${JSON.stringify(promptText.slice(0,60))}`);
       if (!/^VC[A-Z]/i.test(promptText)) {
+        // Both branches below return, so this check decides nothing on an
+        // ordinary turn: it only suppresses the diagnostic line. It is NOT a
+        // network gate, and the unresolved-model accounting is deliberately
+        // not repeated here -- prepare owns that counter, and counting a turn
+        // twice would halve the grace window.
         if (providerFilter) {
           const currentModel = resolveSessionModel(ctx?.sessionKey ?? "");
           if (currentModel && !providerFilter.has(currentModel)) return;
@@ -6908,6 +6983,11 @@ export default {
       const isVcCommand = /^VC[A-Z]/i.test(promptText);
       if (providerFilter && !isVcCommand) {
         const currentModel = resolveSessionModel(sessionKey);
+        const unresolved = noteUnresolvedModel(
+          unresolvedModelState,
+          sessionKey,
+          Boolean(currentModel),
+        );
         if (currentModel && !providerFilter.has(currentModel)) {
           const { transition, lastPassed } = noteFilterResult(
             filterPassState,
@@ -6929,10 +7009,40 @@ export default {
         if (currentModel) {
           noteFilterResult(filterPassState, sessionKey, currentModel, true);
         }
-        if (!currentModel && debug) {
-          log.info?.(
-            `[vc:debug] model not yet in session store, proceeding optimistically`,
-          );
+        if (!currentModel) {
+          // Unconditional, never behind `debug`. A bypass admits a turn the
+          // allowlist was never able to check, so a deployment running with
+          // debug off must still be able to see it happening.
+          if (unresolved.bypass) {
+            log.info?.(
+              `[vc] provider filter NOT EVALUATED — model unresolved for ` +
+              `session=${sessionId} key=${JSON.stringify(sessionKey)} ` +
+              `turn ${unresolved.consecutive} of ${UNRESOLVED_MODEL_GRACE_TURNS} ` +
+              `grace. Proceeding: a new session may not have reached the ` +
+              `session store yet.`,
+            );
+          } else {
+            if (unresolved.refusalOnset) {
+              (log.warn ?? log.info)?.(
+                `[vc] WARN provider filter CANNOT EVALUATE session=${sessionId} ` +
+                `key=${JSON.stringify(sessionKey)} — its serving model stayed ` +
+                `unresolvable for ${UNRESOLVED_MODEL_GRACE_TURNS} consecutive ` +
+                `turns, so the allowlist has never been able to check it. VC ` +
+                `prepare/ingest are now OFF for this session: an unevaluated ` +
+                `turn is not an allowed turn. Expect an entry for this exact ` +
+                `key in ~/.openclaw/agents/<agentId>/sessions/sessions.json ` +
+                `with modelProvider and model set; note the gateway lowercases ` +
+                `store keys while this plugin looks them up verbatim.`,
+              );
+            } else {
+              log.info?.(
+                `[vc] skipping — model unresolved for session=${sessionId} ` +
+                `(${unresolved.consecutive} consecutive turns); the provider ` +
+                `filter cannot evaluate this session`,
+              );
+            }
+            return;
+          }
         }
       }
       if (isVcCommand) {
@@ -7994,6 +8104,24 @@ export default {
         if (providerFilter) {
           const currentModel = resolveSessionModel(sessionKey);
           if (currentModel && !providerFilter.has(currentModel)) {
+            log.info?.(
+              `[vc] skipping ingest — ${currentModel} not in provider filter; ` +
+              `session=${sessionId}`,
+            );
+            releasePendingTurn();
+            return;
+          }
+          // Read, never advance: prepare already counted this turn. Advancing
+          // here as well would halve the grace window and could let the two
+          // halves of one turn disagree.
+          if (
+            !currentModel
+            && !unresolvedModelBypassAllowed(unresolvedModelState, sessionKey)
+          ) {
+            log.info?.(
+              `[vc] skipping ingest — model unresolved for session=${sessionId}; ` +
+              `the provider filter cannot evaluate this session`,
+            );
             releasePendingTurn();
             return;
           }
