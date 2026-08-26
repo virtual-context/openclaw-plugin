@@ -3191,6 +3191,42 @@ export function buildAgentKeyIndex(agentKeyFilesCfg, log, readKeyFile) {
 }
 
 /**
+ * Compare what agentKeyFiles asked for against what actually loaded.
+ *
+ * buildAgentKeyIndex drops an unusable entry and continues, which is the right
+ * runtime behaviour -- one bad path must not take the deployment down -- but it
+ * leaves the index one entry short with nothing to compare against. A loaded
+ * count on its own reads as health: `agentKeys=2` looks fine whether two or
+ * twenty were configured. This supplies the denominator, and names the ids
+ * that fell back so the report identifies WHICH tenant boundary is gone rather
+ * than only that one is.
+ *
+ * Modelled on the outbound-id queue inventory, which reports `configured=`
+ * beside its live counts for exactly this reason.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function summarizeAgentKeyRouting(agentKeyFilesCfg, agentKeyIndex) {
+  const isMap = agentKeyIndex instanceof Map;
+  const usable = agentKeyFilesCfg
+    && typeof agentKeyFilesCfg === "object"
+    && !Array.isArray(agentKeyFilesCfg);
+  const configuredIds = usable ? Object.keys(agentKeyFilesCfg) : [];
+  const missing = configuredIds.filter((id) => !(isMap && agentKeyIndex.has(id)));
+  return {
+    configured: configuredIds.length,
+    loaded: isMap ? agentKeyIndex.size : 0,
+    missing,
+    // An array config is rejected wholesale by buildAgentKeyIndex, so it has
+    // no per-id story to tell; flag the shape itself instead of reporting a
+    // silent zero-of-zero that reads as "nothing was asked for".
+    malformedConfig: agentKeyFilesCfg !== undefined
+      && agentKeyFilesCfg !== null
+      && !usable,
+  };
+}
+
+/**
  * Choose the VC key for a session.
  *
  * The agent id is taken from the session key's `agent:<agentId>:` namespace.
@@ -6549,7 +6585,8 @@ export default {
         `checks guard a local copy and are not part of the suppression fix.`,
       );
     }
-    log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyIndex.size} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
+    const agentKeyRouting = summarizeAgentKeyRouting(cfg.agentKeyFiles, agentKeyIndex);
+    log.info?.(`[vc] register() v${PLUGIN_VERSION} — baseUrl=${baseUrl} debug=${debug} convIdentity=${stableMode ? "stable" : "session"} groupedSessions=${groupIndex.size} agentKeys=${agentKeyRouting.loaded}/${agentKeyRouting.configured} providers=${providerFilter ? [...providerFilter].join(",") : "all"}`);
     // Make per-agent key routing visible at boot. A short SHA-256 fingerprint,
     // never key material. Deliberately not called a tenant id: that equivalence
     // holds only for a tenant's primary key, not for secondary API keys.
@@ -6558,6 +6595,35 @@ export default {
         `[vc] agent key routing: ${routedAgentId} -> keyfp=` +
         `${createHash("sha256").update(routedKey, "utf8").digest("hex").slice(0, 12)} ` +
         `(fingerprint, not a tenant id)`,
+      );
+    }
+    // A dropped entry is otherwise visible only as an ABSENT routing line, and
+    // absence is what nobody greps for. Carry the whole finding in the text
+    // rather than in the severity: plugin log levels are not guaranteed to
+    // reach a level-filtered journal query, so a reader may only ever see this
+    // as an ordinary line. Re-emitted on every register call by construction,
+    // which is the repetition that gives it a second chance at being read.
+    if (agentKeyRouting.malformedConfig) {
+      log.error?.(
+        `[vc:agent-keys] AGENT KEY ROUTING DISABLED — agentKeyFiles is not an ` +
+        `object of agentId -> keyfile path, so the whole block was rejected. ` +
+        `EVERY agent is sending with the deployment-wide key: per-agent tenant ` +
+        `isolation is OFF.`,
+      );
+    } else if (agentKeyRouting.missing.length > 0) {
+      log.error?.(
+        `[vc:agent-keys] KEYS MISSING ${agentKeyRouting.missing.length} of ` +
+        `${agentKeyRouting.configured} — loaded=${agentKeyRouting.loaded} ` +
+        `failed=[${agentKeyRouting.missing.join(", ")}]. Those agents are ` +
+        `FALLING BACK to the deployment-wide key, so their traffic resolves to ` +
+        `the global tenant instead of their own: wrong-tenant reads and writes, ` +
+        `not an outage, so nothing else will report it. Fix the keyfile paths ` +
+        `above or remove the entries.`,
+      );
+    } else if (agentKeyRouting.configured > 0) {
+      log.info?.(
+        `[vc:agent-keys] all ${agentKeyRouting.configured} configured agent ` +
+        `key(s) loaded`,
       );
     }
     drainAllCompletionOutboxes();
