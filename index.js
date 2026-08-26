@@ -3244,6 +3244,56 @@ export function selectVcKey(sessionKey, globalKey, agentKeyIndex) {
 }
 
 /**
+ * Validate the excludeAgents config into a lowercased id set.
+ *
+ * The providers allowlist is model-keyed, so it cannot express "never this
+ * AGENT": a fallback onto a listed model re-admits the agent, and a model two
+ * agents share cannot separate them. excludeAgents is agent-keyed and holds
+ * across model switches and fallbacks.
+ *
+ * Individual unusable entries are dropped but NAMED in `invalid` so register()
+ * can report them; a config that is not an array at all sets `malformed`,
+ * because a malformed exclusion list fails OPEN at runtime (nothing can be
+ * excluded when the intent is unreadable) and that must be said out loud
+ * rather than inferred from an absent line.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function buildExcludedAgentSet(excludeAgentsCfg) {
+  if (excludeAgentsCfg === undefined || excludeAgentsCfg === null) {
+    return { excluded: new Set(), invalid: [], malformed: false };
+  }
+  if (!Array.isArray(excludeAgentsCfg)) {
+    return { excluded: new Set(), invalid: [], malformed: true };
+  }
+  const excluded = new Set();
+  const invalid = [];
+  for (const entry of excludeAgentsCfg) {
+    const id = typeof entry === "string" ? entry.trim().toLowerCase() : "";
+    if (id) excluded.add(id);
+    else invalid.push(entry);
+  }
+  return { excluded, invalid, malformed: false };
+}
+
+/**
+ * Decide whether a session belongs to an excluded agent.
+ *
+ * The agent id comes from the session key's `agent:<agentId>:` namespace, the
+ * same derivation selectVcKey uses for per-agent key routing. Matching is
+ * case-insensitive on both sides: for an exclusion knob a case mismatch must
+ * fail toward exclusion, not toward admission. A key with no agent namespace
+ * is not any excluded agent and proceeds, mirroring selectVcKey's fallback.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function sessionAgentExcluded(excludedAgents, sessionKey) {
+  if (!excludedAgents || excludedAgents.size === 0) return false;
+  const agentId = sessionAgentScopeId(sessionKey);
+  return Boolean(agentId && excludedAgents.has(agentId.toLowerCase()));
+}
+
+/**
  * Every distinct key this deployment can send, global first.
  *
  * The completion outbox is stored in a directory derived from the key hash
@@ -5992,6 +6042,11 @@ export default {
     const providerFilter = Array.isArray(cfg.providers) && cfg.providers.length > 0
       ? new Set(cfg.providers.map((p) => p.toLowerCase()))
       : null; // null = all providers
+    // Agent-keyed exclusion, checked before any cloud call at every network
+    // hook. Total: an excluded agent gets no prepare, no ingest and no VC
+    // commands, and unlike the model allowlist this holds across fallbacks.
+    const agentExclusion = buildExcludedAgentSet(cfg.excludeAgents);
+    const excludedAgents = agentExclusion.excluded;
     const debug = cfg.debug === true;
     const modelCallCapture = normalizeModelCallCaptureConfig(cfg.modelCallCapture);
     // Per-agent keys, read from disk so no key material lives in openclaw.json.
@@ -6626,6 +6681,32 @@ export default {
         `key(s) loaded`,
       );
     }
+    // Same discipline as [vc:agent-keys]: the standing exclusion config is
+    // restated on every register call, and a config that cannot exclude
+    // anything says so instead of leaving an absent line to be noticed.
+    if (agentExclusion.malformed) {
+      log.error?.(
+        `[vc:exclude-agents] AGENT EXCLUSION DISABLED — excludeAgents is not ` +
+        `an array of agent ids, so the whole list was rejected. NO agent is ` +
+        `excluded: every agent on an allowed model is reaching the service.`,
+      );
+    } else {
+      if (agentExclusion.invalid.length > 0) {
+        log.error?.(
+          `[vc:exclude-agents] DROPPED ${agentExclusion.invalid.length} ` +
+          `unusable excludeAgents entr(y/ies) ` +
+          `${JSON.stringify(agentExclusion.invalid)} — those exclude nothing. ` +
+          `${excludedAgents.size} usable id(s) remain in force.`,
+        );
+      }
+      if (excludedAgents.size > 0) {
+        log.info?.(
+          `[vc:exclude-agents] excluded agents: ` +
+          `[${[...excludedAgents].join(", ")}] — no prepare, no ingest, no ` +
+          `VC commands for their sessions`,
+        );
+      }
+    }
     drainAllCompletionOutboxes();
 
     if (outboundIdCfg.enabled) {
@@ -6892,6 +6973,10 @@ export default {
       // command prefix would otherwise reach the service and could reset the
       // local ingest tracker.
       if (isExcludedTrigger(ctx)) return;
+      // Same position for excluded agents: their VC commands must not reach
+      // the cloud or touch the tracker either -- exclusion is total, unlike
+      // the provider filter, which VC commands deliberately bypass.
+      if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
       const sessionId = hookSessionIdentity(ctx);
       const turnRunId = hookInvocationRunId(ctx, sessionId);
       // This hook fires once at the start of each invoked turn, before context
@@ -7007,6 +7092,15 @@ export default {
       if (isExcludedTrigger(ctx)) {
         log.info?.(
           `[vc] skipping prepare — ${VC_EXCLUDED_TRIGGER} turn; session=${sessionId}`,
+        );
+        return;
+      }
+      // Before the provider filter, the VC-command bypass and the prepare
+      // POST: an excluded agent's turns never reach the cloud at all.
+      if (sessionAgentExcluded(excludedAgents, sessionKey)) {
+        log.info?.(
+          `[vc] skipping prepare — agent '${sessionAgentScopeId(sessionKey)}' ` +
+          `is in excludeAgents; session=${sessionId}`,
         );
         return;
       }
@@ -8130,6 +8224,19 @@ export default {
           log.info?.(
             `[vc] skipping ingest — ${VC_EXCLUDED_TRIGGER} turn; session=${sessionId}`,
           );
+          return;
+        }
+        // An excluded agent's turns were refused at prepare, so normally
+        // there is no pending user half -- but a config reload between the
+        // two hooks can exclude an agent mid-turn, so release defensively
+        // (the forgets are no-ops when nothing is pending).
+        if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) {
+          log.info?.(
+            `[vc] skipping ingest — agent ` +
+            `'${sessionAgentScopeId(ctx?.sessionKey)}' is in excludeAgents; ` +
+            `session=${sessionId}`,
+          );
+          releasePendingTurn();
           return;
         }
 

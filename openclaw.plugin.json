@@ -30,6 +30,13 @@
         },
         "description": "List of provider/model strings to activate for (e.g. [\"openai-direct/gpt-5.4\"]). Empty or omitted = all providers."
       },
+      "excludeAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Agent ids excluded from Virtual Context entirely: no prepare, no ingest, no VC commands for their sessions. Matched case-insensitively against the agent id in the session key. Unlike the providers allowlist, exclusion holds across model switches and fallbacks. Empty or omitted = no agents excluded."
+      },
       "debug": {
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."

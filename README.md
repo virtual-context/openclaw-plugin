@@ -60,6 +60,7 @@ In `openclaw.json`:
 | `vcKey` | string | required | Your Virtual Context API key. Sent as the `vckey` query parameter on every request. |
 | `baseUrl` | string | `https://api.virtual-context.com` | VC REST API base URL |
 | `providers` | string[] | all | Provider/model pairs to activate for. Empty = all providers. Example: `["openai-direct/gpt-5.4"]` |
+| `excludeAgents` | string[] | none | Agent ids excluded from Virtual Context entirely: no prepare, no ingest, no VC commands. Holds across model switches and fallbacks. Example: `["extractor"]` |
 | `convIdentity` | `"session"` \| `"stable"` | `"session"` | How VC conversations are keyed. **See below — the default is legacy behavior.** |
 | `conversationGroups` | object | none | Map of group session key to member session keys, so several chat scopes share one VC conversation. Requires `convIdentity: "stable"`. |
 | `debug` | boolean | `false` | Enable verbose logging of REST API calls and payloads |
@@ -150,6 +151,12 @@ Set `debug: true` for verbose `[vc:debug]` and `[vc:wire]` request/response logg
 ## Provider Filtering
 
 By default, the plugin activates for all providers. Use the `providers` config to restrict it to specific provider/model combinations. The plugin reads the current model from the session store at runtime, so it correctly handles `/model` switches.
+
+Because the check is per-turn against the live serving model, a `providers` allowlist must cover the **complete fallback chain** of every agent you want captured: a fallback onto an unlisted model turns memory off mid-conversation. The reverse also holds, and is the sharper edge: listing a model that appears in an unwanted agent's fallback chain makes that agent capturable the moment it falls back, and two agents sharing a model cannot be separated by the allowlist at all.
+
+### Excluding agents
+
+To keep a specific agent out of Virtual Context regardless of model, use `excludeAgents`. An excluded agent's sessions get no prepare, no ingest, and no VC commands; nothing is sent to the cloud for them. The agent id is matched case-insensitively against the `agent:<agentId>:` namespace of the session key — the same derivation `agentKeyFiles` uses. Use this, not the model allowlist, to keep a utility or extractor agent from minting conversations. Skipped turns log `[vc] skipping prepare — agent '<id>' is in excludeAgents` and the active exclusion list is printed at every `register()`.
 
 ## Security and Access
 
