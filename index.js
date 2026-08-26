@@ -343,6 +343,9 @@ const filterPassState = new Map();
 // sessionKey -> consecutive turns whose serving model could not be resolved
 // (see noteUnresolvedModel). Advanced by prepare, read by ingest.
 const unresolvedModelState = new Map();
+// sessionKey -> {everPassed, skips} for provider-filter skips
+// (see noteNeverPassedSkip). Advanced by prepare only.
+const neverPassedState = new Map();
 // sessionId -> runId -> request-local continuity projection expected at
 // llm_input. This is observability only; it never influences a request.
 const continuityAdoptionState = new Map();
@@ -2900,6 +2903,47 @@ export function noteUnresolvedModel(state, sessionKey, resolved) {
  */
 export function unresolvedModelBypassAllowed(state, sessionKey) {
   return (state.get(sessionKey) ?? 0) <= UNRESOLVED_MODEL_GRACE_TURNS;
+}
+
+/**
+ * Notice cadence for sessions that have never passed the provider filter.
+ */
+export const NEVER_PASSED_NOTICE_EVERY = 25;
+
+/**
+ * Track provider-filter skips for sessions that have NEVER passed.
+ *
+ * The transition WARN in noteFilterResult covers a session that WAS passing
+ * and fell off the allowlist. A session that never passed has no transition
+ * to report: its every turn produces only the generic skip line, which reads
+ * identically whether the operator excluded the agent on purpose or forgot
+ * its model (or one link of its fallback chain) in `providers`. This helper
+ * makes that population name itself: a notice on the FIRST skipped turn and
+ * again every NEVER_PASSED_NOTICE_EVERY skips, for as long as the condition
+ * holds -- a once-only line would be gone from a scrolled log, and the log
+ * level cannot be relied on to reach a reader.
+ *
+ * state: Map<sessionKey, {everPassed, skips}>. One pass sets everPassed and
+ * permanently silences this signal for the session; "never passed" would be a
+ * false claim afterwards, and the transition WARN owns that story. The count
+ * is per session, not per model string, so a session bouncing between two
+ * unlisted fallback models keeps one count.
+ *
+ * Pure against the injected state map; exported for unit testing.
+ */
+export function noteNeverPassedSkip(state, sessionKey, passed) {
+  const prior = state.get(sessionKey);
+  if (passed) {
+    state.set(sessionKey, { everPassed: true, skips: 0 });
+    return { notice: false, skips: 0 };
+  }
+  if (prior?.everPassed) return { notice: false, skips: 0 };
+  const skips = (prior?.skips ?? 0) + 1;
+  state.set(sessionKey, { everPassed: false, skips });
+  return {
+    notice: skips === 1 || skips % NEVER_PASSED_NOTICE_EVERY === 0,
+    skips,
+  };
 }
 
 /**
@@ -7155,11 +7199,24 @@ export default {
             currentModel,
             false,
           );
+          const neverPassed = noteNeverPassedSkip(
+            neverPassedState,
+            sessionKey,
+            false,
+          );
           if (transition) {
             (log.warn ?? log.info)?.(
               `[vc] WARN provider filter now SKIPPING session=${sessionId} (${currentModel}) — ` +
               `was passing as ${lastPassed}. VC prepare/ingest are OFF for this session until ` +
               `its model returns to the allowlist (check model fallback / provider auth).`
+            );
+          } else if (neverPassed.notice) {
+            log.info?.(
+              `[vc] session=${sessionId} has NEVER passed the provider filter — ` +
+              `${neverPassed.skips} turn(s) skipped so far, model=${currentModel}. ` +
+              `If this agent should be captured, add ${currentModel} and the ` +
+              `rest of its fallback chain to providers; if keeping it out is ` +
+              `intended, excludeAgents states that intent explicitly.`,
             );
           } else {
             log.info?.(`[vc] skipping — ${currentModel} not in provider filter`);
@@ -7168,6 +7225,7 @@ export default {
         }
         if (currentModel) {
           noteFilterResult(filterPassState, sessionKey, currentModel, true);
+          noteNeverPassedSkip(neverPassedState, sessionKey, true);
         }
         if (!currentModel) {
           // Unconditional, never behind `debug`. A bypass admits a turn the
