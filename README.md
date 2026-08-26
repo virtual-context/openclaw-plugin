@@ -87,6 +87,8 @@ Selecting the plugin as OpenClaw's context engine turns on speaker-attributed gr
 
 This is an OpenClaw-level slot, not a key inside the plugin's own `config` block. When selected, the plugin preserves OpenClaw's legacy context-engine lifecycle and stock compaction, and adds trusted `senderName` / `senderId` attribution to the in-memory group-chat history. Discord DMs and direct sessions are unchanged, missing metadata is never guessed, and stored conversation text is not rewritten. Omit the slot to leave OpenClaw's default context engine in place.
 
+Selecting the slot also gives the plugin an in-band compaction signal: the gateway performs compaction through the engine's `compact()`, so the plugin knows when a session was just compacted. On the first prepare after a completed compaction, the payload sent to Virtual Context carries only the current turn instead of the post-compaction survivors and summary — those are the runtime's compressed view of the conversation, not history, and the service already holds every turn it ingested. The model-facing prompt is unchanged; the suppression logs `[vc] suppressing N post-compaction survivor message(s)`. Without the slot (or on a gateway without `registerContextEngine`) the plugin has no compaction signal and forwards the window as-is; the service guards against that shape on its side.
+
 ## How It Works
 
 The plugin observes seven OpenClaw lifecycle hooks:

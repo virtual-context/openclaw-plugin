@@ -197,6 +197,7 @@ export function createSpeakerAttributedContextEngine({
   buildMemorySystemPromptAddition,
   normalizeCurrentPrompt,
   onCurrentSpeaker,
+  onCompaction,
   log,
 }) {
   if (typeof delegateCompactionToRuntime !== "function") {
@@ -252,7 +253,19 @@ export function createSpeakerAttributedContextEngine({
     },
     async afterTurn() {},
     async compact(params) {
-      return delegateCompactionToRuntime(params);
+      const result = await delegateCompactionToRuntime(params);
+      // Report only a compaction that actually happened, under the runtime's
+      // own success predicate (ok && compacted): a refused or no-op
+      // compaction leaves the next prompt's history meaning what it meant.
+      // The notice must never break compaction itself.
+      if (result?.ok && result?.compacted) {
+        try {
+          onCompaction?.(params, result);
+        } catch (error) {
+          log?.warn?.(`[vc] post-compaction notice failed: ${error}`);
+        }
+      }
+      return result;
     },
     async dispose() {},
   };

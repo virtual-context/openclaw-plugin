@@ -346,6 +346,11 @@ const unresolvedModelState = new Map();
 // sessionKey -> {everPassed, skips} for provider-filter skips
 // (see noteNeverPassedSkip). Advanced by prepare only.
 const neverPassedState = new Map();
+// session ids whose runtime just compacted; the next prepare consumes the
+// flag and sends only the current turn (see notePostCompaction /
+// consumePostCompactionSuppression). Flagged by the context engine's
+// compact() hook, the plugin's own in-band compaction signal.
+const postCompactionSessions = new Set();
 // sessionId -> runId -> request-local continuity projection expected at
 // llm_input. This is observability only; it never influences a request.
 const continuityAdoptionState = new Map();
@@ -2944,6 +2949,45 @@ export function noteNeverPassedSkip(state, sessionKey, passed) {
     notice: skips === 1 || skips % NEVER_PASSED_NOTICE_EVERY === 0,
     skips,
   };
+}
+
+/**
+ * Flag a session whose runtime just completed a compaction.
+ *
+ * After a compaction the next prompt's event.messages carries the
+ * post-compaction SURVIVORS and summary -- the runtime's compressed view of
+ * the conversation, not conversation history. The prepare payload contract
+ * treats event.messages as genuine history, so that one turn must not be
+ * forwarded as such: the service already holds every turn it ingested, and a
+ * sudden multi-turn "history" it has never seen in that shape can trip
+ * destructive server-side reconciliation.
+ *
+ * The signal is the plugin's own context-engine compact() hook -- in-band and
+ * per-session, unlike message-shape sniffing (gateway-version-fragile) or
+ * count heuristics. A Set, not a counter: repeated compactions before the
+ * next prepare still mean one suppression.
+ *
+ * Pure against the injected state set; exported for unit testing.
+ */
+export function notePostCompaction(state, sessionId) {
+  if (typeof sessionId !== "string" || !sessionId.trim()) return false;
+  state.add(sessionId);
+  return true;
+}
+
+/**
+ * Consume a post-compaction flag: true exactly once per flagged session.
+ *
+ * Consumed only where the prepare payload is assembled, so a prepare that
+ * exits earlier (heartbeat, excluded agent, provider filter) leaves the flag
+ * for the session's next real prepare.
+ *
+ * Pure against the injected state set; exported for unit testing.
+ */
+export function consumePostCompactionSuppression(state, sessionId) {
+  if (!state.has(sessionId)) return false;
+  state.delete(sessionId);
+  return true;
 }
 
 /**
@@ -6114,6 +6158,17 @@ export default {
         ...snapshot,
         source: "context-engine",
       }),
+      // Same identity derivation as hookSessionIdentity, so the flag written
+      // here is the one the prepare hook consumes.
+      onCompaction: (params) => {
+        const key = params?.sessionId ?? params?.sessionKey ?? "";
+        if (notePostCompaction(postCompactionSessions, key)) {
+          log.info?.(
+            `[vc] runtime compaction completed for session=${key} — the ` +
+            `next prepare will send only the current turn to VC`,
+          );
+        }
+      },
       log,
     });
     let lastCaptureErrorAt = 0;
@@ -7700,8 +7755,32 @@ export default {
       // If nothing survives, the prompt contained no admissible user content.
       // Never fall back to the raw host wrapper: that is the pollution path
       // this boundary exists to close.
+      //
+      // On the first prepare after a runtime compaction (flagged by this
+      // plugin's own context-engine compact() hook), event.messages carries
+      // the post-compaction survivors and summary -- the runtime's compressed
+      // view, not history -- so the payload sends only the current turn, the
+      // steady-state shape. The model-facing prompt is untouched: survivors
+      // stay in event.messages and the cloud's returned payload still
+      // replaces them in-place below. Genuine-history windows and the
+      // initial JSONL ingest are unaffected: the flag exists only when a
+      // compaction actually completed, and is consumed here exactly once.
+      const survivorsSuppressed = consumePostCompactionSuppression(
+        postCompactionSessions,
+        sessionId,
+      );
+      if (survivorsSuppressed) {
+        const survivorCount = Array.isArray(event.messages)
+          ? event.messages.length
+          : 0;
+        log.info?.(
+          `[vc] suppressing ${survivorCount} post-compaction survivor ` +
+          `message(s) from the VC payload — session=${sessionId}; sending ` +
+          `only the current turn`,
+        );
+      }
       let messagesWithCurrentTurn = mergeCurrentUserMessage(
-        event.messages,
+        survivorsSuppressed ? [] : event.messages,
         currentBody,
         inboundTurn,
       );
