@@ -121,7 +121,7 @@ On gateways that don't expose command registration the plugin skips these and lo
 **1. Check the plugin loaded, and which version.** On gateway startup:
 
 ```
-[vc] register() v5.5.0 — baseUrl=... convIdentity=... groupedSessions=... providers=...
+[vc] register() v... — baseUrl=... debug=... convIdentity=... groupedSessions=... agentKeys=<loaded>/<configured> providers=...
 [vc] registered 7 tools (dynamic schemas, hardcoded fallback)
 [vc] registered 5 native slash commands (vcstatus, vcmerge, vclabel, vcattach, vcreingest)
 ```
@@ -139,7 +139,12 @@ The `register()` line reports the version actually running and the conversation-
 
 Filter the gateway log for `[vc]` to see them. Useful lines when something looks wrong:
 
-- `[vc] skipping prepare —` / `[vc] skipping ingest —` — the provider filter excluded this turn. Check `providers`.
+- `[vc] skipping — <model> not in provider filter` (prepare) / `[vc] skipping ingest — <model> not in provider filter` — the provider filter excluded this turn. Check `providers`.
+- `[vc] WARN provider filter now SKIPPING` — a session that WAS passing fell off the allowlist, usually a model fallback. VC is off for it until its model returns.
+- `[vc] session=... has NEVER passed the provider filter` — repeated periodically for a session no model of which was ever in `providers`; names the model to add if the agent should be captured.
+- `[vc] provider filter NOT EVALUATED` / `[vc] WARN provider filter CANNOT EVALUATE` — the session's model cannot be resolved from the session store; after a short grace window the plugin refuses rather than proceeding unchecked.
+- `[vc] skipping prepare —` / `[vc] skipping ingest —` — the turn was excluded outright: a heartbeat, or an agent listed in `excludeAgents`.
+- `[vc:agent-keys] KEYS MISSING` — one or more `agentKeyFiles` entries failed to load; the named agents are falling back to the deployment-wide key.
 - `[vc] ingest SKIPPED — no reply text in turn` — the turn produced no assistant text to store.
 - `[vc] WARNING: ...` — configuration the plugin believes will cause trouble (see below).
 - `[vc] tool definitions refresh failed for ...` — the schema refresh failed; built-in definitions are still in use, so tools keep working.
