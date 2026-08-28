@@ -80,9 +80,21 @@ function safeSpeakerJson(speaker) {
   })[character]);
 }
 
-function escapeSpeakerMarkup(text) {
-  return text.replace(/<\/?message-speaker\b/gi, (match) =>
-    `\\u003c${match.slice(1)}`
+/**
+ * Neutralize host-attribution tag lookalikes in member-authored text.
+ *
+ * Applied at RENDER time only, on surfaces whose bytes are not locked: the
+ * in-memory history projection here and the prepared system text in the main
+ * module. Never applied before storage - stored conversation content keeps
+ * its exact source bytes. The tag set covers every block the host or this
+ * plugin emits with attribution or framing authority; a member typing any of
+ * them gets inert escaped text, so a parseable host block can only originate
+ * from the host. Idempotent: the escaped form no longer matches.
+ */
+export function escapeHostAttributionMarkup(text) {
+  return text.replace(
+    /<\/?(?:message-speaker|current-speaker-reminder|current-speaker|current-reply-target|vc-prepared-context)\b/gi,
+    (match) => `\\u003c${match.slice(1)}`,
   );
 }
 
@@ -115,12 +127,12 @@ function withSpeakerAttribution(message, speaker, isAttributed) {
   if (typeof message.content === "string") {
     projectedMessage = {
       ...message,
-      content: `${label}\n${escapeSpeakerMarkup(message.content)}`,
+      content: `${label}\n${escapeHostAttributionMarkup(message.content)}`,
     };
   } else if (Array.isArray(message.content)) {
     const content = message.content.map((part) =>
       part?.type === "text" && typeof part.text === "string"
-        ? { ...part, text: escapeSpeakerMarkup(part.text) }
+        ? { ...part, text: escapeHostAttributionMarkup(part.text) }
         : part
     );
     const textIndex = content.findIndex(
