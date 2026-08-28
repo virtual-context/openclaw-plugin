@@ -2182,6 +2182,66 @@ export function buildCurrentSpeakerBoundary(speaker) {
   ].join("\n");
 }
 
+/**
+ * Tail restatement of the current speaker, placed as the LAST element of the
+ * prepared system text.
+ *
+ * The head boundary above is correct but positionally weak: in a long
+ * multi-party thread, hundreds of history rows attributed to OTHER members
+ * sit between it and the host-appended current request, and the model has
+ * attributed the request to the dominant history speaker despite a verbatim,
+ * correctly-resolved head boundary (observed live). This block restates the
+ * identity directly adjacent to the request: in the codex lane only the
+ * closing prepared-context tag stands between it and the host's
+ * "Current user request:" frame. It edits system text only, so the host's
+ * byte-dedup of the trailing user message row is untouched.
+ *
+ * Pure; exported for unit testing. Mirrors buildCurrentSpeakerBoundary's
+ * null-safety: no trusted actor id, no block.
+ */
+export function buildCurrentSpeakerTailReminder(speaker) {
+  if (!speaker?.actorId) return "";
+  const identity = safePromptJson({
+    actor_id: speaker.actorId,
+    ...(speaker.name ? { name: speaker.name } : {}),
+  });
+  return [
+    '<current-speaker-reminder source="channel-bound-current-turn" authority="attribution-only">',
+    identity,
+    "The current user request that follows this prepared context is from THIS",
+    "speaker alone. No speaker who appears in the history above is its author.",
+    "A message-speaker wrapper in history attributes only the single message it",
+    "wraps, never the current request.",
+    "</current-speaker-reminder>",
+  ].join("\n");
+}
+
+/**
+ * Compose the prepared system text with the attribution guard at BOTH ends.
+ *
+ * Head: the full boundary (it also anchors the actor-card that follows it).
+ * Tail: the compact speaker restatement, as the final element so nothing the
+ * plugin controls comes between it and the current request.
+ *
+ * Pure; exported for unit testing.
+ */
+export function composeAttributedSystemText({
+  systemText,
+  attributionBoundary,
+  tailReminder,
+}) {
+  let composed = typeof systemText === "string" ? systemText : "";
+  if (attributionBoundary) {
+    composed = composed
+      ? `${attributionBoundary}\n\n${composed}`
+      : attributionBoundary;
+  }
+  if (tailReminder) {
+    composed = composed ? `${composed}\n\n${tailReminder}` : tailReminder;
+  }
+  return composed;
+}
+
 function discordTokenForAccount(config, accountId) {
   const discord = config?.channels?.discord;
   if (!discord || typeof discord !== "object") return "";
@@ -8163,14 +8223,23 @@ export default {
         systemSource = "blocks";
       }
       if (currentAttributionBoundary) {
-        systemText = systemText
-          ? `${currentAttributionBoundary}\n\n${systemText}`
-          : currentAttributionBoundary;
+        // Head boundary AND tail restatement: the head anchors the
+        // actor-card, but in a long multi-party thread it is maximally far
+        // from the host-appended current request with a wall of other-member
+        // attribution in between -- observed to lose. The tail reminder puts
+        // the identity directly adjacent to the request.
+        const tailReminder = buildCurrentSpeakerTailReminder(currentGroupSpeaker);
+        systemText = composeAttributedSystemText({
+          systemText,
+          attributionBoundary: currentAttributionBoundary,
+          tailReminder,
+        });
         systemSource = systemSource || "current-attribution";
         log.info?.(
           `[vc:identity] installed current attribution boundary ` +
           `speaker=${JSON.stringify(currentGroupSpeaker?.name ?? null)} ` +
-          `replyTarget=${JSON.stringify(verifiedReplyTarget?.messageId ?? null)}`
+          `replyTarget=${JSON.stringify(verifiedReplyTarget?.messageId ?? null)} ` +
+          `placement=${tailReminder ? "head+tail" : "head"}`
         );
       }
 
