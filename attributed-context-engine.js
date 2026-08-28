@@ -90,6 +90,12 @@ function safeSpeakerJson(speaker) {
  * plugin emits with attribution or framing authority; a member typing any of
  * them gets inert escaped text, so a parseable host block can only originate
  * from the host. Idempotent: the escaped form no longer matches.
+ *
+ * TAG-SET SYNC: the canonical list is the Virtual Context engine's
+ * HOST_ATTRIBUTION_TAGS (core/render_escape.py) - the engine owns content
+ * semantics. Add new tags THERE first; this regex mirrors it. The engine
+ * also emits a serialized-JSON escape form (doubled backslash) for tool
+ * results; layering this escape over either engine form is a no-op.
  */
 export function escapeHostAttributionMarkup(text) {
   return text.replace(
