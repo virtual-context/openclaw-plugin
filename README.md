@@ -153,7 +153,7 @@ Filter the gateway log for `[vc]` to see them. Useful lines when something looks
 
 Set `debug: true` for verbose `[vc:debug]` and `[vc:wire]` request/response logging. Disable it in production.
 
-**Startup warnings.** The plugin warns when `agents.defaults.contextPruning.mode` is not `"off"`, when `agents.defaults.contextTokens` is low, or when `session.resetByType.group.idleMinutes` is short enough that OpenClaw would reset a session and discard history before VC records it.
+**Startup warnings.** The plugin warns when `agents.defaults.contextPruning.mode` is not `"off"`, when `agents.defaults.contextTokens` is inflated past any real model context window (oversized budgets disable the gateway's compaction triggers, so native harness limits fire first and reset threads instead of compacting — early compaction costs VC nothing, since every turn is ingested as it completes), or when `session.resetByType.group.idleMinutes` is short enough that OpenClaw would reset a session and discard history before VC records it.
 
 ## Provider Filtering
 

@@ -3069,6 +3069,35 @@ export function consumePostCompactionSuppression(state, sessionId) {
 }
 
 /**
+ * Startup advice for agents.defaults.contextTokens, inverted from the
+ * original warning.
+ *
+ * The old warning recommended 2,000,000+ whenever the value was below one
+ * million. That advice predates per-turn ingest and caused real harm: an
+ * inflated context budget pushes the gateway's compaction triggers so far
+ * past any real model window that a native harness limit always fires
+ * first -- observed live as a self-sustaining fresh-thread reset loop.
+ * VC loses nothing to early compaction: every turn is ingested at
+ * agent_end, and the host's history limiter always preserves compaction
+ * summaries. A modest, truthful budget is the SAFE configuration.
+ *
+ * Pure function; returns the warning text or null. Exported for unit
+ * testing.
+ */
+export function contextTokensWarning(contextTokens) {
+  if (typeof contextTokens !== "number") return null;
+  if (contextTokens <= 2000000) return null;
+  return (
+    `[vc] WARNING: agents.defaults.contextTokens is ${contextTokens} — ` +
+    `larger than any real model context window. Inflated budgets disable ` +
+    `the gateway's compaction triggers, so a native harness limit fires ` +
+    `first and resets the thread instead of compacting. Set it at or ` +
+    `below the largest real model window in use; early compaction costs ` +
+    `VC nothing (every turn is already ingested).`
+  );
+}
+
+/**
  * Derive the VC conversation identity for a session.
  *
  * Durable chat scopes get a stable, human-readable conversation id (`sk:` +
@@ -6922,10 +6951,8 @@ export default {
       log.warn?.(`[vc] WARNING: agents.defaults.contextPruning.mode is "${pruningMode}" — should be "off". OpenClaw may prune messages before VC sees them. Set contextPruning.mode to "off" and let VC manage the context window.`);
     }
 
-    const contextTokens = defaults.contextTokens;
-    if (typeof contextTokens === "number" && contextTokens < 1000000) {
-      log.warn?.(`[vc] WARNING: agents.defaults.contextTokens is ${contextTokens} — recommend 2000000+. Low values cause early compaction before VC can manage the context.`);
-    }
+    const contextTokensAdvice = contextTokensWarning(defaults.contextTokens);
+    if (contextTokensAdvice) log.warn?.(contextTokensAdvice);
 
     const groupIdleMinutes = ocConfig.session?.resetByType?.group?.idleMinutes;
     if (typeof groupIdleMinutes === "number" && groupIdleMinutes < 2880) {
