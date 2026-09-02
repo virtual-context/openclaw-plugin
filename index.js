@@ -2290,6 +2290,99 @@ function trustedDiscordChannelId(sessionKey, conversationId) {
   return conversationMatch?.[1] ?? "";
 }
 
+/**
+ * Detect the host's model-fallback transition notices.
+ *
+ * The gateway emits exactly two forms, both with this prefix: the fallback
+ * notice and its "cleared" sibling. Prefix-match after trim so an agent
+ * reply that merely MENTIONS the phrase mid-sentence is never intercepted.
+ * Pure; exported for unit testing.
+ */
+export function isModelFallbackNotice(content) {
+  return typeof content === "string"
+    && content.trimStart().startsWith("↪️ Model Fallback");
+}
+
+/**
+ * Decide how an outbound model-fallback notice is routed.
+ *
+ * The operator wants to SEE transition notices without members seeing
+ * plumbing in their channels. Cancel-and-DM only when the DM leg is
+ * actually dispatchable (configured operator snowflake AND a bot token);
+ * otherwise pass the notice through untouched -- losing it entirely would
+ * be worse than posting it in-channel.
+ *
+ * Returns null for pass-through, {cancel, dm[, reason]} otherwise.
+ * Pure; exported for unit testing.
+ */
+export function routeFallbackNotice({ content, operatorUserId, token }) {
+  if (!isModelFallbackNotice(content)) return null;
+  const userId = discordSnowflake(operatorUserId);
+  if (!userId) return null;
+  if (typeof token !== "string" || !token) {
+    return { cancel: false, dm: false, reason: "no-token" };
+  }
+  return { cancel: true, dm: true };
+}
+
+/** First usable bot token across configured Discord accounts. */
+function anyDiscordToken(config) {
+  const discord = config?.channels?.discord;
+  if (!discord || typeof discord !== "object") return "";
+  const direct = cleanInboundField(discord.token, 1024);
+  if (direct) return direct;
+  const accounts = discord.accounts && typeof discord.accounts === "object"
+    ? discord.accounts
+    : {};
+  for (const account of Object.values(accounts)) {
+    const token = cleanInboundField(account?.token, 1024);
+    if (token) return token;
+  }
+  return "";
+}
+
+// operatorUserId -> DM channel id, resolved once per process.
+const operatorDmChannelCache = new Map();
+
+/** Fire-and-forget DM to the operator via the plugin's own Discord REST. */
+async function sendOperatorDm(userId, text, token, log, timeoutMs = 5000) {
+  const headers = {
+    Authorization: `Bot ${token}`,
+    "Content-Type": "application/json",
+    "User-Agent": `VirtualContextOpenClawPlugin/${PLUGIN_VERSION}`,
+  };
+  let channelId = operatorDmChannelCache.get(userId);
+  if (!channelId) {
+    const open = await fetch("https://discord.com/api/v10/users/@me/channels", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ recipient_id: userId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!open.ok) {
+      log?.warn?.(`[vc:notice] operator DM channel open failed status=${open.status}`);
+      return false;
+    }
+    channelId = (await open.json())?.id;
+    if (!channelId) return false;
+    operatorDmChannelCache.set(userId, channelId);
+  }
+  const send = await fetch(
+    `https://discord.com/api/v10/channels/${channelId}/messages`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ content: text }),
+      signal: AbortSignal.timeout(timeoutMs),
+    },
+  );
+  if (!send.ok) {
+    log?.warn?.(`[vc:notice] operator DM send failed status=${send.status}`);
+    return false;
+  }
+  return true;
+}
+
 async function discordGetMessage(
   channel,
   messageId,
@@ -6243,6 +6336,9 @@ export default {
     const agentExclusion = buildExcludedAgentSet(cfg.excludeAgents);
     const excludedAgents = agentExclusion.excluded;
     const debug = cfg.debug === true;
+    // Operator DM target for rerouted model-fallback notices; absent = the
+    // notices stay in-channel (host default behavior).
+    const operatorNoticeUserId = cleanInboundField(cfg.operatorNoticeUserId, 32);
     const modelCallCapture = normalizeModelCallCaptureConfig(cfg.modelCallCapture);
     // Per-agent keys, read from disk so no key material lives in openclaw.json.
     // An agent without an entry keeps using the deployment-wide key above.
@@ -8872,6 +8968,40 @@ export default {
       // "outbound send ok" line exists only in the Telegram adapter.
       if (outboundIdCfg.enabled) outboundIdStats.sendingHookEvents += 1;
       if (!event?.content) return;
+      // Model-fallback transition notices are operator plumbing, not member
+      // content: reroute them to the configured operator's DM and cancel the
+      // channel delivery. Fail-safe by construction (routeFallbackNotice):
+      // without an operator id or a bot token the notice passes through.
+      if (operatorNoticeUserId) {
+        const decision = routeFallbackNotice({
+          content: event.content,
+          operatorUserId: operatorNoticeUserId,
+          token: anyDiscordToken(ocConfig),
+        });
+        if (decision?.dm) {
+          const text = event.content;
+          void sendOperatorDm(
+            discordSnowflake(operatorNoticeUserId),
+            text,
+            anyDiscordToken(ocConfig),
+            log,
+          ).then((ok) => {
+            log.info?.(
+              `[vc:notice] model-fallback notice rerouted to operator DM ` +
+              `user=${operatorNoticeUserId} delivered=${ok}; channel delivery cancelled`,
+            );
+          }).catch((error) => {
+            log.warn?.(`[vc:notice] operator DM dispatch failed: ${error}`);
+          });
+        }
+        if (decision?.cancel) return { cancel: true };
+        if (decision?.reason === "no-token") {
+          log.warn?.(
+            `[vc:notice] operatorNoticeUserId set but no Discord bot token ` +
+            `found — fallback notice left in-channel`,
+          );
+        }
+      }
       VC_COMMENT_RE.lastIndex = 0;
       const stripped = event.content.replace(VC_COMMENT_RE, "").trim();
       if (stripped !== event.content) {

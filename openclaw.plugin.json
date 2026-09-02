@@ -41,6 +41,10 @@
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."
       },
+      "operatorNoticeUserId": {
+        "type": "string",
+        "description": "Discord user id (snowflake) that receives the host's model-fallback transition notices as a DM instead of the notices appearing in channels. Omitted = notices keep the host's default in-channel behavior. Requires a configured Discord bot token; without one the notice stays in-channel rather than being lost."
+      },
       "modelCallCapture": {
         "type": "object",
         "description": "Optional bounded, local capture of complete OpenClaw llm_input/llm_output hook payloads. Captures contain conversation content and are written mode 0600.",

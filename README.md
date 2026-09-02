@@ -64,6 +64,7 @@ In `openclaw.json`:
 | `convIdentity` | `"session"` \| `"stable"` | `"session"` | How VC conversations are keyed. **See below — the default is legacy behavior.** |
 | `conversationGroups` | object | none | Map of group session key to member session keys, so several chat scopes share one VC conversation. Requires `convIdentity: "stable"`. |
 | `debug` | boolean | `false` | Enable verbose logging of REST API calls and payloads |
+| `operatorNoticeUserId` | string | none | Discord user id that receives model-fallback transition notices as a DM; the in-channel copy is cancelled. Omitted = host default (in-channel). Fails safe: without a bot token the notice stays in-channel. |
 | `modelCallCapture` | object | disabled | Store complete, untruncated `llm_input` and `llm_output` hook payloads in a bounded local gzip log. Defaults to 512 MiB, 2,000 files, and 7 days under `~/.openclaw/logs/virtual-context/model-calls`. |
 
 ### Conversation identity — read this before going to production
