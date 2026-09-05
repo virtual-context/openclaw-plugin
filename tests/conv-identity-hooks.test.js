@@ -191,6 +191,7 @@ async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
   const mod = await import("../index.js");
   const handlers = new Map();
   const toolFactories = [];
+  const commands = new Map();
   const log = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -205,11 +206,12 @@ async function registerPlugin(home, pluginConfig = {}, openClawConfig = {}) {
     },
     config: openClawConfig,
     registerTool: vi.fn((factory) => toolFactories.push(factory)),
+    registerCommand: vi.fn((command) => commands.set(command.name, command)),
     on: vi.fn((name, handler) => handlers.set(name, handler)),
   };
 
   mod.default.register(api);
-  return { handlers, toolFactories, log };
+  return { handlers, toolFactories, commands, log };
 }
 
 function prepareEvent(prompt = "hello") {
@@ -578,5 +580,325 @@ describe("convIdentity hook routing", () => {
     const warnings = log.warn.mock.calls.map(([message]) => message).join("\n");
     expect(warnings).toContain("provider filter now SKIPPING");
     expect(warnings).not.toContain("ephemeral conv-id fallback");
+  });
+});
+
+// Synthetic server/account identifiers: do not substitute deployment fixtures.
+describe("BUG-001 server memory routing", () => {
+  const server = "710000000000000001";
+  const channel = "720000000000000001";
+  const other = "720000000000000002";
+  const channelKey = (id) => `agent:guide:discord:channel:${id}`;
+  const serverConv = `sk:agent:guide:discord:guild:${server}`;
+  const serverConfig = {
+    bindings: [{ agentId: "guide", match: { channel: "discord", accountId: "primary" } }],
+    channels: { discord: { accounts: { primary: {
+      groupPolicy: "allowlist", guilds: { [server]: {}, "710000000000000002": {} },
+    } } } },
+  };
+  function inbound(handlers, id, guildId = server) {
+    handlers.get("message_received")({ content: "Synthetic message", metadata: {
+      provider: "discord", guildId, originatingTo: `channel:${id}`,
+    } }, { channelId: "discord", accountId: "primary", conversationId: `channel:${id}` });
+  }
+  it("routes tools from two channels to one server and forwards actual delivery channels", async () => {
+    const fetchSpy = installFetch();
+    const { handlers, toolFactories } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, serverConfig);
+    for (const id of [channel, other]) {
+      inbound(handlers, id);
+      const tool = toolFactories[0]({ sessionId: `session-${id}`, sessionKey: channelKey(id),
+        messageChannel: "discord", agentAccountId: "primary", deliveryContext: { channel: "discord", to: `channel:${id}` } });
+      await tool.execute(`tool-${id}`, { tag: "synthetic" });
+    }
+    const requests = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/tools/vc_expand_topic"));
+    expect(requests).toHaveLength(2);
+    for (const [index, [url]] of requests.entries()) {
+      expect(new URL(url).searchParams.get("vcconv")).toBe(serverConv);
+      expect(new URL(url).searchParams.get("vcchannel")).toBe([channel, other][index]);
+    }
+  });
+  it("keeps prepare, exact completion, outbound capture and commands on the same route", async () => {
+    const home = makeHome();
+    const fetchSpy = vi.fn(async (url, options = {}) => {
+      const href = String(url);
+      const body = JSON.parse(options.body ?? "{}");
+      let payload;
+      if (href.includes("/context/capabilities")) payload = { exact_source_admission_version: 2 };
+      else if (href.includes("__vc_exact_source_ingest_v2")) payload = {
+        conversation_id: serverConv, status: "accepted", canonical_persisted: true,
+        source_message_id: body.source_message_id,
+      };
+      else if (body.messages?.some(m => contentText(m.content) === "VCSTATUS")) payload = { vc_command: "status", message: "ok" };
+      else payload = { conversation_id: serverConv, body: { messages: body.messages ?? [] }, metadata: {
+        exact_source_admission_version: 2, exact_source_admission: exactAdmission(serverConv),
+      } };
+      return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    globalThis.fetch = fetchSpy;
+    const { handlers, commands, log } = await registerPlugin(home, {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" }, outboundIdCapture: { mode: "carry" },
+    }, serverConfig);
+    const runs = [];
+    for (const [i, id] of [channel, other].entries()) {
+      const messageId = `74000000000000000${i + 1}`;
+      const sender = `73000000000000000${i + 1}`;
+      const content = `Synthetic channel question ${i + 1}`;
+      const timestamp = discordSnowflakeTimestamp(messageId);
+      const run = { sessionId: [SID1, SID2][i], sessionKey: channelKey(id), runId: `synthetic-run-${i + 1}` };
+      runs.push(run);
+      handlers.get("message_received")({ content, timestamp, messageId, senderId: sender, metadata: {
+        provider: "discord", originatingChannel: "discord", originatingTo: `channel:${id}`,
+        messageId, senderId: sender, senderName: `Participant ${i + 1}`, guildId: server,
+      } }, { channelId: "discord", accountId: "primary", conversationId: `channel:${id}`, messageId, senderId: sender });
+      handlers.get("before_dispatch")({ content, body: content, channel: "discord", sessionKey: run.sessionKey,
+        senderId: sender, timestamp,
+      }, { channelId: "discord", accountId: "primary", conversationId: `channel:${id}`, sessionKey: run.sessionKey, senderId: sender });
+      await handlers.get("before_agent_reply")({ cleanedBody: content }, run);
+      const prompt = `Conversation info (untrusted metadata):\n\`\`\`json\n${JSON.stringify({
+        message_id: messageId, chat_id: `channel:${id}`, sender: { id: sender, name: `Participant ${i + 1}` },
+        group_channel: "synthetic-room",
+      })}\n\`\`\`\n\n${content}`;
+      await handlers.get("before_prompt_build")({ prompt, messages: [] }, run);
+      await handlers.get("message_sent")({ success: true, sessionKey: run.sessionKey,
+        messageId: `75000000000000000${i + 1}`, content: `Synthetic reply ${i + 1}`,
+      }, { channelId: "discord", accountId: "primary", conversationId: `channel:${id}`, sessionKey: run.sessionKey });
+    }
+    const prepares = fetchSpy.mock.calls.filter(([url]) => String(url).includes("__vc_exact_source_prepare_v2"));
+    expect(prepares, log.warn.mock.calls.flat().join("\n")).toHaveLength(2);
+    for (const [i, [url, options]] of prepares.entries()) {
+      expect(new URL(url).searchParams.get("vcconv")).toBe(serverConv);
+      expect(new URL(url).searchParams.get("vcchannel")).toBe([channel, other][i]);
+      expect(JSON.parse(options.body).origin_channel_id).toBe([channel, other][i]);
+    }
+    // A later contradictory observation cannot move a previously prepared
+    // invocation or its exact-source admission token into another scope.
+    inbound(handlers, channel, "710000000000000002");
+    for (const [i, run] of runs.entries()) {
+      await handlers.get("agent_end")({ success: true, runId: run.runId, messages: [] }, run);
+      await handlers.get("llm_output")({ runId: run.runId, sessionId: run.sessionId,
+        assistantTexts: [`Synthetic reply ${i + 1}`], lastAssistant: { role: "assistant", content: `Synthetic reply ${i + 1}` },
+      }, run);
+    }
+    const ingests = fetchSpy.mock.calls.filter(([url]) => String(url).includes("__vc_exact_source_ingest_v2"));
+    expect(ingests, log.error.mock.calls.flat().join("\n")).toHaveLength(2);
+    for (const [i, [url, options]] of ingests.entries()) {
+      expect(new URL(url).searchParams.get("vcconv")).toBe(serverConv);
+      const payload = JSON.parse(options.body);
+      expect(payload.origin_channel_id).toBe([channel, other][i]);
+      expect(payload.exact_source_admission.owner_conversation_id).toBe(serverConv);
+      expect(payload._vc_agent_outbound_ids.some(item => item.channel_id === [channel, other][i])).toBe(true);
+    }
+    expect(await commands.get("vcstatus").handler({ sessionId: SID2, sessionKey: channelKey(other),
+      channelId: "discord", accountId: "primary", conversationId: `channel:${other}` })).toHaveProperty("text");
+    const command = fetchSpy.mock.calls.findLast(([url]) => String(url).includes("/context/prepare"));
+    expect(new URL(command[0]).searchParams.get("vcconv")).toBe(serverConv);
+    expect(new URL(command[0]).searchParams.get("vcchannel")).toBe(other);
+    await commands.get("vcreingest").handler({ sessionId: SID2, sessionKey: channelKey(other) });
+    expect(readTracker(home)[SID2]).toBeUndefined();
+    expect(readTracker(home)[serverConv]).toBeUndefined();
+  });
+
+  it("uses native slash command fields and resets only the native session tracker", async () => {
+    const home = makeHome();
+    const fetchSpy = installFetch();
+    const { handlers, commands } = await registerPlugin(home, {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, serverConfig);
+    inbound(handlers, channel);
+    const sessionDir = join(home, ".openclaw", "agents", "guide", "sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(join(sessionDir, "sessions.json"), JSON.stringify({
+      [channelKey(channel)]: { sessionId: SID1 },
+    }));
+    writeFileSync(trackerPath(home), JSON.stringify({
+      [SID1]: { lastIngestedTs: 10 }, [SID2]: { lastIngestedTs: 20 },
+    }));
+    const nativeContext = { channel: "discord", channelId: channel, accountId: "primary",
+      sessionKey: channelKey(channel), from: `discord:channel:${channel}`, to: "slash:730000000000000001" };
+    await commands.get("vcstatus").handler(nativeContext);
+    const request = fetchSpy.mock.calls.find(([url]) => String(url).includes("/context/prepare"));
+    expect(new URL(request[0]).searchParams.get("vcconv")).toBe(serverConv);
+    expect(new URL(request[0]).searchParams.get("vcchannel")).toBe(channel);
+    const result = await commands.get("vcreingest").handler(nativeContext);
+    expect(result.text).toContain(SID1);
+    expect(readTracker(home)[SID1]).toBeUndefined();
+    expect(readTracker(home)[SID2]).toEqual({ lastIngestedTs: 20 });
+  });
+
+  it("keeps queued old completions on their original destination after server policy activation", async () => {
+    const home = makeHome();
+    const oldConv = `sk:${channelKey(channel)}`;
+    const sourceMessage = "740000000000000001";
+    const hash = value => createHash("sha256").update(value, "utf8").digest("hex");
+    const vcKeyHash = hash("k");
+    const deployment = hash(`https://api.example.com\0${vcKeyHash}`);
+    const outboxKey = hash(`${deployment}\0${oldConv}\0${sourceMessage}`);
+    const payload = { user_message: "Synthetic queued question", assistant_message: "Synthetic queued answer",
+      source_message_id: sourceMessage, origin_channel_id: channel, exact_source_admission: exactAdmission(oldConv) };
+    const record = { version: 2, deployment_id: deployment, base_url: "https://api.example.com", vc_key_hash: vcKeyHash,
+      key: outboxKey, conv_id: oldConv, source_message_id: sourceMessage, enqueue_ordinal: 1,
+      enqueued_at: new Date().toISOString(), payload, fingerprint: hash(JSON.stringify({ conv_id: oldConv, payload })) };
+    const directory = join(home, ".openclaw", "state", "virtual-context", "completion-outbox", deployment);
+    mkdirSync(directory, { recursive: true });
+    const queuedPath = join(directory, `${outboxKey}.json`);
+    writeFileSync(queuedPath, JSON.stringify(record));
+    const fetchSpy = vi.fn(async (url) => {
+      const result = String(url).includes("/capabilities") ? { exact_source_admission_version: 2 }
+        : { status: "accepted", canonical_persisted: true, source_message_id: sourceMessage };
+      return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    globalThis.fetch = fetchSpy;
+    await registerPlugin(home, { convIdentity: "stable", discordMemoryScope: { guide: "server" } }, serverConfig);
+    await vi.waitFor(() => expect(existsSync(queuedPath)).toBe(false));
+    const delivered = fetchSpy.mock.calls.find(([url]) => String(url).includes("__vc_exact_source_ingest_v2"));
+    expect(new URL(delivered[0]).searchParams.get("vcconv")).toBe(oldConv);
+    expect(JSON.parse(delivered[1].body)).toEqual(payload);
+  });
+
+  it("resolves cold outbound membership through the same authenticated route lookup", async () => {
+    const fetchSpy = vi.fn(async (url, options = {}) => {
+      if (String(url).startsWith("https://discord.com/")) {
+        expect(options.headers.Authorization).toBe("Bot synthetic-token");
+        return new Response(JSON.stringify({ id: channel, guild_id: server }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ result: "ok" }), { status: 200 });
+    });
+    globalThis.fetch = fetchSpy;
+    const nativeConfig = structuredClone(serverConfig);
+    nativeConfig.channels.discord.accounts.primary.token = "synthetic-token";
+    const { handlers, toolFactories, log } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" }, outboundIdCapture: { mode: "observe" },
+    }, nativeConfig);
+    await handlers.get("message_sent")({ success: true, sessionKey: channelKey(channel),
+      messageId: "750000000000000001", content: "Synthetic reply" }, {
+      channelId: "discord", accountId: "primary", conversationId: `channel:${channel}`, sessionKey: channelKey(channel),
+    });
+    await toolFactories[0]({ sessionId: SID1, sessionKey: channelKey(channel), messageChannel: "discord",
+      agentAccountId: "primary", deliveryContext: { to: `channel:${channel}` } }).execute("tool", {});
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).startsWith("https://discord.com/"))).toHaveLength(1);
+    const tool = fetchSpy.mock.calls.find(([url]) => String(url).includes("/tools/vc_expand_topic"));
+    expect(new URL(tool[0]).searchParams.get("vcconv")).toBe(serverConv);
+    expect(log.info.mock.calls.flat().join("\n")).toContain("witnessed=1");
+  });
+
+  it("freezes tool credentials and routing context together", async () => {
+    const home = makeHome();
+    const otherKey = `vc-${"b".repeat(40)}`;
+    const keyFile = join(home, "synthetic-secondary.key");
+    writeFileSync(keyFile, otherKey);
+    const fetchSpy = installFetch();
+    const { handlers, toolFactories } = await registerPlugin(home, {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" }, agentKeyFiles: { secondary: keyFile },
+    }, serverConfig);
+    inbound(handlers, channel);
+    const context = { sessionId: SID1, sessionKey: channelKey(channel), messageChannel: "discord",
+      agentAccountId: "primary", deliveryContext: { to: `channel:${channel}` } };
+    const tool = toolFactories[0](context);
+    context.sessionKey = `agent:secondary:discord:channel:${other}`;
+    context.sessionId = SID2;
+    context.deliveryContext.to = `channel:${other}`;
+    await tool.execute("tool", {});
+    const request = fetchSpy.mock.calls.find(([url]) => String(url).includes("/tools/vc_expand_topic"));
+    expect(new URL(request[0]).searchParams.get("vcconv")).toBe(serverConv);
+    expect(new URL(request[0]).searchParams.get("vckey")).toBe("k");
+    expect(new URL(request[0]).searchParams.get("vcchannel")).toBe(channel);
+  });
+
+  it("keeps legacy prepare URLs and main-session Discord DM access unchanged", async () => {
+    const fetchSpy = installFetch();
+    const { handlers, commands, toolFactories } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, serverConfig);
+    for (const sessionKey of ["agent:guide:main", "agent:guide:discord:direct:730000000000000001", "agent:other:telegram:direct:42"]) {
+      const context = { sessionId: SID1, sessionKey, runId: `legacy-${sessionKey}`, agentId: sessionKey.split(":")[1],
+        messageChannel: sessionKey.includes("telegram") ? "telegram" : "discord", channelId: sessionKey.includes("telegram") ? "telegram" : "discord" };
+      await handlers.get("before_prompt_build")(prepareEvent("hello"), context);
+      await toolFactories[0](context).execute("legacy", {});
+    }
+    // The actual native command shape uses a physical channelId.
+    await commands.get("vcstatus").handler({ sessionId: SID2, sessionKey: `agent:other:discord:channel:${channel}`,
+      channel: "discord", channelId: channel, accountId: "primary" });
+    const prepares = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/context/prepare"));
+    expect(prepares).toHaveLength(4);
+    expect(prepares.every(([url]) => !new URL(url).searchParams.has("vcchannel"))).toBe(true);
+    const tools = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/tools/vc_expand_topic"));
+    expect(tools).toHaveLength(3);
+    expect(new URL(tools[0][0]).searchParams.get("vcconv")).toBe("sk:agent:guide:main");
+  });
+
+  it("keeps the normalized outbound account when the native event owns it", async () => {
+    installFetch();
+    const nativeConfig = structuredClone(serverConfig);
+    nativeConfig.bindings.push({ agentId: "guide", match: { channel: "discord", accountId: "secondary" } });
+    nativeConfig.channels.discord.accounts.secondary = structuredClone(nativeConfig.channels.discord.accounts.primary);
+    const { handlers, log } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" }, outboundIdCapture: { mode: "observe" },
+    }, nativeConfig);
+    inbound(handlers, channel);
+    await handlers.get("message_sent")({ success: true, sessionKey: channelKey(channel), accountId: "primary",
+      messageId: "750000000000000001", content: "Synthetic reply" }, {
+      channelId: "discord", conversationId: `channel:${channel}`, sessionKey: channelKey(channel),
+    });
+    expect(log.info.mock.calls.flat().join("\n")).toContain("witnessed=1");
+    expect(log.warn.mock.calls.flat().join("\n")).not.toContain("account_unknown");
+  });
+
+  it("preserves the exact prepare URL for a Discord agent outside the server policy", async () => {
+    const fetchSpy = installFetch();
+    const nativeConfig = structuredClone(serverConfig);
+    nativeConfig.bindings.push({ agentId: "secondary", match: { channel: "discord", accountId: "primary" } });
+    const { handlers } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, nativeConfig);
+    const nativeKey = `agent:secondary:discord:channel:${channel}`;
+    const messageId = "740000000000000001";
+    const senderId = "730000000000000001";
+    const content = "Synthetic legacy channel question";
+    const timestamp = discordSnowflakeTimestamp(messageId);
+    const run = { sessionId: SID1, sessionKey: nativeKey, runId: "legacy-channel-run", agentId: "secondary",
+      messageProvider: "discord", channelId: channel, accountId: "primary" };
+    handlers.get("message_received")({ content, timestamp, messageId, senderId, metadata: {
+      provider: "discord", guildId: server, originatingTo: `channel:${channel}`, messageId, senderId,
+    } }, { channelId: "discord", accountId: "primary", conversationId: `channel:${channel}`, messageId, senderId });
+    handlers.get("before_dispatch")({ content, body: content, channel: "discord", sessionKey: nativeKey, senderId, timestamp }, {
+      channelId: "discord", accountId: "primary", conversationId: `channel:${channel}`, sessionKey: nativeKey, senderId,
+    });
+    await handlers.get("before_agent_reply")({ cleanedBody: content }, run);
+    const prompt = `Conversation info (untrusted metadata):\n\`\`\`json\n${JSON.stringify({
+      message_id: messageId, chat_id: `channel:${channel}`, sender: { id: senderId, name: "Synthetic participant" },
+      group_channel: "synthetic-room",
+    })}\n\`\`\`\n\n${content}`;
+    await handlers.get("before_prompt_build")({ prompt, messages: [] }, run);
+    const prepares = fetchSpy.mock.calls.filter(([url]) => String(url).includes("__vc_exact_source_prepare_v2"));
+    expect(prepares).toHaveLength(1);
+    const url = new URL(prepares[0][0]);
+    expect(url.searchParams.get("vcconv")).toBe(`sk:${nativeKey}`);
+    expect(url.searchParams.has("vcchannel")).toBe(false);
+    expect(JSON.parse(prepares[0][1].body).origin_channel_id).toBe(channel);
+  });
+
+  it("does not interrupt inbound processing when native metadata is absent", async () => {
+    installFetch();
+    const { handlers } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, serverConfig);
+    expect(() => handlers.get("message_received")({ content: "Synthetic incomplete event" }, {
+      channelId: "discord", accountId: "primary", conversationId: `channel:${channel}`,
+    })).not.toThrow();
+  });
+
+  it("bypasses unresolved server memory instead of preparing a channel conversation", async () => {
+    const fetchSpy = installFetch();
+    const { handlers, toolFactories, log } = await registerPlugin(makeHome(), {
+      convIdentity: "stable", discordMemoryScope: { guide: "server" },
+    }, serverConfig);
+    const run = { sessionId: SID1, sessionKey: channelKey(channel), runId: "scope-unavailable" };
+    await handlers.get("before_prompt_build")(prepareEvent("hello"), run);
+    const tool = toolFactories[0](run);
+    expect((await tool.execute("missing", {})).content[0].text).toContain("memory scope unavailable");
+    expect(fetchSpy.mock.calls.filter(([url]) => /context\/prepare|tools\/vc_/.test(String(url)))).toHaveLength(0);
+    expect(log.warn.mock.calls.flat().join("\n")).toContain("membership_unknown");
   });
 });

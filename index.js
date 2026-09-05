@@ -35,6 +35,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createServerMemoryScope, memorySourceChannel } from "./server-memory-scope.js";
 import {
   captureModelCallEvent,
   normalizeModelCallCaptureConfig,
@@ -48,7 +49,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.11.0";
+const PLUGIN_VERSION = "5.11.1";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -2805,6 +2806,24 @@ function readFullSessionJSONL(sessionKey, sessionId, log) {
   }
 }
 
+// Native Discord slash commands provide sessionKey but omit sessionId. The
+// local ingest tracker is keyed by the native UUID, never the memory scope.
+function resolveCommandSessionId(ctx) {
+  const direct = cleanInboundField(ctx?.sessionId, 256);
+  if (direct) return direct;
+  const sessionKey = cleanInboundField(ctx?.sessionKey, 1024);
+  const agentId = sessionAgentScopeId(sessionKey);
+  if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) return "";
+  try {
+    const path = join(homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json");
+    const store = JSON.parse(readFileSync(path, "utf-8"));
+    return cleanInboundField(store[sessionKey]?.sessionId, 256);
+  } catch {
+    return "";
+  }
+}
+
+
 /**
  * Resolve the current provider/model for a session by reading sessions.json.
  * Returns "provider/model" lowercase, or null if unknown.
@@ -2814,6 +2833,7 @@ function readFullSessionJSONL(sessionKey, sessionId, log) {
  * This is fragile — the file format could change between OpenClaw versions.
  * The proper fix is OpenClaw exposing provider/model in the hook context.
  */
+
 function resolveSessionModel(sessionKey) {
   try {
     // Extract agentId from sessionKey: "agent:<agentId>:..."
@@ -6419,6 +6439,7 @@ export default {
       forgetNativeReplyResult(sessionId, runId);
       forgetModelOutput(sessionId, runId);
       forgetInboundTurn(runId);
+      forgetMemoryRoute(sessionId, runId);
     }
 
     function rememberExactGroupEnd(sessionId, runId, sessionKey) {
@@ -6465,7 +6486,6 @@ export default {
       }
       const exactAdmission = requiresExactDiscordAdmission(
         state.sessionKey,
-        sessionId,
       );
       if (exactAdmission && (!attestation || typeof attestation !== "object")) {
         handoffFailures.push("source_attestation");
@@ -6504,7 +6524,12 @@ export default {
         return false;
       }
 
-      const identity = selectConvId(state.sessionKey, sessionId);
+      const identity = runMemoryRoute(state.sessionKey, sessionId, runId, {}, true);
+      if (!identity.available) {
+        log.error?.(`[vc:scope] ingest skipped: memory scope unavailable reason=${identity.reason}`);
+        releaseExactGroupInvocation(sessionId, runId);
+        return false;
+      }
       const ingestPayload = {
         assistant_message: assistantMessage,
         user_message: userMessage,
@@ -6596,10 +6621,10 @@ export default {
     }
 
     let fallbackWarnCount = 0;
-    function selectConvId(sessionKey, sessionId) {
+    function selectLegacyConvId(sessionKey, sessionId) {
       if (!stableMode) return { convId: sessionId, isStable: false };
       const identity = deriveConvIdentity(sessionKey, sessionId, groupIndex);
-      if (identity.fallbackReason === "missing_session_key" || identity.fallbackReason === "unparseable_session_key") {
+      if (sessionId !== null && (identity.fallbackReason === "missing_session_key" || identity.fallbackReason === "unparseable_session_key")) {
         fallbackWarnCount++;
         (log.warn ?? log.info)?.(
           `[vc] WARN ephemeral conv-id fallback (${identity.fallbackReason}) — ` +
@@ -6611,9 +6636,63 @@ export default {
       return identity;
     }
 
-    function requiresExactDiscordAdmission(sessionKey, sessionId) {
-      return requiresExactDiscordAttestation(sessionKey)
-        && selectConvId(sessionKey, sessionId).isStable;
+    const memoryScope = createServerMemoryScope({
+      policies: stableMode ? cfg.discordMemoryScope : undefined,
+      config: ocConfig, groupIndex, legacyIdentity: selectLegacyConvId, log,
+      lookupChannel: async (accountId, channelId) => {
+        const token = discordTokenForAccount(ocConfig, accountId);
+        if (!token) return null;
+        const response = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+          headers: { Authorization: `Bot ${token}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        return response.ok ? response.json() : null;
+      },
+    });
+    if (!stableMode && cfg.discordMemoryScope !== undefined) {
+      log.warn?.('[vc:scope] discordMemoryScope requires convIdentity="stable" — config ignored');
+    }
+    // Routes belong to an invocation, not the most recently observed channel.
+    // The completion outbox persists its own original conv_id and never calls
+    // this resolver during replay.
+    const invocationMemoryRoutes = new Map();
+    function selectConvId(sessionKey, sessionId, ctx = {}) {
+      return memoryScope.peek(sessionKey, sessionId, ctx);
+    }
+    function runMemoryRoute(sessionKey, sessionId, runId, ctx = {}, requireFrozen = false) {
+      const entry = invocationMemoryRoutes.get(invocationStateKey(sessionId, runId));
+      if (entry) return entry.sessionKey === sessionKey ? entry.route
+        : Object.freeze({ available: false, convId: null, reason: "invocation_route_conflict" });
+      const current = selectConvId(sessionKey, sessionId, ctx);
+      if (requireFrozen && current.policyRevision) return Object.freeze({
+        available: false, convId: null, reason: "invocation_route_missing",
+      });
+      return current;
+    }
+    async function resolveRunMemoryRoute(sessionKey, sessionId, runId, ctx = {}) {
+      const key = invocationStateKey(sessionId, runId);
+      const prior = key ? invocationMemoryRoutes.get(key) : null;
+      if (prior) return prior.sessionKey === sessionKey ? prior.route
+        : Object.freeze({ available: false, convId: null, reason: "invocation_route_conflict" });
+      const route = await memoryScope.resolve(sessionKey, sessionId, ctx);
+      if (key) {
+        const winner = invocationMemoryRoutes.get(key);
+        if (winner) return winner.sessionKey === sessionKey ? winner.route
+          : Object.freeze({ available: false, convId: null, reason: "invocation_route_conflict" });
+        invocationMemoryRoutes.set(key, { sessionKey, route });
+        while (invocationMemoryRoutes.size > MAX_PENDING_USER_TURNS) {
+          invocationMemoryRoutes.delete(invocationMemoryRoutes.keys().next().value);
+        }
+      }
+      return route;
+    }
+    function forgetMemoryRoute(sessionId, runId) {
+      invocationMemoryRoutes.delete(invocationStateKey(sessionId, runId));
+    }
+    function requiresExactDiscordAdmission(sessionKey) {
+      // Unavailable server membership must not downgrade exact admission into
+      // the legacy ingest lane. Prepare bypasses VC before network access.
+      return stableMode && requiresExactDiscordAttestation(sessionKey);
     }
 
     // ── Outbound message-id capture (SPEC-outbound-message-id.md) ──
@@ -6623,8 +6702,11 @@ export default {
     if (outboundIdCfg.enabled) outboundIdRegistrations += 1;
 
     // Conversation gate. See outboundConvIdFor.
-    const resolveOutboundConvId = (sessionKey) =>
-      outboundConvIdFor(sessionKey, { stableMode, groupIndex });
+    const resolveOutboundConvId = (sessionKey, ctx = {}) => {
+      if (!stableMode || !sessionKey) return "";
+      const route = selectConvId(sessionKey, null, ctx);
+      return route.available && route.isStable ? route.convId : "";
+    };
 
     const drainAllOutboundIdQueues = () => {
       // BOTH conditions. Checking only latePath meant that switching a
@@ -7094,11 +7176,19 @@ export default {
 
     for (const def of vcTools) {
       api.registerTool((ctx) => {
-        const factorySession = ctx?.sessionId ?? "unknown";
-        const factoryIdentity = selectConvId(ctx?.sessionKey ?? "", factorySession);
-        const factoryChannelId = cleanInboundField(ctx?.channelId, 256);
+        // Keep the route and its credential selector on the same native
+        // snapshot even if a long-lived factory's caller reuses its context.
+        const factoryContext = Object.freeze({ ...ctx,
+          deliveryContext: Object.freeze({ ...ctx?.deliveryContext }),
+        });
+        const factorySession = factoryContext?.sessionId ?? "unknown";
+        const factoryIdentity = runMemoryRoute(factoryContext?.sessionKey ?? "", factorySession, factoryContext?.runId, factoryContext);
+        const factoryChannelId = memorySourceChannel(factoryContext, factoryContext?.sessionKey ?? "");
+        // Each factory retains its own destination even if another channel's
+        // invocation runs before execute. Cold factories resolve once on use.
+        let factoryRoute = factoryIdentity.available ? factoryIdentity : null;
         maybeRefreshToolDefs(
-          baseUrl, vcKeyFor(ctx?.sessionKey ?? ""), factoryIdentity.convId, factoryChannelId, log,
+          baseUrl, vcKeyFor(factoryContext?.sessionKey ?? ""), factoryIdentity.convId, factoryChannelId, log,
         );
         const fetched = cachedToolDef(
           factoryIdentity.convId, def.name, factoryChannelId,
@@ -7108,8 +7198,14 @@ export default {
         description: fetched?.description ?? def.description,
         parameters: fetched?.input_schema ?? def.input_schema,
         async execute(toolCallId, params) {
-          const sessionId = ctx?.sessionId ?? "unknown";
-          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
+          const sessionId = factoryContext?.sessionId ?? "unknown";
+          const identity = factoryRoute ?? await resolveRunMemoryRoute(
+            factoryContext?.sessionKey ?? "", sessionId, factoryContext?.runId, factoryContext,
+          );
+          factoryRoute = identity;
+          if (!identity.available) return {
+            content: [{ type: "text", text: `Error: memory scope unavailable (${identity.reason})` }],
+          };
           log.info?.(`[vc] tool call — ${def.name} session=${sessionId} conv=${identity.convId}`);
           if (debug) log.info?.(`[vc:debug] tool ${def.name} request: ${JSON.stringify(params).slice(0, 500)}`);
 
@@ -7117,12 +7213,12 @@ export default {
             const response = await vcPost(
               baseUrl,
               `/api/v1/tools/${def.name}`,
-              vcKeyFor(ctx?.sessionKey ?? ""),
+              vcKeyFor(factoryContext?.sessionKey ?? ""),
               identity.convId,
               { arguments: params },
               15000,
               debug ? log : null,
-              { channel: cleanInboundField(ctx?.channelId, 256) },
+              { channel: factoryChannelId },
             );
             if (debug) log.info?.(`[vc:debug] tool ${def.name} response: ${(response.result ?? "").slice(0, 500)}`);
             return {
@@ -7163,8 +7259,9 @@ export default {
         description: def.description,
         acceptsArgs: def.acceptsArgs,
         handler: async (ctx) => {
-          const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
-          const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
+          const sessionId = resolveCommandSessionId(ctx) || ctx?.sessionKey || "unknown";
+          const identity = await resolveRunMemoryRoute(ctx?.sessionKey ?? "", sessionId, ctx?.runId, ctx);
+          if (!identity.available) return { text: `Memory scope unavailable (${identity.reason}).` };
           const args = (ctx?.args ?? "").trim();
           const promptText = args ? `${def.cmd} ${args}` : def.cmd;
           const synthMessages = [{
@@ -7180,7 +7277,8 @@ export default {
               identity.convId,
               { messages: synthMessages },
               60000,
-              debug ? log : null
+              debug ? log : null,
+              { ...(identity.policyRevision ? { channel: identity.channelId } : {}) },
             );
             if (prepareResult?.vc_command) {
               return { text: renderVcCommandMessage(prepareResult) };
@@ -7200,7 +7298,8 @@ export default {
       description: "Reset VC ingest tracker; the next message will re-send full history.",
       acceptsArgs: false,
       handler: async (ctx) => {
-        const sessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "unknown";
+        const sessionId = resolveCommandSessionId(ctx);
+        if (!sessionId) return { text: "Native session unavailable; ingest progress was not changed." };
         resetSessionIngest(sessionId);
         log.info?.(`[vc] /vcreingest — reset ingest tracker for session=${sessionId}`);
         return { text: `Session ${sessionId} marked for re-ingest. The full conversation history will be sent to Virtual Context on the next message.` };
@@ -7215,6 +7314,7 @@ export default {
     // routing snapshot; it performs no network call, memory write, or card
     // update. The shipped hook has no run id despite its public type.
     api.on("message_received", (event, ctx) => {
+      memoryScope.observeInbound(event, ctx);
       const remembered = rememberInboundTurn(event, ctx);
       if (!remembered) {
         const diagnostic = inboundTurnAdmissionDiagnostic(event, ctx);
@@ -7336,9 +7436,6 @@ export default {
         log.info?.(`[vc:DIAG-bar] not a VC command, falling through`);
         return;
       }
-      const identity = selectConvId(ctx?.sessionKey ?? "", sessionId);
-      log.info?.(`[vc:DIAG-bar] matched VC command, will call cloud sessionId=${sessionId} conv=${identity.convId}`);
-
       // VCREINGEST is local-only — no cloud round-trip
       if (/^VCREINGEST\b/i.test(promptText)) {
         resetSessionIngest(sessionId);
@@ -7350,6 +7447,11 @@ export default {
         };
       }
 
+      const identity = await resolveRunMemoryRoute(ctx?.sessionKey ?? "", sessionId, turnRunId, ctx);
+      if (!identity.available) return {
+        handled: true,
+        reply: (await loadSuppressionMarker(log))({ text: `Memory scope unavailable (${identity.reason}).` }),
+      };
       // Cloud-handled commands: synthesize a minimal prepare request with the VC prompt
       const synthMessages = [{
         role: "user",
@@ -7364,7 +7466,8 @@ export default {
           identity.convId,
           { messages: synthMessages },
           60000,
-          debug ? log : null
+          debug ? log : null,
+          { ...(identity.policyRevision ? { channel: identity.channelId } : {}) },
         );
         if (prepareResult?.vc_command) {
           markVcCommandInvocation(sessionId, turnRunId);
@@ -7411,7 +7514,6 @@ export default {
         ?? (groupConversationSession(sessionKey) ? null : sessionId);
       const exactDiscordAdmission = requiresExactDiscordAdmission(
         sessionKey,
-        sessionId,
       );
       const correlationId = explicitRunId ?? sessionId;
       const promptText = (event.prompt ?? "").trim();
@@ -7542,6 +7644,18 @@ export default {
           ?? boundInboundTurn?.accountId
           ?? inboundAccountForRun(explicitRunId),
       );
+      const selectedMemoryRoute = await resolveRunMemoryRoute(sessionKey, sessionId, stateRunId, {
+        ...ctx,
+        ...(sourceAccountId ? { accountId: sourceAccountId } : {}),
+        ...(boundInboundTurn?.originChannelId ? { conversationId: `channel:${boundInboundTurn.originChannelId}` } : {}),
+      });
+      if (!selectedMemoryRoute.available) {
+        forgetPendingUserTurn(sessionId, stateRunId);
+        forgetExactSourceCapability(sessionId, stateRunId);
+        forgetInboundTurn(explicitRunId);
+        rememberExactSourceBypass(sessionId, stateRunId, undefined);
+        return;
+      }
       if (platform === "discord" && !sourceAccountId) {
         warnIdentityOnce(
           log,
@@ -7860,7 +7974,7 @@ export default {
         exactDiscordAdmission
         && !hasExactSourceCapability(sessionId, stateRunId)
       ) {
-        const identity = selectConvId(sessionKey, sessionId);
+        const identity = selectedMemoryRoute;
         try {
           await requireExactSourceCapability({
             baseUrl,
@@ -8115,7 +8229,7 @@ export default {
       // Conversation identity: stable scopes get the sk: id; the predecessor
       // forward-link hint goes on prepare ONLY, and only when the selected
       // identity is stable (it then necessarily differs from the session UUID).
-      const identity = selectConvId(sessionKey, sessionId);
+      const identity = selectedMemoryRoute;
       const predecessor = identity.isStable && identity.convId !== sessionId ? sessionId : undefined;
       const preparePath = prepareBody.source_attestation
         ? EXACT_SOURCE_PREPARE_PATH
@@ -8141,6 +8255,7 @@ export default {
           {
             ...(predecessor ? { predecessor } : {}),
             correlationId,
+            ...(identity.policyRevision ? { channel: identity.channelId } : {}),
           },
         );
       } catch (err) {
@@ -8789,7 +8904,11 @@ export default {
           return;
         }
 
-        const identity = selectConvId(sessionKey, sessionId);
+        const identity = runMemoryRoute(sessionKey, sessionId, exactRunId, ctx, true);
+        if (!identity.available) {
+          log.warn?.(`[vc:scope] ingest skipped: memory scope unavailable reason=${identity.reason}`);
+          return;
+        }
 
         if (!assistantMessage) {
           // A turn that reaches here stored nothing. Report it: silence here is
@@ -8851,6 +8970,7 @@ export default {
         if (!groupOutputDeferred) {
           releasePendingTurn();
           forgetInboundTurn(exactRunId);
+          forgetMemoryRoute(sessionId, exactRunId);
         }
       }
     });
@@ -8863,7 +8983,7 @@ export default {
     // so it can and does land after the ingest for the same turn has already
     // completed. Nothing here may assume otherwise.
     if (outboundIdCfg.enabled) {
-      api.on("message_sent", (event, ctx) => {
+      api.on("message_sent", async (event, ctx) => {
         try {
           const now = Date.now();
           const observedAt = new Date(now).toISOString();
@@ -8903,7 +9023,18 @@ export default {
           );
 
           const { identity, reason } = normalizeOutboundIdentity(event, ctx);
-          const convId = identity ? resolveOutboundConvId(sessionKey) : "";
+          const routeContext = identity ? {
+            ...ctx, accountId: identity.account_id, conversationId: `channel:${identity.channel_id}`,
+          } : ctx;
+          let convId = identity ? resolveOutboundConvId(sessionKey, routeContext) : "";
+          if (identity && stableMode && !convId
+            && selectConvId(sessionKey, null, routeContext).available === false) {
+            // Cold outbound observations have no run or guild id. Resolve the
+            // exact delivery channel under its own account; never use the
+            // most recent inbound event or rewrite an existing queue record.
+            const route = await memoryScope.resolve(sessionKey, null, routeContext);
+            convId = route.available && route.isStable ? route.convId : "";
+          }
           if (!identity) {
             noteOutboundIdRefusal(outboundIdStats, reason);
           } else if (!convId) {

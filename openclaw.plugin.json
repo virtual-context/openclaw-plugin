@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.11.0",
+  "version": "5.11.1",
   "kind": "context-engine",
   "main": "./index.js",
   "activation": {
@@ -145,6 +145,16 @@
           "minLength": 1,
           "maxLength": 128
         }
+      },
+      "discordMemoryScope": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "enum": [
+            "server"
+          ]
+        },
+        "description": "Opt-in map of agent id to \"server\". Requires convIdentity=\"stable\". Share one memory conversation per actual Discord server while keeping native sessions separate. Membership comes from trusted inbound metadata or an authenticated channel lookup using the bound account. Multiple servers remain isolated. Unknown or conflicting membership bypasses memory instead of creating a channel conversation. Exact conversationGroups members must agree with proven server membership."
       }
     },
     "additionalProperties": false

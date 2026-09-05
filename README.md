@@ -63,6 +63,7 @@ In `openclaw.json`:
 | `excludeAgents` | string[] | none | Agent ids excluded from Virtual Context entirely: no prepare, no ingest, no VC commands. Holds across model switches and fallbacks. Example: `["extractor"]` |
 | `convIdentity` | `"session"` \| `"stable"` | `"session"` | How VC conversations are keyed. **See below — the default is legacy behavior.** |
 | `conversationGroups` | object | none | Map of group session key to member session keys, so several chat scopes share one VC conversation. Requires `convIdentity: "stable"`. |
+| `discordMemoryScope` | object | none | Opt-in agent-to-`"server"` policy. Shares memory across verified channels of each Discord server; requires stable identity. |
 | `debug` | boolean | `false` | Enable verbose logging of REST API calls and payloads |
 | `operatorNoticeUserId` | string | none | Discord user id that receives model-fallback transition notices as a DM; the in-channel copy is cancelled. Omitted = host default (in-channel). Fails safe: without a bot token the notice stays in-channel. |
 | `modelCallCapture` | object | disabled | Store complete, untruncated `llm_input` and `llm_output` hook payloads in a bounded local gzip log. Defaults to 512 MiB, 2,000 files, and 7 days under `~/.openclaw/logs/virtual-context/model-calls`. |
@@ -77,6 +78,8 @@ In `openclaw.json`:
 If you want a bot that still remembers last week, set `convIdentity: "stable"`.
 
 `conversationGroups` maps one group session key to a list of member session keys; every member then shares the group key's stable VC conversation. Exact stable keys are supported. A terminal `agent:<agent>:discord:channel:*` wildcard is accepted only when OpenClaw binds that agent to an allowlisted Discord account with exactly one explicit guild, and the group key names that guild. Discord DMs and group DMs always remain separate conversations. The plugin logs a warning and ignores the setting if `convIdentity` is not `"stable"`.
+
+For server-wide Discord memory, set `"discordMemoryScope": { "guide": "server" }` alongside `"convIdentity": "stable"`, replacing `guide` with the agent id. This policy uses the message's actual server membership, so one account can serve several isolated servers. New channels and threads resolve from trusted inbound metadata or an authenticated channel lookup under the bound account. Native sessions and ingest progress stay separate; the original channel remains source provenance. Direct messages retain their existing identity. Exact `conversationGroups` entries must agree with the verified server and agent. Unknown, ambiguous, or conflicting membership visibly bypasses memory instead of creating a channel-specific memory. Channel membership is cached only within this plugin registration and is revalidated after restart. Existing completion outbox records retain their original destination. Historical data consolidation is a separate administrative operation. The agent must have explicit Discord account bindings. Cold lookups require a resolved bot credential on the bound account; without one, native inbound metadata can still establish membership. Failed lookups back off for 30 seconds, and fresh native membership evidence is usable immediately.
 
 ### Context engine (optional)
 
