@@ -49,7 +49,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.11.1";
+const PLUGIN_VERSION = "5.11.2";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -481,6 +481,25 @@ function writeIngestTracker(tracker) {
 
 function isSessionIngested(sessionId) {
   return sessionId in readIngestTracker();
+}
+
+// OpenClaw 2026.9.x hands the full native transcript to before_prompt_build on
+// every turn. After the initial ingest the cloud already holds that history, so
+// prepare only needs a recent tail for continuity; forwarding thousands of
+// messages per turn blew past the prepare timeout.
+const HOST_HISTORY_TAIL = Math.max(
+  4,
+  Number.parseInt(process.env.VC_HOST_HISTORY_TAIL ?? "24", 10) || 24,
+);
+function windowHostHistory(messages, sessionId, log) {
+  if (!Array.isArray(messages) || messages.length <= HOST_HISTORY_TAIL) return messages;
+  if (!isSessionIngested(sessionId)) return messages;
+  const tail = messages.slice(-HOST_HISTORY_TAIL);
+  log?.info?.(
+    `[vc] host history windowed — session=${sessionId} ` +
+    `${messages.length} -> ${tail.length} message(s); VC holds the canonical history`,
+  );
+  return tail;
 }
 
 function markSessionIngested(sessionId, messageCount) {
@@ -2834,7 +2853,13 @@ function resolveCommandSessionId(ctx) {
  * The proper fix is OpenClaw exposing provider/model in the hook context.
  */
 
-function resolveSessionModel(sessionKey) {
+function resolveSessionModel(sessionKey, hookCtx = null) {
+  // OpenClaw 2026.9.x exposes the serving model on the hook context. Prefer it:
+  // the on-disk sessions.json below no longer exists once the session store has
+  // migrated to SQLite, and reading it was always the fragile path.
+  const ctxProvider = typeof hookCtx?.modelProviderId === "string" ? hookCtx.modelProviderId.trim() : "";
+  const ctxModel = typeof hookCtx?.modelId === "string" ? hookCtx.modelId.trim() : "";
+  if (ctxProvider && ctxModel) return `${ctxProvider}/${ctxModel}`.toLowerCase();
   try {
     // Extract agentId from sessionKey: "agent:<agentId>:..."
     const parts = sessionKey?.split(":");
@@ -2953,7 +2978,10 @@ export function resolveSessionRuntimeDetails(
     sessionEntry?.modelProvider,
     sessionEntry?.model,
   );
-  const modelRef = sessionModel ?? normalizedProviderModel(
+  const hookRef = typeof hookModel === "string" && hookModel.includes("/")
+    ? hookModel.trim().toLowerCase()
+    : null;
+  const modelRef = sessionModel ?? hookRef ?? normalizedProviderModel(
     sessionEntry?.modelProvider,
     hookModel,
   );
@@ -7426,7 +7454,7 @@ export default {
         // not repeated here -- prepare owns that counter, and counting a turn
         // twice would halve the grace window.
         if (providerFilter) {
-          const currentModel = resolveSessionModel(ctx?.sessionKey ?? "");
+          const currentModel = resolveSessionModel(ctx?.sessionKey ?? "", ctx);
           if (currentModel && !providerFilter.has(currentModel)) return;
         }
         // Ordinary model turns are never blocked on VC capability. Exact
@@ -7544,7 +7572,7 @@ export default {
       // be refused because VC is unavailable.
       const isVcCommand = /^VC[A-Z]/i.test(promptText);
       if (providerFilter && !isVcCommand) {
-        const currentModel = resolveSessionModel(sessionKey);
+        const currentModel = resolveSessionModel(sessionKey, ctx);
         const unresolved = noteUnresolvedModel(
           unresolvedModelState,
           sessionKey,
@@ -8057,7 +8085,10 @@ export default {
               : null,
           }
         : resolveSessionRuntimeDetails(sessionKey, {
-            model: ctx?.model,
+            model: ctx?.model
+              ?? (ctx?.modelProviderId && ctx?.modelId
+                ? `${ctx.modelProviderId}/${ctx.modelId}`
+                : undefined),
             config: api?.config,
           });
       const runtimeId = runtime.id ?? "";
@@ -8105,7 +8136,7 @@ export default {
         );
       }
       let messagesWithCurrentTurn = mergeCurrentUserMessage(
-        survivorsSuppressed ? [] : event.messages,
+        survivorsSuppressed ? [] : windowHostHistory(event.messages, sessionId, log),
         currentBody,
         inboundTurn,
       );
@@ -8759,7 +8790,7 @@ export default {
 
         // Same provider filter as prepare
         if (providerFilter) {
-          const currentModel = resolveSessionModel(sessionKey);
+          const currentModel = resolveSessionModel(sessionKey, ctx);
           if (currentModel && !providerFilter.has(currentModel)) {
             log.info?.(
               `[vc] skipping ingest — ${currentModel} not in provider filter; ` +
