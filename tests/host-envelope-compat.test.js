@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -95,7 +95,7 @@ describe("BUG-002: marked host envelopes retain exact turn provenance", () => {
   });
 });
 
-async function hookFixture({ typedBody, reply = false } = {}) {
+async function hookFixture({ typedBody, reply = false, sourceEventTime = false, capabilityStatus = 200, deferredPath = "", deferredResponse, providers } = {}) {
   const home = mkdtempSync(join(tmpdir(), "vc-marked-hook-"));
   homes.push(home);
   mkdirSync(join(home, ".openclaw", "extensions", "virtual-context"), { recursive: true });
@@ -119,29 +119,135 @@ async function hookFixture({ typedBody, reply = false } = {}) {
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     expect(href.startsWith("https://memory.invalid/")).toBe(true);
-    const response = href.includes("/capabilities") ? { exact_source_admission_version: 2 } : {
+    if (deferredPath && href.includes(deferredPath)) await deferredResponse;
+    const response = href.includes("/capabilities") ? {
+      exact_source_admission_version: 2,
+      ...(sourceEventTime ? { source_event_time_version: 1 } : {}),
+    } : {
       conversation_id: "synthetic-conversation", body: { messages: request.messages ?? [] },
+      status: "accepted", canonical_persisted: true, source_message_id: request.source_attestation?.message_id,
       metadata: { exact_source_admission_version: 2, exact_source_admission: { version: 2, owner_conversation_id: "synthetic-conversation", conversation_generation: 0, lifecycle_epoch: 1 } },
     };
-    return new Response(JSON.stringify(response), { status: 200, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(response), { status: href.includes("/capabilities") ? capabilityStatus : 200, headers: { "Content-Type": "application/json" } });
   });
   mod.default.register({
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    pluginConfig: { vcKey: "synthetic-key", baseUrl: "https://memory.invalid", convIdentity: "stable" },
+    pluginConfig: { vcKey: "synthetic-key", baseUrl: "https://memory.invalid", convIdentity: "stable", ...(providers ? { providers } : {}) },
     config: { agents: { list: [{ id: "example" }] }, bindings: [{ agentId: "example", match: { channel: "discord", accountId: "example" } }], channels: { discord: { accounts: { example: { token: "synthetic-token" } } } } },
     registerTool: vi.fn(), on: (name, fn) => handlers.set(name, fn),
   });
-  const ctx = { sessionId: "00000000-0000-4000-8000-000000000002", sessionKey, runId: "00000000-0000-4000-8000-000000000003", model: "openai/example-model", trigger: "user" };
+  const ctx = { sessionId: "00000000-0000-4000-8000-000000000002", sessionKey, runId: "00000000-0000-4000-8000-000000000003", model: "openai/example-model", modelProviderId: "openai", modelId: "example-model", trigger: "user" };
   const hookCtx = { channelId: "discord", accountId: "example", conversationId: `channel:${channel}` };
   handlers.get("message_received")({ from: `discord:${sender}`, content: body, timestamp,
     metadata: { provider: "discord", originatingChannel: "discord", originatingTo: `channel:${channel}`, messageId, senderId: sender, senderName: "Member B", ...(reply ? { replyToId: replyId } : {}), guildId: "100000000000000005" },
   }, hookCtx);
   handlers.get("before_dispatch")({ content: body, body, channel: "discord", sessionKey, senderId: sender, timestamp }, { ...hookCtx, sessionKey, senderId: sender });
   const current = { role: "user", content: body, timestamp, __openclaw: { senderId: sender, senderName: "Member B", transport: { channel: "discord", messageId } } };
-  return { handlers, calls, ctx, body, current, replyId };
+  return { handlers, calls, ctx, body, current, replyId, home };
 }
 
 describe("BUG-002: registered marked-envelope dispatch admission", () => {
+  it("BUG-003: a late matching output retains its bounded deferred admission time", async () => {
+    let releaseResponse;
+    const deferredResponse = new Promise((resolve) => { releaseResponse = resolve; });
+    const { handlers, calls, ctx, body, current, replyId } = await hookFixture({
+      typedBody: "<@100000000000000009>", reply: true, sourceEventTime: true,
+      deferredPath: "/__vc_exact_source_prepare_v2", deferredResponse,
+    });
+    const prompt = block(newInfo, { ...info, has_reply_context: true, reply_to_id: replyId }) + replay + body;
+    await handlers.get("before_prompt_build")({ prompt, messages: [current] }, ctx);
+    vi.useFakeTimers();
+    let finishing;
+    try {
+      await handlers.get("agent_end")({ runId: ctx.runId, success: true, messages: [] }, ctx);
+      await vi.advanceTimersByTimeAsync(29_000);
+      finishing = handlers.get("llm_output")({ runId: ctx.runId, sessionId: ctx.sessionId, assistantTexts: ["The late native reply."] }, ctx);
+      await vi.waitFor(() => expect(calls.some(({ href }) => href.includes("/__vc_exact_source_prepare_v2"))).toBe(true));
+      // Output arrived within its deadline; a two-second prepare is also
+      // within its own timeout even though the original output window ends.
+      await vi.advanceTimersByTimeAsync(2_000);
+    } finally {
+      releaseResponse();
+      if (finishing) await finishing;
+      vi.useRealTimers();
+    }
+    const ingests = calls.filter(({ href }) => href.includes("/__vc_exact_source_ingest_v2"));
+    expect(ingests).toHaveLength(1);
+    expect(ingests[0].request.assistant_message).toBe("The late native reply.");
+  });
+  it.each([
+    ["/capabilities", "cancelled"],
+    ["/__vc_exact_source_prepare_v2", "cancelled"],
+    ["/capabilities", "provider-excluded"],
+    ["/__vc_exact_source_prepare_v2", "provider-excluded"],
+  ])("BUG-003: deferred admission cannot resume a %s %s run", async (deferredPath, reason) => {
+    let releaseResponse;
+    const deferredResponse = new Promise((resolve) => { releaseResponse = resolve; });
+    const { handlers, calls, ctx, body, current, replyId, home } = await hookFixture({
+      typedBody: "<@100000000000000009>", reply: true, sourceEventTime: true,
+      deferredPath, deferredResponse, providers: ["openai/example-model"],
+    });
+    const prompt = block(newInfo, { ...info, has_reply_context: true, reply_to_id: replyId }) + replay + body;
+    await handlers.get("before_prompt_build")({ prompt, messages: [current] }, ctx);
+    await handlers.get("agent_end")({ runId: ctx.runId, success: true, messages: [] }, ctx);
+    const finishing = handlers.get("llm_output")({ runId: ctx.runId, sessionId: ctx.sessionId, assistantTexts: ["The completed native reply."] }, ctx);
+    try {
+      await vi.waitFor(() => expect(calls.some(({ href }) => href.includes(deferredPath))).toBe(true));
+      await handlers.get("agent_end")(
+        { runId: ctx.runId, success: reason !== "cancelled", messages: [] },
+        reason === "provider-excluded" ? { ...ctx, modelId: "excluded-model" } : ctx,
+      );
+    } finally {
+      releaseResponse();
+      await finishing;
+    }
+    expect(calls.some(({ href }) => href.includes("/__vc_exact_source_ingest_v2"))).toBe(false);
+    expect(existsSync(join(home, ".openclaw", "state", "virtual-context", "completion-outbox"))).toBe(false);
+    if (deferredPath === "/capabilities") {
+      expect(calls.some(({ href }) => href.includes("/__vc_exact_source_prepare_v2"))).toBe(false);
+    }
+  });
+  it.each([false, true])("BUG-003: sends occurrence time only with server capability %s", async (supported) => {
+    const { handlers, calls, ctx, body, current } = await hookFixture({ sourceEventTime: supported });
+    await handlers.get("before_prompt_build")({ prompt: block(newInfo, info) + history + replay + body, messages: [current] }, ctx);
+    const prepare = calls.find(({ href }) => href.includes("/__vc_exact_source_prepare_v2"))?.request;
+    expect(prepare.source_attestation.occurred_at).toBe(supported ? new Date(timestamp).toISOString() : undefined);
+  });
+  it.each([false, true])("BUG-003: captures reply-only time after generation with capability %s", async (supported) => {
+    const { handlers, calls, ctx, body, current, replyId } = await hookFixture({
+      typedBody: "<@100000000000000009>", reply: true, sourceEventTime: supported,
+    });
+    const prompt = block(newInfo, { ...info, has_reply_context: true, reply_to_id: replyId }) + replay + body;
+    const first = await handlers.get("before_prompt_build")({ prompt, messages: [current] }, ctx);
+    expect(first.prependContext).toContain("Treat the replied-to message below");
+    expect(calls.some(({ href }) => href.startsWith("https://memory.invalid/"))).toBe(false);
+    await handlers.get("agent_end")({ runId: ctx.runId, success: true, messages: [] }, ctx);
+    await handlers.get("llm_output")({ runId: ctx.runId, sessionId: ctx.sessionId, assistantTexts: ["Here is the distinction."] }, ctx);
+    const prepare = calls.find(({ href }) => href.includes("/__vc_exact_source_prepare_v2"))?.request;
+    const ingest = calls.find(({ href }) => href.includes("/__vc_exact_source_ingest_v2"))?.request;
+    expect(prepare).toBeDefined();
+    expect(ingest).toBeDefined();
+    for (const request of [prepare, ingest]) {
+      expect(request.source_attestation.occurred_at).toBe(supported ? new Date(timestamp).toISOString() : undefined);
+      expect(request.source_attestation.message_id).toBe(messageId);
+    }
+    expect(ingest.user_message).toBe(body);
+    expect(ingest.assistant_message).toBe("Here is the distinction.");
+    expect(ingest.exact_source_admission.owner_conversation_id).toBe("synthetic-conversation");
+  });
+  it("BUG-003: a post-generation capability outage leaves the native reply intact", async () => {
+    const { handlers, calls, ctx, body, current, replyId } = await hookFixture({
+      typedBody: "<@100000000000000009>", reply: true, sourceEventTime: true, capabilityStatus: 503,
+    });
+    const prompt = block(newInfo, { ...info, has_reply_context: true, reply_to_id: replyId }) + replay + body;
+    const first = await handlers.get("before_prompt_build")({ prompt, messages: [current] }, ctx);
+    expect(first.prependContext).toContain("Treat the replied-to message below");
+    expect(calls.some(({ href }) => href.startsWith("https://memory.invalid/"))).toBe(false);
+    await handlers.get("agent_end")({ runId: ctx.runId, success: true, messages: [] }, ctx);
+    await handlers.get("llm_output")({ runId: ctx.runId, sessionId: ctx.sessionId, assistantTexts: ["The native reply."] }, ctx);
+    expect(calls.filter(({ href }) => href.includes("/capabilities"))).toHaveLength(1);
+    expect(calls.some(({ href }) => href.includes("/__vc_exact_source_"))).toBe(false);
+  });
   it("admits exact native dispatch with nested messages and prepares the right actor without legacy session files", async () => {
     const { handlers, calls, ctx, body, current } = await hookFixture();
     const result = await handlers.get("before_prompt_build")({ prompt: block(newInfo, info) + history + replay + body, messages: [current] }, ctx);

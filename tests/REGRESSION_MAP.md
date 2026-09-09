@@ -2,6 +2,7 @@
 
 | Bug | Tests | Contract |
 |---|---|---|
+| BUG-003 | `source-event-time.test.js`; `host-envelope-compat.test.js` — `BUG-003: sends occurrence time only with server capability` | Bound timestamp serialization, legacy claim compatibility, invalid time rejection, source identity, and invocation-scoped capability negotiation through registered native dispatch, deferred reply-only admission, and native reply preservation during capability outages |
 | BUG-001 | `server-memory-scope.test.js` — `BUG-001: client-owned server memory scope` | Multiple servers, verified membership, threads, account isolation, exact overrides, conflicts, missing membership, cold lookup backoff, and legacy DM/ephemeral scopes |
 | BUG-001 | `conv-identity-hooks.test.js` — `BUG-001 server memory routing` | Shared hook/tool/command/outbound routing, physical channel provenance, frozen route and credentials, unchanged outbox replay, native UUID tracker, legacy prepare URLs, and visible unavailable-scope bypass |
 | BUG-002 | `host-envelope-compat.test.js` — `BUG-002: marked host envelopes retain exact turn provenance` and `BUG-002: registered marked-envelope dispatch admission` | Legacy/marked header ordering, plaintext session history, quoted-label preservation, reply-chain scope, repeated prompt builds, exact dispatch-bound prepare, sender/message/body rejection without legacy session files, and literal-header reply-body preservation |

@@ -77,7 +77,7 @@ const MAX_PENDING_USER_TURNS = 512;
 // that performed it.  It is deliberately not a deployment-wide cache: after
 // a rollback or mixed deployment, a later Discord turn must prove the exact
 // admission surface again before it can send canonical source material.
-const exactSourceCapabilityByInvocation = new Set();
+const exactSourceCapabilityByInvocation = new Map();
 const MAX_EXACT_SOURCE_CAPABILITIES = 512;
 // A VC admission failure must never become a user-visible model refusal.
 // Remember the per-run pass-through result so OpenClaw's duplicate prompt
@@ -145,14 +145,14 @@ function forgetPendingUserTurn(sessionId, runId) {
   if (key) pendingUserTurnByInvocation.delete(key);
 }
 
-function rememberExactSourceCapability(sessionId, runId) {
+function rememberExactSourceCapability(sessionId, runId, capabilities = {}) {
   const key = invocationStateKey(sessionId, runId);
   if (!key) return false;
   exactSourceCapabilityByInvocation.delete(key);
-  exactSourceCapabilityByInvocation.add(key);
+  exactSourceCapabilityByInvocation.set(key, capabilities.source_event_time_version === 1);
   while (exactSourceCapabilityByInvocation.size > MAX_EXACT_SOURCE_CAPABILITIES) {
     exactSourceCapabilityByInvocation.delete(
-      exactSourceCapabilityByInvocation.values().next().value,
+      exactSourceCapabilityByInvocation.keys().next().value,
     );
   }
   return true;
@@ -161,6 +161,11 @@ function rememberExactSourceCapability(sessionId, runId) {
 function hasExactSourceCapability(sessionId, runId) {
   const key = invocationStateKey(sessionId, runId);
   return key ? exactSourceCapabilityByInvocation.has(key) : false;
+}
+
+function hasSourceEventTimeCapability(sessionId, runId) {
+  const key = invocationStateKey(sessionId, runId);
+  return key ? exactSourceCapabilityByInvocation.get(key) === true : false;
 }
 
 function forgetExactSourceCapability(sessionId, runId) {
@@ -1822,6 +1827,7 @@ export function buildSourceAttestation(
   inbound,
   canonicalBody,
   replyTargetMessageId = "",
+  { includeOccurredAt = false } = {},
 ) {
   const body = typeof canonicalBody === "string" ? canonicalBody : "";
   const canonicalBodySha = exactSourceBodyHash(body);
@@ -1839,6 +1845,15 @@ export function buildSourceAttestation(
     || !inbound.promptRunId
     || !canonicalBodySha
   ) return null;
+  // Keep the already bound transport time through delayed delivery and replay.
+  // A missing timestamp must remain unknown rather than becoming Date.now().
+  const sourceTimestamp = inbound.sourceTimestamp;
+  const occurredAt = typeof sourceTimestamp === "number"
+    && Number.isSafeInteger(sourceTimestamp)
+    && sourceTimestamp >= 0
+    && sourceTimestamp <= 253_402_300_799_999
+    ? new Date(sourceTimestamp).toISOString()
+    : null;
   return {
     version: 1,
     agent_scope_id: inbound.agentScopeId,
@@ -1852,6 +1867,7 @@ export function buildSourceAttestation(
     canonical_body_sha256: canonicalBodySha,
     projection_version: "openclaw-current-user-v1",
     reply_target_message_id: replyId,
+    ...(includeOccurredAt && occurredAt ? { occurred_at: occurredAt } : {}),
   };
 }
 
@@ -6520,8 +6536,54 @@ export default {
       const assistantMessage = output.deliveredText || output.assistantText || "";
       if (!assistantMessage) return false;
       state.finalizing = true;
+      // The matching output arrived. Deferred HTTP admission has its own
+      // bounded timeouts and must not inherit the expired output-wait budget.
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = null;
 
-      const pendingTurn = findPendingUserTurn(sessionId, runId);
+      let pendingTurn = findPendingUserTurn(sessionId, runId);
+      if (pendingTurn?.deferredSourceAttestation) {
+        // Reply-only prompts stay independent of cloud availability. Admit
+        // their frozen source after generation, when the exact receipt and
+        // optional occurrence-time capability can be obtained together.
+        try {
+          const route = runMemoryRoute(state.sessionKey, sessionId, runId, {}, true);
+          if (!route.available) throw new Error("reply-only memory scope unavailable");
+          const capabilities = await requireExactSourceCapability({
+            baseUrl, vcKey: vcKeyFor(state.sessionKey), convId: route.convId,
+            log: debug ? log : null,
+          });
+          if (exactGroupEndByInvocation.get(key) !== state) return false;
+          const sourceAttestation = { ...pendingTurn.deferredSourceAttestation };
+          if (capabilities.source_event_time_version !== 1) {
+            delete sourceAttestation.occurred_at;
+          }
+          const provenance = { ...pendingTurn.provenance, source_attestation: sourceAttestation };
+          const prepared = await vcPost(
+            baseUrl, EXACT_SOURCE_PREPARE_PATH, vcKeyFor(state.sessionKey), route.convId,
+            { messages: [{ role: "user", content: pendingTurn.text }], ...provenance },
+            15000, debug ? log : null,
+            {
+              correlationId: `reply-only:${sourceAttestation.message_id}`,
+              ...(route.isStable && route.convId !== sessionId ? { predecessor: sessionId } : {}),
+              ...(route.policyRevision ? { channel: route.channelId } : {}),
+            },
+          );
+          const metadata = prepared.metadata ?? {};
+          const receipt = validatedExactSourceAdmission(metadata.exact_source_admission);
+          if (Number(metadata.exact_source_admission_version) !== EXACT_SOURCE_ADMISSION_VERSION || !receipt) {
+            throw new Error("reply-only exact source receipt unavailable");
+          }
+          // A failed/cancelled run may have released this invocation while
+          // the request was in flight. Never revive it or cross into a new run.
+          if (exactGroupEndByInvocation.get(key) !== state) return false;
+          pendingTurn = { ...pendingTurn, provenance, exactSourceAdmission: receipt };
+        } catch (error) {
+          log.error?.(`[vc:identity] reply-only ingest skipped after generation: ${error}`);
+          releaseExactGroupInvocation(sessionId, runId);
+          return false;
+        }
+      }
       const userMessage = pendingTurn?.text;
       const userProvenance = pendingTurn?.provenance ?? {};
       const attestation = userProvenance?.source_attestation;
@@ -7960,6 +8022,7 @@ export default {
                   inboundTurn,
                   replyOnlyBody,
                   turnProvenance.reply_target_message_id,
+                  { includeOccurredAt: hasSourceEventTimeCapability(sessionId, stateRunId) },
                 )
               : null;
             const recordedReplyOnly = rememberPendingUserTurn(
@@ -7974,6 +8037,12 @@ export default {
                     : {}),
                 },
                 messageId: replyOnlyId,
+                ...(replyOnlyAttestation ? {
+                  deferredSourceAttestation: buildSourceAttestation(
+                    inboundTurn, replyOnlyBody, turnProvenance.reply_target_message_id,
+                    { includeOccurredAt: true },
+                  ),
+                } : {}),
               },
             );
             if (recordedReplyOnly) {
@@ -8027,13 +8096,13 @@ export default {
       ) {
         const identity = selectedMemoryRoute;
         try {
-          await requireExactSourceCapability({
+          const capabilities = await requireExactSourceCapability({
             baseUrl,
             vcKey: vcKeyFor(sessionKey),
             convId: identity.convId,
             log: debug ? log : null,
           });
-          rememberExactSourceCapability(sessionId, stateRunId);
+          rememberExactSourceCapability(sessionId, stateRunId, capabilities);
         } catch (error) {
           forgetPendingUserTurn(sessionId, stateRunId);
           forgetExactSourceCapability(sessionId, stateRunId);
@@ -8220,6 +8289,7 @@ export default {
                 inboundTurn,
                 text,
                 turnProvenance.reply_target_message_id,
+                { includeOccurredAt: hasSourceEventTimeCapability(sessionId, stateRunId) },
               )
             : null;
           if (sourceAttestation) {
@@ -8736,6 +8806,13 @@ export default {
       // ingest. Every exit from this hook has to release it, or it outlives the
       // turn it belongs to and can be attached to a later reply.
       const releasePendingTurn = () => {
+        const key = invocationStateKey(sessionId, exactRunId);
+        if (key && exactGroupEndByInvocation.has(key)) {
+          // Deferred admission may be awaiting capability or prepare. Removing
+          // only its pending halves would leave the captured finalizer live.
+          releaseExactGroupInvocation(sessionId, exactRunId);
+          return;
+        }
         forgetPendingUserTurn(sessionId, exactRunId);
         forgetNativeReplyResult(sessionId, exactRunId);
         forgetModelOutput(sessionId, exactRunId);

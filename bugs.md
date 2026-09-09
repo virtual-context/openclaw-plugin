@@ -1,5 +1,13 @@
 # Bug fixes
 
+## BUG-003 — Source claims lose bound message occurrence time
+
+Exact dispatch binding retained the transport timestamp locally but omitted it from the source claim. Delayed delivery and replay consequently preserved identity without preserving when the message occurred.
+
+The adapter sends the bound UTC occurrence timestamp when the server advertises support. Capability state stays scoped to the invocation; missing timestamps and older servers retain the existing claim shape. Replay carries the original value and never substitutes the delivery clock. Reply-only invocations freeze the source immediately and obtain capability plus exact admission after generation, preserving native reply behavior during cloud outages.
+
+Regression: the timestamp serialization and capability-negative hook cases failed before their fixes. Focused source serialization and registered native dispatch tests cover valid and unusable times, missing source identity, and supported versus older servers. Post-generation reply-only capture passes the original user/assistant pair and the exact receipt into the durable completion path; unsupported or unavailable capability never fabricates occurrence metadata.
+
 ## BUG-001 — Server memory fragments across channels
 
 Opt-in server grouping could not resolve channel membership when an account allowed several servers. Hooks and tools fell back to separate channel memory identities, and tool factories read an unavailable channel field.
