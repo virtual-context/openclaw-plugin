@@ -33,6 +33,27 @@ describe("BUG-002: current-turn transcript fencing", () => {
     expect(result.messages[0]).toBe(historical);
     expect(handoff.mock.calls[0][0].speaker).toMatchObject({senderId:"member-a"});
   });
+  it("reads the active fence for embedded group assembly without runtimeContext", async () => {
+    const embeddedTarget = { ...target, sessionKey: "agent:example:telegram:group:room-synthetic" };
+    const capture = vi.fn(() => ({ ...admission, ...embeddedTarget }));
+    const handoff = vi.fn();
+    const previous = { ...historical, __openclaw: { senderId: "member-a", senderName: "Member A", transport: { channel: "telegram" } } };
+    const result = await make(capture, { onCurrentSpeaker: handoff }).assemble({
+      sessionId: embeddedTarget.sessionId, sessionKey: embeddedTarget.sessionKey,
+      messages: [previous], prompt: "same words",
+    });
+    expect(capture).toHaveBeenCalledWith(embeddedTarget);
+    expect(result.messages[0].content).toContain('"actor_id":"actor:telegram:member-a"');
+    expect(handoff.mock.calls[0][0].speaker).toBeNull();
+    expect(previous.content).toBe("same words");
+  });
+  it("rejects another embedded conversation's receipt with the same agent and session id", async () => {
+    const engine = make(() => ({ ...admission, sessionKey: "agent:example:telegram:group:other-room" }));
+    await expect(engine.assemble({
+      sessionId: target.sessionId, sessionKey: target.sessionKey,
+      messages: [historical], prompt: "same words",
+    })).rejects.toThrow(/admission.*target/i);
+  });
   it("rejects a mismatched captured admission instead of borrowing another transcript's current author", async () => {
     const engine=make(()=>({...admission,sessionId:"different-session"}));
     await expect(engine.assemble({...target,messages:[historical],prompt:"same words",runtimeContext:{sessionTarget:target}})).rejects.toThrow(/admission.*target/i);

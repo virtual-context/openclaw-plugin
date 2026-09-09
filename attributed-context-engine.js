@@ -259,7 +259,16 @@ async function captureHostTranscriptReadAdmission(target) {
 }
 
 async function hasCurrentTurnTranscriptFence(params, capture) {
-  const target = params.runtimeContext?.sessionTarget;
+  // Embedded hosts expose the same admission but omit runtimeContext. Its lookup
+  // needs only the host-owned agent/session identity, never message content.
+  const agentId = typeof params.sessionKey === "string"
+    ? /^(?:sk:)?agent:([^:]+):/.exec(params.sessionKey)?.[1]
+    : undefined;
+  const target = params.runtimeContext?.sessionTarget ?? (
+    agentId && typeof params.sessionId === "string" && params.sessionId
+      ? { agentId, sessionId: params.sessionId, sessionKey: params.sessionKey }
+      : undefined
+  );
   if (!target) return false;
   if (
     !target.agentId
