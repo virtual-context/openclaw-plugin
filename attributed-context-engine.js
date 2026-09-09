@@ -20,17 +20,46 @@ function groupPlatform(sessionKey) {
   return /^[a-z0-9._-]+$/.test(platform) ? platform : "";
 }
 
+/** Read identity only from host-owned message metadata, across native formats. */
+export function readHostMessageSpeaker(message) {
+  if (message?.role !== "user") return null;
+  const metadata = message.__openclaw;
+  if (metadata != null && (typeof metadata !== "object" || Array.isArray(metadata))) {
+    return null;
+  }
+  const transport = metadata?.transport;
+  if (transport != null && (typeof transport !== "object" || Array.isArray(transport))) {
+    return null;
+  }
+  const clean = (value, limit, lower = false) => {
+    if (value == null) return "";
+    if (typeof value !== "string") return null;
+    const text = value.trim();
+    if (text.length > limit || /[\x00-\x1f\x7f]/.test(text)) return null;
+    return lower ? text.toLowerCase() : text;
+  };
+  const senderIds = [message.senderId, metadata?.senderId].map((value) => clean(value, 256));
+  const names = [message.senderName, metadata?.senderName].map((value) => clean(value, 128));
+  const channels = [message.sourceChannel, metadata?.sourceChannel, transport?.channel]
+    .map((value) => clean(value, 64, true));
+  if ([...senderIds, ...names, ...channels].some((value) => value === null)) return null;
+  if (new Set(senderIds.filter(Boolean)).size > 1 || new Set(channels.filter(Boolean)).size > 1) {
+    return null;
+  }
+  // Names can change while the immutable sender id stays the same.
+  return {
+    senderId: senderIds.find(Boolean) ?? "",
+    senderName: names[1] || names[0],
+    sourceChannel: channels.find(Boolean) ?? "",
+  };
+}
+
 function trustedSpeaker(message, platform) {
   if (message?.role !== "user" || !platform) return null;
-  const sourceChannel = typeof message.sourceChannel === "string"
-    ? message.sourceChannel.trim().toLowerCase()
-    : "";
-  const senderId = typeof message.senderId === "string"
-    ? message.senderId.trim()
-    : "";
-  const name = typeof message.senderName === "string"
-    ? message.senderName.trim()
-    : "";
+  const metadata = readHostMessageSpeaker(message);
+  const sourceChannel = metadata?.sourceChannel ?? "";
+  const senderId = metadata?.senderId ?? "";
+  const name = metadata?.senderName ?? "";
   if (
     sourceChannel !== platform
     || !senderId
@@ -65,9 +94,7 @@ export function trustedCurrentGroupSpeaker(messages, sessionKey, prompt) {
   return {
     name: speaker.name,
     actorId: speaker.actor_id,
-    senderId: typeof trailing.senderId === "string"
-      ? trailing.senderId.trim()
-      : "",
+    senderId: readHostMessageSpeaker(trailing)?.senderId ?? "",
     platform,
   };
 }
@@ -209,9 +236,51 @@ export function attributeGroupHistoryMessages(messages, sessionKey, prompt, log)
   return attributedCount > 0 || unattributedCount > 0 ? output : messages;
 }
 
-/** A legacy-parity context engine with speaker-aware group projection. */
+// Current hosts fence transcript SDK reads with an async-local admission. Read
+// that same host-owned receipt instead of guessing from message text or version.
+const TRANSCRIPT_ADMISSION_RUNTIME = "openclaw/plugin-sdk/codex-session-transcript-runtime";
+let transcriptAdmissionRuntime;
+async function captureHostTranscriptReadAdmission(target) {
+  transcriptAdmissionRuntime ??= import(/* @vite-ignore */ TRANSCRIPT_ADMISSION_RUNTIME)
+    .catch((error) => {
+      // Older hosts do not expose this contract; keep their existing projection.
+      if (
+        ["ERR_PACKAGE_PATH_NOT_EXPORTED", "ERR_MODULE_NOT_FOUND"].includes(error?.code)
+        && String(error?.message).includes("codex-session-transcript-runtime")
+      ) return null;
+      throw error;
+    });
+  const runtime = await transcriptAdmissionRuntime;
+  if (!runtime) return undefined;
+  if (typeof runtime.captureCodexSessionTranscriptReadAdmission !== "function") {
+    throw new Error("OpenClaw transcript admission reader is unavailable");
+  }
+  return runtime.captureCodexSessionTranscriptReadAdmission(target);
+}
+
+async function hasCurrentTurnTranscriptFence(params, capture) {
+  const target = params.runtimeContext?.sessionTarget;
+  if (!target) return false;
+  if (
+    !target.agentId
+    || target.sessionId !== params.sessionId
+    || (params.sessionKey && target.sessionKey !== params.sessionKey)
+  ) throw new Error("Transcript admission target does not match context assembly");
+  const admission = await capture(target);
+  if (!admission) return false;
+  if (
+    admission.role !== "user"
+    || admission.agentId !== target.agentId
+    || admission.sessionId !== target.sessionId
+    || admission.sessionKey !== target.sessionKey
+  ) throw new Error("Transcript admission belongs to a different assembly target");
+  return true;
+}
+
+/** A stateless context engine with speaker-aware, host-fenced history projection. */
 export function createSpeakerAttributedContextEngine({
   delegateCompactionToRuntime,
+  captureTranscriptReadAdmission = captureHostTranscriptReadAdmission,
   buildMemorySystemPromptAddition,
   normalizeCurrentPrompt,
   onCurrentSpeaker,
@@ -225,18 +294,28 @@ export function createSpeakerAttributedContextEngine({
     info: {
       id: SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID,
       name: "Virtual Context Speaker-Attributed Legacy Engine",
-      version: "5.5.0",
+      version: "5.11.3",
+      transcriptSemantics: {
+        currentTurnFence: "before-current-turn-entry-v1",
+        turnAdvancementIdempotency: "atomic-idempotent-v1",
+      },
     },
     async ingest() {
       return { ingested: false };
     },
     async assemble(params) {
+      // The host supplies messages strictly before the admitted current entry.
+      // This engine reads no other transcript or cached history. An older row
+      // repeating the current words must stay historical, never prove its author.
+      const fenced = await hasCurrentTurnTranscriptFence(
+        params, captureTranscriptReadAdmission,
+      );
       let currentPrompt = params.prompt;
       try {
         if (typeof normalizeCurrentPrompt === "function") {
           currentPrompt = normalizeCurrentPrompt(params.prompt);
         }
-        const currentSpeaker = trustedCurrentGroupSpeaker(
+        const currentSpeaker = fenced ? null : trustedCurrentGroupSpeaker(
           params.messages,
           params.sessionKey,
           currentPrompt,
@@ -254,7 +333,7 @@ export function createSpeakerAttributedContextEngine({
       const messages = attributeGroupHistoryMessages(
         params.messages,
         params.sessionKey,
-        currentPrompt,
+        fenced ? undefined : currentPrompt,
         log,
       );
       const systemPromptAddition = typeof buildMemorySystemPromptAddition === "function"
@@ -270,6 +349,13 @@ export function createSpeakerAttributedContextEngine({
       };
     },
     async afterTurn() {},
+    async commitTurn() {
+      // There is no engine-owned turn store to advance: assemble projects the
+      // runtime's committed transcript, while cloud ingestion remains owned by
+      // the existing plugin hooks. Replaying this no-op is atomic/idempotent
+      // across process restarts and must not duplicate ingestion or compaction.
+      return { status: "committed" };
+    },
     async compact(params) {
       const result = await delegateCompactionToRuntime(params);
       // Report only a compaction that actually happened, under the runtime's

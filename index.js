@@ -46,10 +46,11 @@ import {
 } from "openclaw/plugin-sdk/core";
 import {
   registerSpeakerAttributedContextEngine,
+  readHostMessageSpeaker,
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.11.2";
+const PLUGIN_VERSION = "5.11.3";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -532,15 +533,22 @@ function resetSessionIngest(sessionId) {
 // `has_reply_context` / `reply_to_id`. String matching is only the fallback
 // for locating that block.
 
-const _CONV_INFO_LABEL = "Conversation info (untrusted metadata):";
-const _REPLY_TARGET_LABEL =
-  "Reply target of current user message (untrusted, for context):";
-const _REPLY_CHAIN_LABEL =
-  "Reply chain of current user message (untrusted, nearest first):";
+const _CONV_INFO_LABELS = [
+  "Conversation info (untrusted metadata):",
+  "Conversation info: ⟦openclaw:ctx⟧",
+];
+const _REPLY_TARGET_LABELS = [
+  "Reply target of current user message (untrusted, for context):",
+  "Reply target of current user message: ⟦openclaw:ctx⟧",
+];
+const _REPLY_CHAIN_LABELS = [
+  "Reply chain of current user message (untrusted, nearest first):",
+  "Reply chain of current user message (nearest first): ⟦openclaw:ctx⟧",
+];
 const _CURRENT_TURN_LABELS = [
-  _CONV_INFO_LABEL,
-  _REPLY_TARGET_LABEL,
-  _REPLY_CHAIN_LABEL,
+  ..._CONV_INFO_LABELS,
+  ..._REPLY_TARGET_LABELS,
+  ..._REPLY_CHAIN_LABELS,
   "Chat history since last reply (untrusted, for context):",
 ];
 const _REPLY_ONLY_DIRECTIVE_TTL_MS = 5 * 60 * 1000;
@@ -559,80 +567,93 @@ const _REPLAY_CLOSE_TAG = "</conversation_context>";
 // adapter, and placed after the request label so it survives that split. Unlike
 // the metadata headers it is not fenced JSON — it is a run of numbered history
 // lines — so the fence-based strip cannot see it.
-const _HISTORY_BLOCK_LABEL =
-  "Conversation context (untrusted, chronological, selected for current message):";
-const _HISTORY_LINE_RE = /^#\d+\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/;
+const _HISTORY_BLOCK_LABELS = [
+  "Conversation context (untrusted, chronological, selected for current message):",
+  "Conversation context (chronological, selected for current message): ⟦openclaw:ctx⟧",
+  "Chat history since last reply: ⟦openclaw:ctx⟧",
+];
+const _HISTORY_LINE_RE = /^#(?:\d+|session:[a-f0-9-]+)\s+\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/i;
 
-/** Parse the fenced JSON block following one of the host's prompt labels. */
+function promptLine(text, at) {
+  const newline = text.indexOf("\n", at);
+  const end = newline < 0 ? text.length : newline;
+  return { text: text.slice(at, end).trimEnd(), end, next: newline < 0 ? end : end + 1 };
+}
+
+/** Read an exact header immediately followed by a complete JSON fence. */
+function labeledJsonAt(text, at, labels, limit = text.length) {
+  if (at > 0 && text[at - 1] !== "\n") return null;
+  const header = promptLine(text, at);
+  if (!labels.includes(header.text) || header.next >= limit) return null;
+  const open = promptLine(text, header.next);
+  if (open.text !== "```json" || open.next >= limit) return null;
+  let cursor = open.next;
+  while (cursor < limit) {
+    const line = promptLine(text, cursor);
+    if (line.end > limit) return null;
+    if (line.text === "```") {
+      try {
+        return { at, end: line.end, value: JSON.parse(text.slice(open.next, cursor).trim()) };
+      } catch {
+        return null;
+      }
+    }
+    cursor = line.next;
+  }
+  return null;
+}
+
+/** Find complete blocks by text position, never by alias preference. */
+function labeledJsonBlocks(text, labels, limit = text.length) {
+  const blocks = [];
+  let at = 0;
+  while (at < limit) {
+    const line = promptLine(text, at);
+    if (labels.includes(line.text)) {
+      const block = labeledJsonAt(text, at, labels, limit);
+      if (block) {
+        blocks.push(block);
+        at = block.end;
+      }
+    }
+    at = promptLine(text, at).next;
+  }
+  return blocks;
+}
+
+/** Parse the fenced JSON block following an exact host prompt label. */
 export function parseLabeledJsonBlock(promptText, label) {
   const text = typeof promptText === "string" ? promptText : "";
-  const at = text.indexOf(label);
-  if (at < 0) return null;
-  const fence = text.indexOf("```json", at);
-  if (fence < 0) return null;
-  const start = text.indexOf("\n", fence);
-  if (start < 0) return null;
-  const end = text.indexOf("```", start + 1);
-  if (end < 0) return null;
-  try {
-    return JSON.parse(text.slice(start + 1, end).trim());
-  } catch {
-    return null;
-  }
+  const labels = Array.isArray(label) ? label : [label];
+  return labeledJsonBlocks(text, labels)[0]?.value ?? null;
 }
 
 /** The host's structured conversation-info object for the current turn, or null. */
 export function parseConversationInfo(promptText) {
-  return parseLabeledJsonBlock(promptText, _CONV_INFO_LABEL);
+  return parseCurrentConversationInfo(promptText);
 }
 
 /**
  * Parse the host-owned Conversation-info wrapper for the current turn.
  *
  * On the first prompt-build pass it is the first such block; user text comes
- * later and therefore cannot replace it by quoting the label. On repeated
- * Codex prompt-build passes, VC's prepared context is placed before the real
- * host envelope and the assembled-context marker follows it, so the last
- * parsable block before that marker is authoritative. This is routing
- * evidence only; none of the prose inside the untrusted block is an
- * instruction.
+ * later and therefore cannot replace it by quoting either supported label. On
+ * repeated prompt-build passes the real host envelope follows prepared context
+ * and precedes the assembled-context marker, so the last block there wins.
+ * This only nominates routing evidence: exact native dispatch identity and body
+ * admission remain mandatory before a Discord turn can use memory.
  */
 export function parseCurrentConversationInfo(promptText) {
   const text = typeof promptText === "string" ? promptText : "";
+  return currentConversationInfoBlock(text)?.value ?? null;
+}
+
+function currentConversationInfoBlock(text) {
   const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
   const limit = replayAt >= 0 ? replayAt : text.length;
-  const candidates = [];
-  let from = 0;
-  while (from < limit) {
-    const at = text.indexOf(_CONV_INFO_LABEL, from);
-    if (at < 0 || at >= limit) break;
-    const lineStart = at === 0 || text[at - 1] === "\n";
-    if (lineStart) {
-      const fence = text.indexOf("```json", at + _CONV_INFO_LABEL.length);
-      const start = fence >= 0 ? text.indexOf("\n", fence) : -1;
-      const end = start >= 0 ? text.indexOf("```", start + 1) : -1;
-      if (
-        fence >= 0
-        && fence < limit
-        && start >= 0
-        && end >= 0
-        && end < limit
-      ) {
-        try {
-          const parsed = JSON.parse(text.slice(start + 1, end).trim());
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            candidates.push(parsed);
-          }
-        } catch {
-          // A malformed quoted block is not evidence. Keep looking for the
-          // host's real block on repeated prompt-build passes.
-        }
-      }
-    }
-    from = at + _CONV_INFO_LABEL.length;
-  }
-  if (!candidates.length) return null;
-  return replayAt >= 0 ? candidates.at(-1) : candidates[0];
+  const candidates = labeledJsonBlocks(text, _CONV_INFO_LABELS, limit)
+    .filter(({ value }) => value && typeof value === "object" && !Array.isArray(value));
+  return (replayAt >= 0 ? candidates.at(-1) : candidates[0]) ?? null;
 }
 
 /** Structured provenance for the current turn, with no prompt text attached. */
@@ -682,53 +703,67 @@ export function currentTurnProvenance(promptText, sessionKey = "") {
 
 /** The nearest replied-to message body supplied by the host, or an empty string. */
 export function replyTargetBody(promptText) {
-  const target = parseLabeledJsonBlock(promptText, _REPLY_TARGET_LABEL);
-  if (typeof target?.body === "string" && target.body.trim()) {
-    return target.body.trim();
-  }
-
-  const chain = parseLabeledJsonBlock(promptText, _REPLY_CHAIN_LABEL);
-  if (Array.isArray(chain)) {
-    const nearest = chain.find(
-      (entry) => typeof entry?.body === "string" && entry.body.trim(),
-    );
+  const text = typeof promptText === "string" ? promptText : "";
+  const envelopeAt = currentConversationInfoBlock(text)?.at ?? 0;
+  const envelope = text.slice(envelopeAt);
+  const limit = leadingScaffoldEnd(envelope);
+  const blocks = labeledJsonBlocks(
+    envelope, [..._REPLY_TARGET_LABELS, ..._REPLY_CHAIN_LABELS], limit,
+  );
+  for (const { value } of blocks) {
+    const entries = Array.isArray(value) ? value : [value];
+    const nearest = entries.find((entry) => typeof entry?.body === "string" && entry.body.trim());
     if (nearest) return nearest.body.trim();
   }
   return "";
 }
 
-/** The actual user-typed body: the current-turn text with the host's labeled
- *  untrusted-metadata blocks removed. */
-export function currentMessageBody(promptText) {
-  let text = typeof promptText === "string" ? promptText : "";
-  for (const label of _CURRENT_TURN_LABELS) {
-    const at = text.indexOf(label);
-    if (at < 0) continue;
-    const fenceStart = text.indexOf("```", at);
-    if (fenceStart < 0) continue;
-    const fenceEnd = text.indexOf("```", fenceStart + 3);
-    if (fenceEnd < 0) continue;
-    text = text.slice(0, at) + text.slice(fenceEnd + 3);
+/** End of a leading plaintext history block, or null for an unknown shape. */
+function historyBlockEnd(text, at) {
+  const header = promptLine(text, at);
+  if (!_HISTORY_BLOCK_LABELS.includes(header.text)) return null;
+  let cursor = header.next;
+  while (cursor < text.length && !promptLine(text, cursor).text.trim()) {
+    cursor = promptLine(text, cursor).next;
   }
-  return text.trim();
+  let end = null;
+  while (cursor < text.length) {
+    const line = promptLine(text, cursor);
+    if (!_HISTORY_LINE_RE.test(line.text)) break;
+    end = line.end;
+    cursor = line.next;
+  }
+  // The first blank separator ends the host block. A user's own timestamped
+  // line after that separator is still part of their current message.
+  return end;
 }
 
-/**
- * Drop the host's numbered chat-history block, keeping the text around it.
- *
- * Only the unbroken run of numbered lines after the label is removed, so the
- * user's own message — which follows that run and is not numbered — survives.
- */
-export function stripHistoryBlock(text) {
-  const at = text.indexOf(_HISTORY_BLOCK_LABEL);
-  if (at < 0) return text;
-  const before = text.slice(0, at);
-  const lines = text.slice(at + _HISTORY_BLOCK_LABEL.length).split("\n");
-  let i = 0;
-  while (i < lines.length && (!lines[i].trim() || _HISTORY_LINE_RE.test(lines[i].trim()))) {
-    i += 1;
+/** Recognize only the contiguous leading host scaffold, not user quotations. */
+function leadingScaffoldEnd(text, limit = text.length) {
+  let cursor = 0;
+  let end = 0;
+  while (cursor < limit) {
+    while (cursor < limit && /\s/.test(text[cursor])) cursor += 1;
+    const block = labeledJsonAt(text, cursor, _CURRENT_TURN_LABELS, limit);
+    const next = block?.end ?? historyBlockEnd(text, cursor);
+    if (next == null || next > limit) break;
+    end = next;
+    cursor = next;
   }
-  return `${before}\n${lines.slice(i).join("\n")}`.trim();
+  return end;
+}
+
+/** The actual user-typed body after the host's leading metadata and history. */
+export function currentMessageBody(promptText) {
+  const text = typeof promptText === "string" ? promptText : "";
+  return text.slice(leadingScaffoldEnd(text)).trim();
+}
+
+/** Drop a leading host history block without stripping later user examples. */
+export function stripHistoryBlock(text) {
+  const start = text.length - text.trimStart().length;
+  const end = historyBlockEnd(text, start);
+  return end == null ? text : text.slice(end).trim();
 }
 
 /**
@@ -785,21 +820,7 @@ export function leadingEnvelope(promptText) {
   const text = typeof promptText === "string" ? promptText : "";
   const replayAt = text.indexOf(_ASSEMBLED_CONTEXT_LABEL);
   const limit = replayAt >= 0 ? replayAt : text.length;
-  let end = 0;
-  for (;;) {
-    let next = -1;
-    for (const label of _CURRENT_TURN_LABELS) {
-      const at = text.indexOf(label, end);
-      if (at >= 0 && at < limit && (next < 0 || at < next)) next = at;
-    }
-    if (next < 0) break;
-    const fence = text.indexOf("```", next);
-    if (fence < 0 || fence >= limit) break;
-    const fenceEnd = text.indexOf("```", fence + 3);
-    if (fenceEnd < 0 || fenceEnd >= limit) break;
-    end = fenceEnd + 3;
-  }
-  return end > 0 ? text.slice(0, end) : "";
+  return text.slice(0, leadingScaffoldEnd(text, limit)).trimEnd();
 }
 
 /**
@@ -913,9 +934,15 @@ export function hasReplyContext(promptText) {
  * left the quoted replay in the body, which never looks like a bare mention.
  * That silently disabled this whole path on every real reply-only turn.
  */
-export function isReplyOnlyInvocation(promptText) {
+export function isReplyOnlyInvocation(promptText, options = undefined) {
   if (!hasReplyContext(promptText)) return false;
-  return isBareMentionOrEmpty(currentTurnBody(promptText));
+  // A member can type a complete host-looking header as their actual body.
+  // Once dispatch has bound the exact body, never reparse those bytes as a
+  // scaffold to decide whether the member sent only a mention.
+  const body = typeof options?.currentBody === "string"
+    ? options.currentBody
+    : currentTurnBody(promptText);
+  return isBareMentionOrEmpty(body);
 }
 
 /**
@@ -924,7 +951,7 @@ export function isReplyOnlyInvocation(promptText) {
  * inventing an XML/Markdown delimiter that the request itself could close.
  */
 export function buildReplyOnlyDirective(promptText, options = undefined) {
-  if (!isReplyOnlyInvocation(promptText)) return "";
+  if (!isReplyOnlyInvocation(promptText, options)) return "";
   const hasTrustedTarget = Boolean(
     options
     && Object.prototype.hasOwnProperty.call(options, "targetBody"),
@@ -966,6 +993,10 @@ export function resolveReplyOnlyDirective(
     ? info.message_id.trim()
     : "";
   const key = messageId ? `${sessionId}:${messageId}` : "";
+  if (typeof options?.currentBody === "string" && !isBareMentionOrEmpty(options.currentBody)) {
+    if (key) _replyOnlyDirectiveCache.delete(key);
+    return "";
+  }
   const fresh = buildReplyOnlyDirective(promptText, options);
 
   if (fresh) {
@@ -1093,7 +1124,7 @@ export function readSpeakerNames(sessionKey, sessionId, log) {
       }
       const msg = entry?.message ?? entry;
       if (msg?.role !== "user") continue;
-      const name = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
+      const name = readHostMessageSpeaker(msg)?.senderName ?? "";
       if (!name) continue;
       const text = speakerMessageText(msg.content).trim();
       if (!text) continue;
@@ -1130,7 +1161,7 @@ export function labelSpeakers(messages, names, log) {
     // resolve repeated words ("yes", "same") to a different historical
     // member, so it is never authoritative for this marked row.
     const name = msg?.[CURRENT_NATIVE_TURN]
-      ? (typeof msg?.senderName === "string" ? msg.senderName.trim() : "")
+      ? (readHostMessageSpeaker(msg)?.senderName ?? "")
       : names.get(text.trim());
     if (!name || text.startsWith(`${name}: `)) return msg;
     labeled++;
@@ -1161,20 +1192,14 @@ export function labelFullSessionSpeakers(messages, sessionKey, log) {
   const names = new Set(
     messages
       .filter((message) => message?.role === "user")
-      .map((message) => (
-        typeof message?.senderName === "string"
-          ? message.senderName.trim()
-          : ""
-      ))
+      .map((message) => readHostMessageSpeaker(message)?.senderName ?? "")
       .filter(Boolean),
   );
   if (names.size < 2) return messages;
   let labeled = 0;
   const output = messages.map((message) => {
     if (message?.role !== "user") return message;
-    const name = typeof message.senderName === "string"
-      ? message.senderName.trim()
-      : "";
+    const name = readHostMessageSpeaker(message)?.senderName ?? "";
     const text = speakerMessageText(message.content);
     if (!name || !text || text.startsWith(`${name}: `)) return message;
     labeled += 1;
@@ -1685,7 +1710,7 @@ export function mergeCurrentUserMessage(messages, currentBody, inboundTurn) {
     for (let index = source.length - 1; index >= 0; index -= 1) {
       const message = source[index];
       if (message?.role !== "user") continue;
-      const messageSender = cleanInboundField(message?.senderId);
+      const messageSender = readHostMessageSpeaker(message)?.senderId ?? "";
       const messageTimestamp = Number(message?.timestamp);
       if (
         messageSender === senderId
@@ -2116,15 +2141,10 @@ export function findCurrentSpeakerInSessionJsonl(
     // user row to be the exact current body; never search backward into an old
     // matching message and accidentally borrow that older author's identity.
     if (speakerMessageText(message.content).trim() !== body) return null;
-    const senderId = typeof message.senderId === "string"
-      ? message.senderId.trim()
-      : "";
-    const name = typeof message.senderName === "string"
-      ? message.senderName.trim()
-      : "";
-    const sourceChannel = typeof message.sourceChannel === "string"
-      ? message.sourceChannel.trim().toLowerCase()
-      : "";
+    const metadata = readHostMessageSpeaker(message);
+    const senderId = metadata?.senderId ?? "";
+    const name = metadata?.senderName ?? "";
+    const sourceChannel = metadata?.sourceChannel ?? "";
     if (
       !senderId
       || senderId.length > 256
@@ -7890,7 +7910,7 @@ export default {
       // reply + bare mention to an otherwise empty "@Vast" request.
       if (
         exactDiscordAdmission
-        && isReplyOnlyInvocation(event.prompt)
+        && isReplyOnlyInvocation(event.prompt, { currentBody })
         && !verifiedReplyTarget?.body
       ) {
         log.warn?.(
@@ -7903,9 +7923,12 @@ export default {
         event.prompt,
         sessionId,
         Date.now(),
-        verifiedReplyTarget
-          ? { targetBody: verifiedReplyTarget.body }
-          : (exactDiscordAdmission ? { targetBody: "" } : undefined),
+        {
+          ...(verifiedReplyTarget
+            ? { targetBody: verifiedReplyTarget.body }
+            : (exactDiscordAdmission ? { targetBody: "" } : {})),
+          ...(inboundTurn?.invokedBody ? { currentBody } : {}),
+        },
       );
       // This must run before VC prepare and on EVERY prompt-build pass. The
       // Codex Discord harness rebuilds the prompt after the first hook result;
