@@ -50,7 +50,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.11.3";
+const PLUGIN_VERSION = "5.11.5";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -2736,6 +2736,27 @@ export async function resolveVerifiedReplyTarget(
     config,
     log,
   );
+}
+
+/** Transport the verified reply chain separately from canonical user text. */
+export function buildVerifiedReplyProvenance(target) {
+  if (!target) return {};
+  const parent = target.parent;
+  return {
+    reply_target_message_id: target.messageId,
+    reply_target_body: target.body,
+    ...(target.actorId ? { reply_subject_actor_id: target.actorId } : {}),
+    ...(target.senderName ? { reply_subject_label: target.senderName } : {}),
+    ...(target.body && parent?.messageId && parent.messageId !== target.messageId
+      && parent.actorId && parent.body && !parent.status
+      ? { reply_target_parent: {
+          message_id: parent.messageId,
+          actor_id: parent.actorId,
+          name: parent.senderName || "",
+          body: parent.body,
+        } }
+      : {}),
+  };
 }
 
 /** Model-facing, explicitly-linked quotation for the current native reply. */
@@ -7903,18 +7924,7 @@ export default {
                 : {}),
             }
           : trustedPromptProvenance),
-        ...(verifiedReplyTarget
-          ? {
-              reply_target_message_id: verifiedReplyTarget.messageId,
-              reply_target_body: verifiedReplyTarget.body,
-              ...(verifiedReplyTarget.actorId
-                ? { reply_subject_actor_id: verifiedReplyTarget.actorId }
-                : {}),
-              ...(verifiedReplyTarget.senderName
-                ? { reply_subject_label: verifiedReplyTarget.senderName }
-                : {}),
-            }
-          : {}),
+        ...buildVerifiedReplyProvenance(verifiedReplyTarget),
       };
       if (currentGroupSpeaker) {
         log.info?.(

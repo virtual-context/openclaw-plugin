@@ -1580,6 +1580,12 @@ describe("current Discord sender and reply target", () => {
     expect(prepare.reply_target_message_id).toBe(TARGET_MESSAGE_ID);
     expect(prepare.reply_subject_actor_id).toBe(`actor:discord:${VAST_ID}`);
     expect(prepare).not.toHaveProperty("target_in_reply_to");
+    expect(prepare.reply_target_parent).toMatchObject({
+      message_id: PARENT_MESSAGE_ID,
+      actor_id: `actor:discord:${PARENT_SENDER_ID}`,
+      body: PARENT_BODY,
+    });
+    expect(prepare.sender_actor_id).toBe(`actor:discord:${CURRENT_SENDER_ID}`);
   });
 
   it("keeps the verified direct target when parent enrichment fails", async () => {

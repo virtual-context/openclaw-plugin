@@ -1,5 +1,13 @@
 # Bug fixes
 
+## BUG-004 — Verified reply parents disappear before memory preparation
+
+The model-facing reply boundary retained the target's parent, but memory preparation received only the direct target. A third-party follow-up therefore lacked the participant identity needed to select relevant continuity.
+
+The adapter forwards the verified parent as separate provenance, preserving the current sender and direct subject. Missing, edited, unavailable and self-linked parents are omitted. Parent text never enters the canonical user body.
+
+Regression: the missing provenance builder first failed synthetic parent transport checks. Focused builder and registered-hook cases cover valid parent transport, unchanged requester identity, unavailable parents and malformed native references.
+
 ## BUG-003 — Source claims lose bound message occurrence time
 
 Exact dispatch binding retained the transport timestamp locally but omitted it from the source claim. Delayed delivery and replay consequently preserved identity without preserving when the message occurred.
