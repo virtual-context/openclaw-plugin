@@ -1,3 +1,6 @@
+import { projectHistoryImagesForFlatHost } from "./history-image-refs.js";
+import { createHistoryImageLabeler } from "./image-labeler.js";
+
 const ATTRIBUTED_MESSAGE = Symbol("virtual-context-speaker-attributed");
 
 export const SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID = "virtual-context";
@@ -294,16 +297,21 @@ export function createSpeakerAttributedContextEngine({
   normalizeCurrentPrompt,
   onCurrentSpeaker,
   onCompaction,
+  historyImageLabeler,
   log,
 }) {
   if (typeof delegateCompactionToRuntime !== "function") {
     throw new TypeError("delegateCompactionToRuntime is required");
   }
+  // null disables labeling (tests); undefined builds the bundled worker.
+  const labeler = historyImageLabeler === null
+    ? null
+    : (historyImageLabeler ?? createHistoryImageLabeler({ log }));
   return {
     info: {
       id: SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID,
       name: "Virtual Context Speaker-Attributed Legacy Engine",
-      version: "5.11.3",
+      version: "5.12.0",
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -339,20 +347,30 @@ export function createSpeakerAttributedContextEngine({
       } catch (error) {
         log?.warn?.(`[vc:identity] current speaker handoff failed: ${error}`);
       }
-      const messages = attributeGroupHistoryMessages(
+      const attributed = attributeGroupHistoryMessages(
         params.messages,
         params.sessionKey,
         fenced ? undefined : currentPrompt,
         log,
       );
-      const systemPromptAddition = typeof buildMemorySystemPromptAddition === "function"
+      // Flat-rendering hosts get every history image labeled with a printed
+      // VCREF that the message text and the developer map repeat. Never throws
+      // and never drops an image; see history-image-refs.js.
+      const media = await projectHistoryImagesForFlatHost(attributed, {
+        sessionId: params.sessionId,
+        runtimeSettings: params.runtimeSettings,
+        runtimeContext: params.runtimeContext,
+        prompt: fenced ? undefined : currentPrompt,
+      }, { labeler, log });
+      const memoryAddition = typeof buildMemorySystemPromptAddition === "function"
         ? buildMemorySystemPromptAddition({
             availableTools: params.availableTools,
             citationsMode: params.citationsMode,
           })
         : undefined;
+      const systemPromptAddition = [memoryAddition, media.note].filter(Boolean).join("\n\n");
       return {
-        messages,
+        messages: media.messages,
         estimatedTokens: 0,
         ...(systemPromptAddition ? { systemPromptAddition } : {}),
       };

@@ -2,6 +2,7 @@
 
 | Bug | Tests | Contract |
 |---|---|---|
+| BUG-005 | `history-image-refs.test.js`; `image-labeler.test.js`; `codex-history-image-projection.test.js` — `BUG-005: …` | Flat-projection host detection, per-image VCREF derivation and uniqueness, derived-copy projection with refs in text and file name, byte-identical originals on failure, developer ref map, trusted workspace resolution, labeler cache/quota/temp hygiene, and untouched embedded assemblies |
 | BUG-004 | `reply-parent-provenance.test.js`; `current-turn-reply-attribution.test.js` — verified parent cases | Separate parent identity and body through registered hooks, unchanged requester and direct subject, unavailable parent and invalid reference exclusion |
 | BUG-003 | `source-event-time.test.js`; `host-envelope-compat.test.js` — `BUG-003: sends occurrence time only with server capability` | Bound timestamp serialization, legacy claim compatibility, invalid time rejection, source identity, and invocation-scoped capability negotiation through registered native dispatch, deferred reply-only admission, and native reply preservation during capability outages |
 | BUG-001 | `server-memory-scope.test.js` — `BUG-001: client-owned server memory scope` | Multiple servers, verified membership, threads, account isolation, exact overrides, conflicts, missing membership, cold lookup backoff, and legacy DM/ephemeral scopes |
