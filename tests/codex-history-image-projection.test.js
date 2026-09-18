@@ -119,6 +119,22 @@ describe("BUG-005: Codex assemblies bind every history image to its message", ()
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("error=worker timeout"));
   });
 
+  it("lists the current request's images from the prompt envelope in the developer map", async () => {
+    const earlier = memberRow("Here we go", [imageFact("IMG_1052.png")]);
+    const current = imageFact("IMG_1053.png");
+    const prompt = [
+      `[media attached: ${current.path} (image/png) "IMG_1053.png"]`,
+      "To send an image back, use the message tool. Keep caption in the text body.",
+      "Look again big dawg",
+    ].join("\n");
+    const result = await make({ historyImageLabeler: stubLabeler() }).assemble({
+      ...target, messages: [earlier], prompt, runtimeSettings: codex, runtimeContext,
+    });
+    expect(result.systemPromptAddition).toContain("The current request's images are attached last and carry no band.");
+    expect(result.systemPromptAddition).toContain('Current request images (attached last, no band): 1 = "IMG_1053.png"');
+    expect(result.systemPromptAddition).not.toMatch(/unlabeled/iu);
+  });
+
   it("places the image map after the memory addition and omits it when there are no history images", async () => {
     const labeler = stubLabeler();
     const engine = make({ historyImageLabeler: labeler, buildMemorySystemPromptAddition: () => "MEMORY" });

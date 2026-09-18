@@ -11,6 +11,7 @@ import {
   isImageMediaFact,
   labeledFileName,
   messageBindingKey,
+  parseCurrentRequestImages,
   projectHistoryImageBindings,
   projectHistoryImagesForFlatHost,
   resolveLabelWorkspaceDir,
@@ -76,7 +77,7 @@ describe("BUG-005: history image refs", () => {
   it("derives readable display names and strips unsafe characters", () => {
     expect(attachmentDisplayName(imageFact("IMG_0978.png"))).toBe("IMG_0978.png");
     expect(attachmentDisplayName({ path: staged("IMG_0957") })).toBe("IMG_0957.png");
-    expect(attachmentDisplayName({ fileName: 'weird ["name"]‮.png' })).toBe("weird name .png");
+    expect(attachmentDisplayName({ fileName: 'weird ["name"]\u202e.png' })).toBe("weird name .png");
     expect(attachmentDisplayName({ fileName: "x".repeat(200) }).length).toBeLessThanOrEqual(82);
     expect(attachmentDisplayName({})).toBe("image");
   });
@@ -154,7 +155,8 @@ describe("BUG-005: history image refs", () => {
     ]);
     const note = buildHistoryImageDeveloperNote(bindings, outcomes);
     expect(note).toContain("ONLY by an exact VCREF match");
-    expect(note).toContain("Attached images with no VCREF band belong to the current user request");
+    expect(note).toContain("The current request's images are attached last and carry no band.");
+    expect(note).not.toContain("Current request images");
     expect(note).toContain(`- VCREF ${bindings[0].ref}: Member A, 2026-09-09 20:49 UTC, "IMG_0978.png"`);
     expect(note).toContain("WITHOUT a VCREF band");
     expect(note).toContain('- Member A, 2026-09-09 20:49 UTC, "IMG_0999.png"');
@@ -173,6 +175,36 @@ describe("BUG-005: history image refs", () => {
     );
     expect(remote[0].sourcePath).toBe("");
     expect(resolveLabelWorkspaceDir(undefined, remote)).toBeNull();
+  });
+
+  it("parses the current request's image attachments from the host envelope", () => {
+    const single = [
+      `[media attached: ${staged("IMG_1053")} (image/png) "IMG_1053.png"]`,
+      "To send an image back, use the message tool. Keep caption in the text body.",
+      "Here we go @Vast",
+    ].join("\n");
+    expect(parseCurrentRequestImages(single)).toEqual(["IMG_1053.png"]);
+    const multi = [
+      "[media attached: 3 files]",
+      `[media attached 1/3: ${staged("IMG_0978")} (image/png) "IMG_0978.png"]`,
+      `[media attached 2/3: ${WS}/media/inbound/x/coa.pdf (application/pdf) "coa.pdf"]`,
+      `[media attached 3/3: ${staged("IMG_0979")} (image/png)]`,
+      "caption",
+    ].join("\n");
+    expect(parseCurrentRequestImages(multi)).toEqual(["IMG_0978.png", "IMG_0979.png"]);
+    expect(parseCurrentRequestImages(`plain text\n[media attached: ${staged("x")} (image/png)]`)).toEqual([]);
+    expect(parseCurrentRequestImages("")).toEqual([]);
+    expect(parseCurrentRequestImages(undefined)).toEqual([]);
+  });
+
+  it("names the current request's images positively in the developer map", () => {
+    const messages = [row("one", [imageFact("IMG_0978.png")])];
+    const bindings = collectHistoryImageBindings(messages, { sessionId: "s" });
+    const outcomes = outcomesFor(bindings, () => ({ path: "/x.jpg", contentType: "image/jpeg" }));
+    const note = buildHistoryImageDeveloperNote(bindings, outcomes, { currentImages: ["IMG_1053.png", "IMG_1054.png"] });
+    expect(note).toContain("The current request's images are attached last and carry no band.");
+    expect(note).toContain('Current request images (attached last, no band): 1 = "IMG_1053.png", 2 = "IMG_1054.png"');
+    expect(note).not.toMatch(/unlabeled|not attached|re-share/iu);
   });
 
   it("orchestrates labeling for the Codex host and leaves other hosts untouched", async () => {

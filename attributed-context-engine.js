@@ -311,7 +311,7 @@ export function createSpeakerAttributedContextEngine({
     info: {
       id: SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID,
       name: "Virtual Context Speaker-Attributed Legacy Engine",
-      version: "5.12.0",
+      version: "5.12.1",
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -361,6 +361,7 @@ export function createSpeakerAttributedContextEngine({
         runtimeSettings: params.runtimeSettings,
         runtimeContext: params.runtimeContext,
         prompt: fenced ? undefined : currentPrompt,
+        currentRequestPrompt: params.prompt,
       }, { labeler, log });
       const memoryAddition = typeof buildMemorySystemPromptAddition === "function"
         ? buildMemorySystemPromptAddition({
