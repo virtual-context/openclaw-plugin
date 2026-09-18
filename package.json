@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-virtual-context",
-  "version": "5.11.5",
+  "version": "5.12.0",
   "description": "Plugin integrates OpenClaw to virtual-context.com and provides a virtual context window of 50M+ tokens for unlimited memory, reduces upstream costs by compressing the LLM payload, and increases LLM reasoning by providing only relevant context with memory retrieval tools.",
   "main": "./index.js",
   "type": "module",
@@ -40,6 +40,9 @@
   "files": [
     "index.js",
     "attributed-context-engine.js",
+    "history-image-refs.js",
+    "image-labeler.js",
+    "tools/label_image.py",
     "model-call-capture.js",
     "server-memory-scope.js",
     "openclaw.plugin.json",
