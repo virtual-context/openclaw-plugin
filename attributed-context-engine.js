@@ -286,172 +286,6 @@ async function hasCurrentTurnTranscriptFence(params, capture) {
   return true;
 }
 
-
-// The Codex app-server host renders assembled history into ONE prompt string
-// and appends every history image it can load as a flat image list after that
-// string (images: [...contextImages, ...currentTurnImages]). Text and images
-// lose their pairing there: a turn with one new screenshot arrives with every
-// earlier screenshot in the conversation and no way to tell which is which.
-// Embedded hosts keep images structurally inside their message and prune them
-// themselves, so this projection only touches the flat-rendering host.
-const FLAT_IMAGE_PROJECTION_HOST_IDS = new Set(["codex-app-server"]);
-const IMAGE_EXTENSION_RE = /\.(?:png|jpe?g|gif|webp|bmp|heic|heif|tiff?|avif)(?:[?#].*)?$/iu;
-const ATTACHED_IMAGES_ARE_CURRENT_NOTE =
-  "Attached images belong only to the current user request. Earlier images "
-  + "are noted in the conversation text and are not attached; ask for a "
-  + "re-share before describing one.";
-
-/** True when the host flattens assembled history into a single prompt string. */
-export function hostFlattensHistoryImages(runtimeSettings) {
-  const id = runtimeSettings?.executionHost?.id;
-  return typeof id === "string" && FLAT_IMAGE_PROJECTION_HOST_IDS.has(id.trim().toLowerCase());
-}
-
-function isRecord(value) {
-  return value != null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isImageMediaFact(fact) {
-  if (!isRecord(fact)) return false;
-  const kind = typeof fact.kind === "string" ? fact.kind.trim().toLowerCase() : "";
-  if (kind) return kind === "image";
-  const contentType = typeof fact.contentType === "string"
-    ? fact.contentType.trim().toLowerCase()
-    : "";
-  if (contentType) return contentType.startsWith("image/");
-  const ref = (typeof fact.path === "string" && fact.path)
-    || (typeof fact.url === "string" && fact.url)
-    || "";
-  return IMAGE_EXTENSION_RE.test(ref);
-}
-
-function cleanNoteText(value, limit) {
-  if (typeof value !== "string") return "";
-  const text = value.replace(/[\x00-\x1f\x7f]/gu, " ").replace(/[[\]]/gu, "").trim();
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
-}
-
-/** User-facing attachment name: the host's fileName, else the staged basename. */
-function attachmentDisplayName(fact) {
-  const fileName = cleanNoteText(fact.fileName, 80);
-  if (fileName) return fileName;
-  const ref = (typeof fact.path === "string" && fact.path)
-    || (typeof fact.url === "string" && fact.url)
-    || "";
-  const base = ref.split(/[\\/]/u).pop() ?? "";
-  // Host staging names look like input-IMG_0978---<uuid>.png.
-  const derived = base
-    .replace(/^input-/u, "")
-    .replace(/---[0-9a-f-]{8,}(?=\.[^.]+$)/iu, "");
-  return cleanNoteText(derived, 80) || "image";
-}
-
-function earlierImageNote(names, speakerName) {
-  const who = speakerName ? ` from ${speakerName}` : "";
-  const noun = names.length === 1 ? "image" : `${names.length} images`;
-  const list = names.map((name) => `"${name}"`).join(", ");
-  return `[earlier ${noun}${who}: ${list}; not attached to this request]`;
-}
-
-/**
- * Detach a history message's images for a flat-rendering host.
- *
- * Returns the same object when there is nothing to detach. Otherwise returns
- * a projected copy: image facts leave `__openclaw.media` (non-image facts
- * stay), inline image parts leave the content, the host's own
- * `mediaImagePruned` flag is set so its media loader skips the row, and one
- * bracketed note names what was there so the model still knows an image was
- * shared without being handed the bytes. Never mutates the host's row.
- */
-export function detachHistoryImagesForFlatProjection(message) {
-  if (message?.role !== "user") return { message, detached: 0 };
-  if (containsToolProtocolPart(message.content)) return { message, detached: 0 };
-  const metadata = isRecord(message.__openclaw) ? message.__openclaw : null;
-  const facts = Array.isArray(metadata?.media) ? metadata.media : [];
-  const imageFacts = facts.filter(isImageMediaFact);
-  const otherFacts = facts.filter((fact) => !imageFacts.includes(fact));
-  const legacyFacts = Array.isArray(message.media) ? message.media : [];
-  const legacyImageFacts = legacyFacts.filter(isImageMediaFact);
-  const inlineImages = Array.isArray(message.content)
-    ? message.content.filter((part) => part?.type === "image")
-    : [];
-  const detached = imageFacts.length + legacyImageFacts.length + inlineImages.length;
-  if (detached === 0) return { message, detached: 0 };
-
-  const names = [...imageFacts, ...legacyImageFacts].map(attachmentDisplayName);
-  for (let index = 0; index < inlineImages.length; index += 1) names.push("inline image");
-  const speakerName = cleanNoteText(readHostMessageSpeaker(message)?.senderName, 64);
-  const note = earlierImageNote(names, speakerName);
-
-  let content;
-  if (typeof message.content === "string") {
-    content = message.content.trim() ? `${message.content}\n${note}` : note;
-  } else if (Array.isArray(message.content)) {
-    content = [
-      ...message.content.filter((part) => part?.type !== "image"),
-      { type: "text", text: note },
-    ];
-  } else {
-    content = note;
-  }
-
-  const projected = { ...message, content };
-  if (legacyFacts.length) {
-    const remaining = legacyFacts.filter((fact) => !legacyImageFacts.includes(fact));
-    if (remaining.length) projected.media = remaining;
-    else delete projected.media;
-  }
-  const nextMetadata = { ...(metadata ?? {}) };
-  if (otherFacts.length) nextMetadata.media = otherFacts;
-  else delete nextMetadata.media;
-  delete nextMetadata.mediaImageLayout;
-  delete nextMetadata.mediaImageBlockFactIndexes;
-  nextMetadata.mediaImagePruned = true;
-  projected.__openclaw = nextMetadata;
-  return { message: projected, detached };
-}
-
-/**
- * Detach every history image when the host renders history flat.
- *
- * The trailing row is left untouched when it is the current request (no
- * transcript fence): the host removes it from projected history by exact
- * text, and its images travel with the turn itself, not with history.
- */
-export function detachHistoryImagesForHost(messages, runtimeSettings, prompt, log) {
-  if (!Array.isArray(messages) || !hostFlattensHistoryImages(runtimeSettings)) {
-    return { messages, detachedImages: 0, detachedMessages: 0 };
-  }
-  const currentPrompt = typeof prompt === "string" ? prompt.trim() : "";
-  const trailingIndex = messages.length - 1;
-  const trailing = messages[trailingIndex];
-  const preserveTrailingCurrent = Boolean(
-    currentPrompt
-    && trailing?.role === "user"
-    && textContent(trailing.content).trim() === currentPrompt,
-  );
-  let detachedImages = 0;
-  let detachedMessages = 0;
-  const output = messages.map((message, index) => {
-    if (preserveTrailingCurrent && index === trailingIndex) return message;
-    const result = detachHistoryImagesForFlatProjection(message);
-    if (result.detached > 0) {
-      detachedImages += result.detached;
-      detachedMessages += 1;
-    }
-    return result.message;
-  });
-  if (detachedImages > 0) {
-    log?.info?.(
-      `[vc:media] flat-projection host=${runtimeSettings.executionHost.id}: detached `
-      + `${detachedImages} earlier image(s) from ${detachedMessages} history message(s); `
-      + "only the current request's attachments travel with this turn",
-    );
-    return { messages: output, detachedImages, detachedMessages };
-  }
-  return { messages, detachedImages: 0, detachedMessages: 0 };
-}
-
 /** A stateless context engine with speaker-aware, host-fenced history projection. */
 export function createSpeakerAttributedContextEngine({
   delegateCompactionToRuntime,
@@ -469,7 +303,7 @@ export function createSpeakerAttributedContextEngine({
     info: {
       id: SPEAKER_ATTRIBUTED_CONTEXT_ENGINE_ID,
       name: "Virtual Context Speaker-Attributed Legacy Engine",
-      version: "5.11.6",
+      version: "5.11.3",
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -505,29 +339,18 @@ export function createSpeakerAttributedContextEngine({
       } catch (error) {
         log?.warn?.(`[vc:identity] current speaker handoff failed: ${error}`);
       }
-      const attributed = attributeGroupHistoryMessages(
+      const messages = attributeGroupHistoryMessages(
         params.messages,
         params.sessionKey,
         fenced ? undefined : currentPrompt,
         log,
       );
-      const media = detachHistoryImagesForHost(
-        attributed,
-        params.runtimeSettings,
-        fenced ? undefined : currentPrompt,
-        log,
-      );
-      const messages = media.messages;
-      const memoryAddition = typeof buildMemorySystemPromptAddition === "function"
+      const systemPromptAddition = typeof buildMemorySystemPromptAddition === "function"
         ? buildMemorySystemPromptAddition({
             availableTools: params.availableTools,
             citationsMode: params.citationsMode,
           })
         : undefined;
-      const systemPromptAddition = [
-        memoryAddition,
-        media.detachedImages > 0 ? ATTACHED_IMAGES_ARE_CURRENT_NOTE : undefined,
-      ].filter(Boolean).join("\n\n");
       return {
         messages,
         estimatedTokens: 0,

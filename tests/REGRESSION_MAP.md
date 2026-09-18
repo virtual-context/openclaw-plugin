@@ -2,7 +2,6 @@
 
 | Bug | Tests | Contract |
 |---|---|---|
-| BUG-005 | `codex-history-media.test.js` — `BUG-005: flat-projection hosts receive only the current request's images` | Codex host detection, history image-fact detachment with speaker-named notes, mixed attachment sets, embedded/unknown host identity, unfenced current-row preservation, fenced same-text rows, staged-name derivation, inline image parts, untouched assistant/tool/image-free rows, and single system-prompt note |
 | BUG-004 | `reply-parent-provenance.test.js`; `current-turn-reply-attribution.test.js` — verified parent cases | Separate parent identity and body through registered hooks, unchanged requester and direct subject, unavailable parent and invalid reference exclusion |
 | BUG-003 | `source-event-time.test.js`; `host-envelope-compat.test.js` — `BUG-003: sends occurrence time only with server capability` | Bound timestamp serialization, legacy claim compatibility, invalid time rejection, source identity, and invocation-scoped capability negotiation through registered native dispatch, deferred reply-only admission, and native reply preservation during capability outages |
 | BUG-001 | `server-memory-scope.test.js` — `BUG-001: client-owned server memory scope` | Multiple servers, verified membership, threads, account isolation, exact overrides, conflicts, missing membership, cold lookup backoff, and legacy DM/ephemeral scopes |
