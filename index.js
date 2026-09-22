@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.16.0";
+const PLUGIN_VERSION = "5.16.1";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -639,13 +639,6 @@ function labeledJsonBlocks(text, labels, limit = text.length) {
     at = promptLine(text, at).next;
   }
   return blocks;
-}
-
-/** Parse the fenced JSON block following an exact host prompt label. */
-export function parseLabeledJsonBlock(promptText, label) {
-  const text = typeof promptText === "string" ? promptText : "";
-  const labels = Array.isArray(label) ? label : [label];
-  return labeledJsonBlocks(text, labels)[0]?.value ?? null;
 }
 
 /** The host's structured conversation-info object for the current turn, or null. */
