@@ -298,6 +298,7 @@ export function createSpeakerAttributedContextEngine({
   onCurrentSpeaker,
   onCompaction,
   historyImageLabeler,
+  historyWindowFor,
   log,
 }) {
   if (typeof delegateCompactionToRuntime !== "function") {
@@ -347,8 +348,20 @@ export function createSpeakerAttributedContextEngine({
       } catch (error) {
         log?.warn?.(`[vc:identity] current speaker handoff failed: ${error}`);
       }
+      // A routed agent's model call goes through VC, which holds the canonical
+      // history and injects what the turn needs; the host projection then only
+      // carries a recent tail instead of the whole transcript.
+      let history = params.messages;
+      const window = typeof historyWindowFor === "function" ? Number(historyWindowFor(params.sessionKey)) || 0 : 0;
+      if (window > 0 && Array.isArray(history) && history.length > window) {
+        history = history.slice(-window);
+        log?.info?.(
+          `[vc:proxy] projection windowed — session=${params.sessionId} ` +
+          `${params.messages.length} -> ${history.length} message(s); VC owns the history`,
+        );
+      }
       const attributed = attributeGroupHistoryMessages(
-        params.messages,
+        history,
         params.sessionKey,
         fenced ? undefined : currentPrompt,
         log,

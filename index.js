@@ -64,7 +64,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.14.3";
+const PLUGIN_VERSION = "5.15.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -6495,6 +6495,13 @@ export default {
     registerSpeakerAttributedContextEngine(api, {
       delegateCompactionToRuntime,
       buildMemorySystemPromptAddition,
+      // Routed agents (twin or Codex route) send their model call through VC,
+      // which owns the history; the host projection keeps only a recent tail.
+      historyWindowFor: (sessionKey) => {
+        if (!proxyMode.enabled) return 0;
+        const id = agentIdFromSessionKey(sessionKey);
+        return proxyMode.agents.has(id) || proxyMode.codexAgents?.has(id) ? HOST_HISTORY_TAIL : 0;
+      },
       normalizeCurrentPrompt: currentTurnForIngest,
       onCurrentSpeaker: (snapshot) => rememberCurrentContextSpeaker({
         ...snapshot,
