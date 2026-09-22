@@ -346,3 +346,11 @@ keys alone.
   transcript (transcript_events, transcript_event_identities, session_transcript_active_events,
   index state); gateway restart; one routed turn; read `[vc:proxy] projection windowed N -> 24`,
   `[context-diag] pre-prompt … historyTextChars=`, and the engine `T<n> … in= out=` line.
+
+## 11. Proxy mode owns the payload (ruling of 2026-09-22)
+
+- The host sends whatever it builds; VC is the context engineer for the whole outbound payload. The plugin's only proxy-mode duties are routing and handing VC the conversation id (the signed marker in the prompt; the gateway's `before_model_resolve` can only override model and provider, so no per-session query string or header can ride on the model call).
+- For a routed agent the plugin does no prompt injection, no end-of-run ingest (`proxyOwnsIngest` is true for the Codex route as of 5.16.0), and no host-registered `vc_*` tools: the route scripts set `agents.entries.<agent>.tools.deny = ["vc_*"]` so the proxy's injected tools are the ones the model sees and runs through VC.
+- The tenant parameters (`context_window`, compaction thresholds, `protected_recent_turns`, `tool_output`, assembly budgets) define the outbound payload; no proxy-only budget knob. Per-conversation overrides persist where the engine reads them (cloud 68cf348) and reach every worker within the revision recheck interval (cloud 54c3100).
+- Codex payload facts (captured 2026-09-22 13:24Z, Vast guild): the tool catalog rides inside `input` as an `additional_tools` developer item; the current turn's tool loop is `custom_tool_call`/`custom_tool_call_output` items; the whole loop is one turn to VC. The engine counts every item type (6943aba, within 0.2% of provider usage on the captures), stubs consumed tool outputs inside the current turn under protected-zone intrusion keeping the newest two verbatim (82d3aaf), and keeps per-conversation embedding caches packed (417a2fc).
+- Order of reduction (Codex review, specs/astra-review-proxy-mode-2026-09-22.md in the engine repo): proven duplicates, reconstructible scaffolding, tool catalog exposure with discovery kept, older history through summaries and retrieval, then selected current-turn tool evidence. Streaming pass-through with VC tool interception is a later coordinator design. Vast stays native until the release gate in that review passes.
