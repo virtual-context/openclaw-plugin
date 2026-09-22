@@ -31,4 +31,12 @@ describe("routed projection window", () => {
     const none = make();
     expect((await none.assemble(params(history(60)))).messages).toHaveLength(60);
   });
+  it("a broken window callback never breaks assembly", async () => {
+    const log = { info: vi.fn(), warn: vi.fn() };
+    for (const bad of [() => Symbol("tail"), () => { throw new Error("boom"); }, () => "24", () => NaN, () => -3]) {
+      const engine = make({ historyWindowFor: bad, log });
+      expect((await engine.assemble(params(history(60)))).messages).toHaveLength(60);
+    }
+    expect(log.warn.mock.calls.some(([line]) => /history window lookup failed/.test(line))).toBe(true);
+  });
 });

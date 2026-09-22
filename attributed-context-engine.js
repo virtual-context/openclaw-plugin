@@ -352,7 +352,16 @@ export function createSpeakerAttributedContextEngine({
       // history and injects what the turn needs; the host projection then only
       // carries a recent tail instead of the whole transcript.
       let history = params.messages;
-      const window = typeof historyWindowFor === "function" ? Number(historyWindowFor(params.sessionKey)) || 0 : 0;
+      let window = 0;
+      if (typeof historyWindowFor === "function") {
+        // A broken window callback must never cost the turn its history.
+        try {
+          const raw = historyWindowFor(params.sessionKey);
+          window = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+        } catch (error) {
+          log?.warn?.(`[vc:proxy] history window lookup failed: ${error}`);
+        }
+      }
       if (window > 0 && Array.isArray(history) && history.length > window) {
         history = history.slice(-window);
         log?.info?.(
