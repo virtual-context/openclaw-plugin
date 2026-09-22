@@ -337,11 +337,13 @@ export function observeProxyModelCall(latch, model) {
 }
 
 /**
- * The plugin skips its own ingest only when every observed call went to the twin.
- * A Codex-routed run gives no per-call proof that VC saw the request (the binary
- * can pick a transport that bypasses the base URL), so the plugin keeps ingesting
- * and the proxy's canonical-turn dedupe absorbs the second copy.
+ * In proxy mode the proxy records every turn it relays, so the plugin never ingests a
+ * routed run twice. A twin run proves routing per call (every observed model call
+ * was a twin); a Codex-routed run is routed by the agent's provider config, so the
+ * proxy owns its ingest for the whole run.
  */
 export function proxyOwnsIngest(latch) {
-  return Boolean(latch && latch.route !== "codex" && latch.observed && !latch.mismatch);
+  if (!latch) return false;
+  if (latch.route === "codex") return true;
+  return Boolean(latch.observed && !latch.mismatch);
 }
