@@ -10,6 +10,9 @@
  * contained so index.js only wires hooks.
  */
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export const ROUTE_MARKER_PREFIX = "<!-- vc:route conversation=";
 
@@ -51,8 +54,8 @@ export function tenantPathSegment(vcKey) {
  * Validation per agent: embedded runtime, primary is openai/<real> with twin <real>-vc,
  * fallbacks are twins only, every referenced twin is a well-formed VC-routed catalog entry.
  */
-export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, log } = {}) {
-  const out = { enabled: false, agents: new Map(), disabled: [], healthTimeoutMs: 1500, healthTtlMs: 60_000, latchTtlMs: 24 * 3_600_000 };
+export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, log, readCodexConfig = readCodexHomeConfig } = {}) {
+  const out = { enabled: false, agents: new Map(), codexAgents: new Map(), disabled: [], healthTimeoutMs: 1500, healthTtlMs: 60_000, latchTtlMs: 24 * 3_600_000 };
   const pm = cfg?.proxyMode;
   if (!pm || typeof pm !== "object" || Array.isArray(pm)) return out;
   out.enabled = pm.enabled === true;
@@ -61,8 +64,8 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
     out[name] = Number.isFinite(v) && v >= floor ? v : def;
   }
   if (!out.enabled) return out;
-  const agents = pm.agents;
-  if (!agents || typeof agents !== "object" || Array.isArray(agents)) {
+  const agents = pm.agents ?? {};
+  if (typeof agents !== "object" || Array.isArray(agents)) {
     log?.warn?.("[vc:proxy] proxyMode.agents must be an object of agentId -> twin model id; proxy mode disabled");
     out.enabled = false;
     return out;
@@ -120,7 +123,35 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
     out.agents.set(agentId, { twin, key, twins: new Set(twinsToCheck) });
     log?.info?.(`[vc:proxy] ENABLED agent=${agentId} twin=${twin}`);
   }
-  if (out.agents.size === 0) out.enabled = false;
+  // Codex-harness agents: the agent's codex-home names this tenant's route as its
+  // chatgpt_base_url, so every OpenAI call the Codex binary makes already goes
+  // through VC. The plugin only has to sign the conversation into the prompt and
+  // leave prepare and ingest to the proxy. The base URL is checked at startup so a
+  // misrouted agent is reported instead of silently running native.
+  const codexAgents = pm.codexAgents;
+  if (codexAgents && typeof codexAgents === "object" && !Array.isArray(codexAgents)) {
+    for (const [agentIdRaw, flag] of Object.entries(codexAgents)) {
+      const agentId = String(agentIdRaw).trim();
+      const disable = (reason) => {
+        out.disabled.push({ agent: agentId, reason });
+        log?.warn?.(`[vc:proxy] DISABLED agent=${agentId} reason=${reason}`);
+      };
+      if (!agentId || flag === false) continue;
+      if (out.agents.has(agentId)) { disable("codex-and-twin"); continue; }
+      if (!ocConfig?.agents?.entries?.[agentId]) { disable("agent-not-configured"); continue; }
+      const key = typeof vcKeyFor === "function" ? vcKeyFor(`agent:${agentId}:main`) : "";
+      if (!key) { disable("no-vc-key"); continue; }
+      const wantBase = `https://${expectedHost}/${tenantPathSegment(key)}/backend-api`;
+      const toml = typeof readCodexConfig === "function" ? readCodexConfig(agentId) : null;
+      if (typeof toml !== "string") { disable(`codex-config-missing:${agentId}`); continue; }
+      const m = /^\s*chatgpt_base_url\s*=\s*"([^"]*)"/m.exec(toml);
+      const configured = m ? m[1].replace(/\/+$/, "") : "";
+      if (!expectedHost || configured !== wantBase) { disable(`codex-base-url:${agentId}`); continue; }
+      out.codexAgents.set(agentId, { key });
+      log?.info?.(`[vc:proxy] ENABLED agent=${agentId} route=codex`);
+    }
+  }
+  if (out.agents.size === 0 && out.codexAgents.size === 0) out.enabled = false;
   return out;
 }
 
@@ -183,10 +214,48 @@ export function createProxyLatches({ ttlMs, now = Date.now } = {}) {
   };
 }
 
+/** The Codex binary's config for one agent, or null when the agent has no codex-home. */
+export function readCodexHomeConfig(agentId) {
+  try {
+    return readFileSync(join(homedir(), ".openclaw", "agents", agentId, "agent", "codex-home", "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Route decision for a run on a Codex-harness agent. The request already goes to
+ * VC by base URL; the plugin latches the run so the prompt carries the signed
+ * conversation and the completion is not ingested twice. Returns { latch, reason }.
+ * Only OpenAI models leave the codex-home; a run the host placed on the embedded
+ * runner (fallbacks, an explicit openclaw runtime) is native.
+ */
+export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIdentity, groupIndex, latches }) {
+  const agent = config?.codexAgents?.get(agentIdFromSessionKey(ctx?.sessionKey));
+  if (!agent) return { latch: null, reason: "" };
+  if (typeof model !== "string" || !model.startsWith("openai/")) return { latch: null, reason: "native-model" };
+  if (runtimeId === "openclaw") return { latch: null, reason: "embedded-runtime" };
+  const key = proxyLatchKey(ctx);
+  if (!key) return { latch: null, reason: "no-run-key" };
+  const existing = latches.get(key);
+  if (existing) return { latch: existing, reason: "latched" };
+  const identity = deriveConvIdentity(ctx?.sessionKey, ctx?.sessionId, groupIndex);
+  let convId = identity?.isStable && typeof identity.convId === "string" && identity.convId.startsWith("sk:") ? identity.convId : "";
+  if (!convId) {
+    // The request leaves regardless; an ephemeral session gets its own signed id.
+    if (typeof ctx?.sessionId !== "string" || !ctx.sessionId) return { latch: null, reason: "no-session" };
+    convId = `sk:session:${ctx.sessionId}`;
+  }
+  const modelId = model.slice("openai/".length);
+  latches.take(key, { twin: modelId, twins: new Set([modelId]), convId, key: agent.key, route: "codex" });
+  return { latch: latches.get(key), reason: "routed" };
+}
+
 /** Decide the override for one run. Returns { override, reason }. */
 export function decideProxyOverride({ config, ctx, health, sessionIngested, deriveConvIdentity, groupIndex, latches, prompt }) {
   if (!config?.enabled) return { override: null, reason: "disabled" };
   const agentId = agentIdFromSessionKey(ctx?.sessionKey);
+  if (config.codexAgents?.has(agentId)) return { override: null, reason: "codex-routed" };
   const agent = config.agents.get(agentId);
   if (!agent) return { override: null, reason: "agent-not-enabled" };
   const key = proxyLatchKey(ctx);

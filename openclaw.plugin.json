@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.13.2",
+  "version": "5.14.0",
   "kind": "context-engine",
   "main": "./index.js",
   "activation": {
@@ -169,6 +169,11 @@
               "type": "string"
             },
             "description": "agentId -> VC-routed twin model id (e.g. gpt-6-astra-vc)"
+          },
+          "codexAgents": {
+            "type": "object",
+            "description": "Agents whose codex-home chatgpt_base_url already names this tenant's VC route. The plugin signs the conversation into each prompt and leaves prepare and ingest to the proxy. Value: true.",
+            "additionalProperties": { "type": "boolean" }
           },
           "healthTimeoutMs": {
             "type": "integer",

@@ -43,6 +43,7 @@ import {
   createProxyLatches,
   decideProxyOverride,
   relatchProxyRun,
+  decideCodexRoute,
   observeProxyModelCall,
   proxyLatchKey,
   proxyOwnsIngest,
@@ -63,7 +64,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.13.2";
+const PLUGIN_VERSION = "5.14.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -7532,7 +7533,7 @@ export default {
         );
         return { modelOverride: decision.override };
       }
-      if (["disabled", "agent-not-enabled", "selected-again"].includes(decision.reason)) return;
+      if (["disabled", "agent-not-enabled", "selected-again", "codex-routed"].includes(decision.reason)) return;
       const onceKey = `${ctx?.sessionKey ?? sessionId}|${decision.reason}`;
       if (!proxyBypassLogged.has(onceKey)) {
         if (proxyBypassLogged.size > 2000) proxyBypassLogged.clear();
@@ -7758,6 +7759,18 @@ export default {
           log.info?.(`[vc:proxy] re-latched — host re-ran the run model=${runModel} session=${sessionId} run=${stateRunId || "?"}`);
         } else if (re.reason) {
           log.warn?.(`[vc:proxy] twin model without a route reason=${re.reason} model=${runModel} session=${sessionId}; VC will reject the call`);
+        }
+        if (!proxyLatch && proxyMode.codexAgents?.size) {
+          // Codex-harness agents already send every OpenAI call to VC by base URL;
+          // the prompt only needs the signed conversation.
+          const runtimeId = resolveSessionRuntimeDetails(sessionKey, { model: runModel, config: ctx?.config })?.id ?? null;
+          const cx = decideCodexRoute({ config: proxyMode, ctx, model: runModel, runtimeId, deriveConvIdentity, groupIndex, latches: proxyLatches });
+          if (cx.latch) {
+            proxyLatch = cx.latch;
+            if (cx.reason === "routed") log.info?.(`[vc:proxy] codex route — model=${runModel} conv=${cx.latch.convId} session=${sessionId} run=${stateRunId || "?"}`);
+          } else if (cx.reason && !["native-model", "embedded-runtime"].includes(cx.reason)) {
+            log.warn?.(`[vc:proxy] codex-routed agent without a route reason=${cx.reason} model=${runModel} session=${sessionId}; VC will reject the call`);
+          }
         }
       }
       if (proxyLatch) {

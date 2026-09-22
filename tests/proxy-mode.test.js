@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import {
   tenantPathSegment,
   buildProxyModeConfig, createProxyHealth, createProxyLatches, decideProxyOverride,
-  proxyLatchKey, relatchProxyRun, routeMarkerLine, signRouteMarker,
+  proxyLatchKey, relatchProxyRun, routeMarkerLine, signRouteMarker, decideCodexRoute,
 } from "../proxy-mode.js";
 
 const KEY = "vc-route-key";
@@ -177,5 +177,59 @@ describe("relatchProxyRun", () => {
     expect(relatchProxyRun({ config: cfg, ctx: { sessionKey: "agent:bast:main" }, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra-vc" }))
       .toEqual({ latch: null, reason: "no-run-key" });
     expect(latches.size()).toBe(0);
+  });
+});
+
+
+describe("codex-harness route", () => {
+  const toml = (url) => `project_doc_max_bytes = 65536\nchatgpt_base_url = "${url}"\n[projects."/x"]\ntrust_level = "trusted"\n`;
+  const good = `https://api.virtual-context.com/${KEY}/backend-api/`;
+  const buildCodex = (cfg, reader, oc = ocConfig()) =>
+    buildProxyModeConfig(cfg, oc, { pluginBaseUrl: "https://api.virtual-context.com", vcKeyFor: () => KEY, readCodexConfig: reader });
+  it("enables an agent whose codex-home names this tenant's route", () => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    expect(c.enabled).toBe(true);
+    expect(c.codexAgents.get("bast")).toEqual({ key: KEY });
+    expect(c.agents.size).toBe(0);
+  });
+  it.each([
+    ["codex-config-missing:bast", () => null],
+    ["codex-base-url:bast", () => toml("https://chatgpt.com/backend-api/")],
+    ["codex-base-url:bast", () => "project_doc_max_bytes = 1\n"],
+  ])("disables with reason %s", (reason, reader) => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, reader);
+    expect(c.enabled).toBe(false);
+    expect(c.disabled).toEqual([{ agent: "bast", reason }]);
+  });
+  it("an agent cannot be both twin-routed and codex-routed", () => {
+    const c = buildCodex({ proxyMode: { enabled: true, agents: { bast: "gpt-6-astra-vc" }, codexAgents: { bast: true } } }, () => toml(good));
+    expect(c.disabled).toEqual([{ agent: "bast", reason: "codex-and-twin" }]);
+    expect(c.agents.has("bast")).toBe(true);
+  });
+  it("latches the run to the real model and never overrides it", () => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    const stable = () => ({ convId: "sk:agent:bast:main", isStable: true });
+    const d = decideProxyOverride({ config: c, ctx, health: { decide: () => "ok" }, sessionIngested: true, deriveConvIdentity: stable, latches, prompt: "hi" });
+    expect(d).toEqual({ override: null, reason: "codex-routed" });
+    const r = decideCodexRoute({ config: c, ctx, model: "openai/gpt-6-astra", runtimeId: null, deriveConvIdentity: stable, latches });
+    expect(r.reason).toBe("routed");
+    expect(r.latch).toMatchObject({ twin: "gpt-6-astra", convId: "sk:agent:bast:main", key: KEY, route: "codex" });
+    expect(decideCodexRoute({ config: c, ctx, model: "openai/gpt-6-astra", runtimeId: null, deriveConvIdentity: stable, latches }).reason).toBe("latched");
+    expect(routeMarkerLine(r.latch.key, r.latch.convId)).toContain("conversation=sk:agent:bast:main");
+  });
+  it("native fallbacks and embedded-runtime runs are not routed; ephemeral sessions get a signed session id", () => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const stable = () => ({ convId: "sk:agent:bast:main", isStable: true });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    expect(decideCodexRoute({ config: c, ctx, model: "anthropic/claude-opus-4-6", runtimeId: null, deriveConvIdentity: stable, latches })).toEqual({ latch: null, reason: "native-model" });
+    expect(decideCodexRoute({ config: c, ctx, model: "openai/gpt-6-astra", runtimeId: "openclaw", deriveConvIdentity: stable, latches })).toEqual({ latch: null, reason: "embedded-runtime" });
+    expect(decideCodexRoute({ config: c, ctx: { sessionKey: "agent:other:main", sessionId: "s", runId: "r" }, model: "openai/gpt-6-astra", runtimeId: null, deriveConvIdentity: stable, latches })).toEqual({ latch: null, reason: "" });
+    const eph = decideCodexRoute({ config: c, ctx: { sessionKey: "agent:bast:cron:x", sessionId: "abc-123", runId: "r9" }, model: "openai/gpt-5.6-sol", runtimeId: null,
+      deriveConvIdentity: () => ({ convId: "abc-123", isStable: false }), latches });
+    expect(eph.latch).toMatchObject({ twin: "gpt-5.6-sol", convId: "sk:session:abc-123" });
+    expect(latches.size()).toBe(1);
   });
 });
