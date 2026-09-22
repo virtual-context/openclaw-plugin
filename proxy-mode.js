@@ -105,6 +105,13 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
       const wantBase = `https://${expectedHost}/${tenantPathSegment(key)}/backend-api`;
       if (!expectedHost || m.baseUrl !== wantBase) { reason = `twin-baseUrl:${t}`; break; }
       if (m.headers?.["X-VC-Upstream-Model"] !== t.slice(0, -3)) { reason = `twin-upstream-header:${t}`; break; }
+      // The host's "auto" transport reuses a per-session WebSocket keyed by
+      // session and auth identity, not by baseUrl: a twin selected mid-session
+      // would ride the socket the real model opened to the default backend and
+      // never reach VC. SSE builds each request against the twin's own baseUrl.
+      const ref = `openai/${t}`;
+      const transport = entry.models?.[ref]?.params?.transport ?? ocConfig?.agents?.defaults?.models?.[ref]?.params?.transport;
+      if (transport !== "sse") { reason = `twin-transport-not-sse:${t}`; break; }
       // The live catalog entries the host accepts carry neither field; their
       // absence is reported, not fatal.
       if (m.cost === undefined || m.maxTokens === undefined) log?.info?.(`[vc:proxy] twin ${t} has no cost/maxTokens; the host will use provider defaults`);
@@ -199,6 +206,31 @@ export function decideProxyOverride({ config, ctx, health, sessionIngested, deri
   const sig = signRouteMarker(agent.key, identity.convId);
   latches.take(key, { twin: agent.twin, twins: agent.twins ?? new Set([agent.twin]), convId: identity.convId, sig, key: agent.key });
   return { override: agent.twin, reason: "selected", latchKey: key, convId: identity.convId };
+}
+
+/**
+ * Rebuild the route for a run that still carries a twin model but has no latch.
+ * The host re-runs a failed attempt under the same runId after agent_end already
+ * released the latch; the run's model, not the latch, is the durable signal.
+ * Returns { latch, reason } — latch null when this is not a twin run or the
+ * conversation identity cannot be signed.
+ */
+export function relatchProxyRun({ config, ctx, latches, deriveConvIdentity, groupIndex, model }) {
+  if (!config?.enabled || typeof model !== "string") return { latch: null, reason: "" };
+  const agent = config.agents.get(agentIdFromSessionKey(ctx?.sessionKey));
+  if (!agent) return { latch: null, reason: "" };
+  const modelId = model.startsWith("openai/") ? model.slice("openai/".length) : model;
+  const twins = agent.twins ?? new Set([agent.twin]);
+  if (!twins.has(modelId)) return { latch: null, reason: "" };
+  const key = proxyLatchKey(ctx);
+  if (!key) return { latch: null, reason: "no-run-key" };
+  const identity = deriveConvIdentity(ctx?.sessionKey, ctx?.sessionId, groupIndex);
+  if (!identity?.isStable || typeof identity.convId !== "string" || !identity.convId.startsWith("sk:")) {
+    return { latch: null, reason: "unstable-identity" };
+  }
+  const sig = signRouteMarker(agent.key, identity.convId);
+  latches.take(key, { twin: modelId, twins, convId: identity.convId, sig, key: agent.key });
+  return { latch: latches.get(key), reason: "relatched" };
 }
 
 /** Record one model call against the run's latch; a non-twin call marks a mismatch. */

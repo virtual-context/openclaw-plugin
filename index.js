@@ -42,6 +42,7 @@ import {
   createProxyHealth,
   createProxyLatches,
   decideProxyOverride,
+  relatchProxyRun,
   observeProxyModelCall,
   proxyLatchKey,
   proxyOwnsIngest,
@@ -62,7 +63,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.13.0";
+const PLUGIN_VERSION = "5.13.1";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -7744,7 +7745,21 @@ export default {
       // Proxy mode: this run's model call goes through VC, which sees the
       // host's full history and owns compaction, injection and ingest. The
       // only thing the prompt needs is the signed conversation route.
-      const proxyLatch = proxyMode.enabled ? proxyLatches.get(proxyLatchKey(ctx)) : undefined;
+      let proxyLatch = proxyMode.enabled ? proxyLatches.get(proxyLatchKey(ctx)) : undefined;
+      if (proxyMode.enabled && !proxyLatch) {
+        // A failed attempt is re-run by the host under the same runId after
+        // agent_end released the latch; the run still carries the twin model.
+        const runModel = typeof ctx?.model === "string"
+          ? ctx.model
+          : (ctx?.modelProviderId && ctx?.modelId ? `${ctx.modelProviderId}/${ctx.modelId}` : undefined);
+        const re = relatchProxyRun({ config: proxyMode, ctx, latches: proxyLatches, deriveConvIdentity, groupIndex, model: runModel });
+        if (re.latch) {
+          proxyLatch = re.latch;
+          log.info?.(`[vc:proxy] re-latched — host re-ran the run model=${runModel} session=${sessionId} run=${stateRunId || "?"}`);
+        } else if (re.reason) {
+          log.warn?.(`[vc:proxy] twin model without a route reason=${re.reason} model=${runModel} session=${sessionId}; VC will reject the call`);
+        }
+      }
       if (proxyLatch) {
         log.info?.(
           `[vc:proxy] routed run — prepare skipped; VC owns the payload ` +

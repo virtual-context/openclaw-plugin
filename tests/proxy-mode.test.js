@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import {
   tenantPathSegment,
   buildProxyModeConfig, createProxyHealth, createProxyLatches, decideProxyOverride,
-  proxyLatchKey, routeMarkerLine, signRouteMarker,
+  proxyLatchKey, relatchProxyRun, routeMarkerLine, signRouteMarker,
 } from "../proxy-mode.js";
 
 const KEY = "vc-route-key";
@@ -11,7 +11,7 @@ const twin = (id, real) => ({ id, api: "openai-chatgpt-responses", baseUrl: `htt
   headers: { "X-VC-Upstream-Model": real }, cost: { input: 1, output: 2 }, maxTokens: 1000, reasoning: true, input: ["text"] });
 const ocConfig = (over = {}) => ({
   models: { providers: { openai: { models: [{ id: "gpt-6-astra" }, twin("gpt-6-astra-vc", "gpt-6-astra"), twin("gpt-5.6-sol-vc", "gpt-5.6-sol")] } } },
-  agents: { entries: { bast: { models: { "openai/gpt-6-astra": { agentRuntime: { id: "openclaw" } } }, model: { primary: "openai/gpt-6-astra", fallbacks: ["openai/gpt-5.6-sol-vc"] }, ...over } } },
+  agents: { entries: { bast: { models: { "openai/gpt-6-astra": { agentRuntime: { id: "openclaw" } }, "openai/gpt-6-astra-vc": { params: { transport: "sse" } }, "openai/gpt-5.6-sol-vc": { params: { transport: "sse" } } }, model: { primary: "openai/gpt-6-astra", fallbacks: ["openai/gpt-5.6-sol-vc"] }, ...over } } },
 });
 const build = (cfg, oc = ocConfig()) => buildProxyModeConfig(cfg, oc, { pluginBaseUrl: "https://api.virtual-context.com", vcKeyFor: () => KEY });
 
@@ -26,6 +26,8 @@ describe("buildProxyModeConfig", () => {
     ["agentRuntime-not-openclaw:auto", { models: { "openai/gpt-6-astra": { agentRuntime: { id: "auto" } } } }],
     ["agentRuntime-not-openclaw:implicit", { models: {} }],
     ["primary-not-openai", { model: { primary: "minimax/MiniMax-M2.7" } }],
+    ["twin-transport-not-sse:gpt-6-astra-vc", { models: { "openai/gpt-6-astra": { agentRuntime: { id: "openclaw" } } } }],
+    ["twin-transport-not-sse:gpt-5.6-sol-vc", { models: { "openai/gpt-6-astra": { agentRuntime: { id: "openclaw" } }, "openai/gpt-6-astra-vc": { params: { transport: "sse" } } } }],
     ["twin-mismatch:gpt-6-astra-vc!=gpt-5.6-sol-vc", { model: { primary: "openai/gpt-5.6-sol" }, models: { "openai/gpt-5.6-sol": { agentRuntime: { id: "openclaw" } } } }],
   ])("disables with reason %s", (reason, over) => {
     const c = build({ proxyMode: { enabled: true, agents: { bast: "gpt-6-astra-vc" } } }, ocConfig(over));
@@ -148,5 +150,30 @@ describe("tenantPathSegment", () => {
   it("never doubles the vc- prefix", () => {
     expect(tenantPathSegment("vc-abc")).toBe("vc-abc");
     expect(tenantPathSegment("abc")).toBe("vc-abc");
+  });
+});
+
+describe("relatchProxyRun", () => {
+  const cfg = build({ proxyMode: { enabled: true, agents: { bast: "gpt-6-astra-vc" } } });
+  const stable = () => ({ convId: "sk:agent:bast:main", isStable: true });
+  it("rebuilds the route for a twin-model run whose latch is gone", () => {
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    const re = relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra-vc" });
+    expect(re.reason).toBe("relatched");
+    expect(re.latch).toMatchObject({ twin: "gpt-6-astra-vc", convId: "sk:agent:bast:main", key: KEY, sig: signRouteMarker(KEY, "sk:agent:bast:main") });
+    expect(latches.get(proxyLatchKey(ctx))).toBe(re.latch);
+    const fb = relatchProxyRun({ config: cfg, ctx: { ...ctx, runId: "r2" }, latches, deriveConvIdentity: stable, model: "gpt-5.6-sol-vc" });
+    expect(fb.latch).toMatchObject({ twin: "gpt-5.6-sol-vc" });  // a twin fallback is a routed attempt too
+  });
+  it("ignores native models and refuses to route an unsigned identity", () => {
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra" })).toEqual({ latch: null, reason: "" });
+    expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: () => ({ convId: "s1", isStable: false }), model: "openai/gpt-6-astra-vc" }))
+      .toEqual({ latch: null, reason: "unstable-identity" });
+    expect(relatchProxyRun({ config: cfg, ctx: { sessionKey: "agent:bast:main" }, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra-vc" }))
+      .toEqual({ latch: null, reason: "no-run-key" });
+    expect(latches.size()).toBe(0);
   });
 });
