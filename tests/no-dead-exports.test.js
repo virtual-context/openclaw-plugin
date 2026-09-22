@@ -62,6 +62,11 @@ const INTENTIONALLY_UNCALLED = new Map([
     "UNRESOLVED and the worst of the three: no production caller AND no test "
     + "reference at all. A sibling resolveSessionRuntimeDetails exists, so "
     + "this is probably a superseded wrapper -- but probably is not a reason."],
+  ["outboundConvIdFor",
+    "UNRESOLVED: the pure conversation gate, pinned by outbound-message-id "
+    + "tests, while register() resolves the outbound conversation through "
+    + "selectConvId instead. Either the inline gate should call it or the "
+    + "pure form is superseded; needs a decision, not an exemption."],
 ]);
 
 describe("no exported function is dead", () => {
@@ -108,7 +113,7 @@ describe("no exported function is dead", () => {
       .filter(([, reason]) => reason.startsWith("UNRESOLVED"))
       .map(([name]) => name);
     expect(unresolved, "open dead-export findings awaiting a decision")
-      .toEqual(["leadingEnvelope", "resolveSessionRuntime"]);
+      .toEqual(["leadingEnvelope", "resolveSessionRuntime", "outboundConvIdFor"]);
   });
 
   it("the known defect stays labelled as a defect, not as an exemption", () => {
