@@ -163,13 +163,15 @@ describe("relatchProxyRun", () => {
     expect(re.reason).toBe("relatched");
     expect(re.latch).toMatchObject({ twin: "gpt-6-astra-vc", convId: "sk:agent:bast:main", key: KEY, sig: signRouteMarker(KEY, "sk:agent:bast:main") });
     expect(latches.get(proxyLatchKey(ctx))).toBe(re.latch);
-    const fb = relatchProxyRun({ config: cfg, ctx: { ...ctx, runId: "r2" }, latches, deriveConvIdentity: stable, model: "gpt-5.6-sol-vc" });
+    const fb = relatchProxyRun({ config: cfg, ctx: { ...ctx, runId: "r2" }, latches, deriveConvIdentity: stable, model: "openai/gpt-5.6-sol-vc" });
     expect(fb.latch).toMatchObject({ twin: "gpt-5.6-sol-vc" });  // a twin fallback is a routed attempt too
   });
   it("ignores native models and refuses to route an unsigned identity", () => {
     const latches = createProxyLatches({ ttlMs: 3600000 });
     const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
     expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra" })).toEqual({ latch: null, reason: "" });
+    expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: stable, model: "gpt-6-astra-vc" })).toEqual({ latch: null, reason: "" });
+    expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: stable, model: "anthropic/gpt-6-astra-vc" })).toEqual({ latch: null, reason: "" });
     expect(relatchProxyRun({ config: cfg, ctx, latches, deriveConvIdentity: () => ({ convId: "s1", isStable: false }), model: "openai/gpt-6-astra-vc" }))
       .toEqual({ latch: null, reason: "unstable-identity" });
     expect(relatchProxyRun({ config: cfg, ctx: { sessionKey: "agent:bast:main" }, latches, deriveConvIdentity: stable, model: "openai/gpt-6-astra-vc" }))

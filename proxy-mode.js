@@ -219,7 +219,9 @@ export function relatchProxyRun({ config, ctx, latches, deriveConvIdentity, grou
   if (!config?.enabled || typeof model !== "string") return { latch: null, reason: "" };
   const agent = config.agents.get(agentIdFromSessionKey(ctx?.sessionKey));
   if (!agent) return { latch: null, reason: "" };
-  const modelId = model.startsWith("openai/") ? model.slice("openai/".length) : model;
+  // Only a provider-qualified openai ref can be a twin; a bare or foreign ref never matches.
+  if (!model.startsWith("openai/")) return { latch: null, reason: "" };
+  const modelId = model.slice("openai/".length);
   const twins = agent.twins ?? new Set([agent.twin]);
   if (!twins.has(modelId)) return { latch: null, reason: "" };
   const key = proxyLatchKey(ctx);
