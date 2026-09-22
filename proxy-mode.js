@@ -147,6 +147,14 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
       const m = /^\s*chatgpt_base_url\s*=\s*"([^"]*)"/m.exec(toml);
       const configured = m ? m[1].replace(/\/+$/, "") : "";
       if (!expectedHost || configured !== wantBase) { disable(`codex-base-url:${agentId}`); continue; }
+      // The model call itself goes through a custom provider: the built-in one
+      // dials chatgpt.com over a WebSocket regardless of chatgpt_base_url.
+      const provider = codexProviderBlock(toml);
+      const providerBase = (provider.base_url || "").replace(/\/+$/, "");
+      if (!/^\s*model_provider\s*=\s*"vc"/m.test(toml) || providerBase !== `${wantBase}/codex` ||
+          provider.supports_websockets !== "false" || provider.requires_openai_auth !== "true") {
+        disable(`codex-provider:${agentId}`); continue;
+      }
       out.codexAgents.set(agentId, { key });
       log?.info?.(`[vc:proxy] ENABLED agent=${agentId} route=codex`);
     }
@@ -212,6 +220,18 @@ export function createProxyLatches({ ttlMs, now = Date.now } = {}) {
     delete(key) { if (key) map.delete(key); },
     size() { sweep(); return map.size; },
   };
+}
+
+/** Key/value pairs of the [model_providers.vc] table in a codex config (strings unquoted). */
+export function codexProviderBlock(toml) {
+  const m = /^\[model_providers\.vc\]\n((?:[^\[\n][^\n]*\n?)*)/m.exec(String(toml || ""));
+  const out = {};
+  if (!m) return out;
+  for (const line of m[1].split("\n")) {
+    const kv = /^\s*([A-Za-z_]+)\s*=\s*(.*?)\s*$/.exec(line);
+    if (kv) out[kv[1]] = kv[2].replace(/^"(.*)"$/, "$1");
+  }
+  return out;
 }
 
 /** The Codex binary's config for one agent, or null when the agent has no codex-home. */

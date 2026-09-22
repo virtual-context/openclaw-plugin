@@ -182,8 +182,10 @@ describe("relatchProxyRun", () => {
 
 
 describe("codex-harness route", () => {
-  const toml = (url) => `project_doc_max_bytes = 65536\nchatgpt_base_url = "${url}"\n[projects."/x"]\ntrust_level = "trusted"\n`;
   const good = `https://api.virtual-context.com/${KEY}/backend-api/`;
+  const provider = (url, over = "") => `\n[model_providers.vc]\nname = "OpenAI via Virtual Context"\nbase_url = "${url}codex"\nwire_api = "responses"\nrequires_openai_auth = true\nsupports_websockets = false\n${over}`;
+  const toml = (url, { withProvider = true, providerUrl = url, over = "" } = {}) =>
+    `chatgpt_base_url = "${url}"\nmodel_provider = "vc"\n[projects."/x"]\ntrust_level = "trusted"\n` + (withProvider ? provider(providerUrl, over) : "");
   const buildCodex = (cfg, reader, oc = ocConfig()) =>
     buildProxyModeConfig(cfg, oc, { pluginBaseUrl: "https://api.virtual-context.com", vcKeyFor: () => KEY, readCodexConfig: reader });
   it("enables an agent whose codex-home names this tenant's route", () => {
@@ -196,6 +198,9 @@ describe("codex-harness route", () => {
     ["codex-config-missing:bast", () => null],
     ["codex-base-url:bast", () => toml("https://chatgpt.com/backend-api/")],
     ["codex-base-url:bast", () => "project_doc_max_bytes = 1\n"],
+    ["codex-provider:bast", () => toml(good, { withProvider: false })],
+    ["codex-provider:bast", () => toml(good, { providerUrl: "https://chatgpt.com/backend-api/" })],
+    ["codex-provider:bast", () => toml(good, { over: "supports_websockets = true\n" })],
   ])("disables with reason %s", (reason, reader) => {
     const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, reader);
     expect(c.enabled).toBe(false);
