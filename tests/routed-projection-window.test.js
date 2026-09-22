@@ -1,4 +1,4 @@
-/** Routed agents project only a recent tail of history; VC owns the rest. */
+/** The history window hook exists for hosts that opt in; the plugin itself no longer sets one. */
 import { describe, it, expect, vi } from "vitest";
 import { createSpeakerAttributedContextEngine } from "../attributed-context-engine.js";
 
