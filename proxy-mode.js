@@ -312,7 +312,12 @@ export function observeProxyModelCall(latch, model) {
   else latch.mismatch = true;
 }
 
-/** The plugin skips its own ingest only when every observed call went to the twin. */
+/**
+ * The plugin skips its own ingest only when every observed call went to the twin.
+ * A Codex-routed run gives no per-call proof that VC saw the request (the binary
+ * can pick a transport that bypasses the base URL), so the plugin keeps ingesting
+ * and the proxy's canonical-turn dedupe absorbs the second copy.
+ */
 export function proxyOwnsIngest(latch) {
-  return Boolean(latch && latch.observed && !latch.mismatch);
+  return Boolean(latch && latch.route !== "codex" && latch.observed && !latch.mismatch);
 }

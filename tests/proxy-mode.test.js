@@ -232,4 +232,14 @@ describe("codex-harness route", () => {
     expect(eph.latch).toMatchObject({ twin: "gpt-5.6-sol", convId: "sk:session:abc-123" });
     expect(latches.size()).toBe(1);
   });
+  it("never lets a codex-routed run skip the plugin's own ingest", async () => {
+    const { observeProxyModelCall, proxyOwnsIngest } = await import("../proxy-mode.js");
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    const r = decideCodexRoute({ config: c, ctx, model: "openai/gpt-6-astra", runtimeId: null, deriveConvIdentity: () => ({ convId: "sk:agent:bast:main", isStable: true }), latches });
+    observeProxyModelCall(r.latch, "gpt-6-astra");
+    expect(r.latch.observed).toBe(true);
+    expect(proxyOwnsIngest(r.latch)).toBe(false);
+  });
 });
