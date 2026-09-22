@@ -150,9 +150,9 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
       // The model call itself goes through a custom provider: the built-in one
       // dials chatgpt.com over a WebSocket regardless of chatgpt_base_url.
       const provider = codexProviderBlock(toml);
-      const providerBase = (provider.base_url || "").replace(/\/+$/, "");
+      const providerBase = (provider.base_url?.string || "").replace(/\/+$/, "");
       if (!/^\s*model_provider\s*=\s*"vc"/m.test(toml) || providerBase !== `${wantBase}/codex` ||
-          provider.supports_websockets !== "false" || provider.requires_openai_auth !== "true") {
+          provider.supports_websockets?.literal !== "false" || provider.requires_openai_auth?.literal !== "true") {
         disable(`codex-provider:${agentId}`); continue;
       }
       out.codexAgents.set(agentId, { key });
@@ -229,7 +229,11 @@ export function codexProviderBlock(toml) {
   if (!m) return out;
   for (const line of m[1].split("\n")) {
     const kv = /^\s*([A-Za-z_]+)\s*=\s*(.*?)\s*$/.exec(line);
-    if (kv) out[kv[1]] = kv[2].replace(/^"(.*)"$/, "$1");
+    if (!kv) continue;
+    // Strings are unquoted; bare TOML literals (booleans, numbers) are kept
+    // as written so a quoted "false" cannot pass for the boolean false.
+    const raw = kv[2];
+    out[kv[1]] = /^".*"$/.test(raw) ? { string: raw.slice(1, -1) } : { literal: raw };
   }
   return out;
 }

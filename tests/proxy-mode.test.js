@@ -201,6 +201,8 @@ describe("codex-harness route", () => {
     ["codex-provider:bast", () => toml(good, { withProvider: false })],
     ["codex-provider:bast", () => toml(good, { providerUrl: "https://chatgpt.com/backend-api/" })],
     ["codex-provider:bast", () => toml(good, { over: "supports_websockets = true\n" })],
+    ["codex-provider:bast", () => toml(good).replace("supports_websockets = false", 'supports_websockets = "false"')],
+    ["codex-provider:bast", () => toml(good).replace("requires_openai_auth = true", 'requires_openai_auth = "true"')],
   ])("disables with reason %s", (reason, reader) => {
     const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, reader);
     expect(c.enabled).toBe(false);
