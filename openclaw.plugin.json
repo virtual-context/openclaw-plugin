@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.12.1",
+  "version": "5.13.0",
   "kind": "context-engine",
   "main": "./index.js",
   "activation": {
@@ -155,6 +155,35 @@
           ]
         },
         "description": "Opt-in map of agent id to \"server\". Requires convIdentity=\"stable\". Share one memory conversation per actual Discord server while keeping native sessions separate. Membership comes from trusted inbound metadata or an authenticated channel lookup using the bound account. Multiple servers remain isolated. Unknown or conflicting membership bypasses memory instead of creating a channel conversation. Exact conversationGroups members must agree with proven server membership."
+      },
+      "proxyMode": {
+        "type": "object",
+        "description": "Route enabled agents' model calls through the VC cloud proxy so VC owns the payload.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "agents": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "agentId -> VC-routed twin model id (e.g. gpt-6-astra-vc)"
+          },
+          "healthTimeoutMs": {
+            "type": "integer",
+            "minimum": 100
+          },
+          "healthTtlMs": {
+            "type": "integer",
+            "minimum": 1000
+          },
+          "latchTtlMs": {
+            "type": "integer",
+            "minimum": 3600000
+          }
+        },
+        "additionalProperties": false
       }
     },
     "additionalProperties": false

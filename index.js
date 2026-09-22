@@ -37,6 +37,18 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServerMemoryScope, memorySourceChannel } from "./server-memory-scope.js";
 import {
+  agentIdFromSessionKey,
+  buildProxyModeConfig,
+  createProxyHealth,
+  createProxyLatches,
+  decideProxyOverride,
+  observeProxyModelCall,
+  proxyLatchKey,
+  proxyOwnsIngest,
+  routeMarkerLine,
+  tenantPathSegment,
+} from "./proxy-mode.js";
+import {
   captureModelCallEvent,
   normalizeModelCallCaptureConfig,
 } from "./model-call-capture.js";
@@ -50,7 +62,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.12.1";
+const PLUGIN_VERSION = "5.13.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -6449,6 +6461,26 @@ export default {
     // An agent without an entry keeps using the deployment-wide key above.
     const agentKeyIndex = buildAgentKeyIndex(cfg.agentKeyFiles, log);
     const vcKeyFor = (sessionKey) => selectVcKey(sessionKey, vcKey, agentKeyIndex);
+    // Proxy mode: route an enabled agent's model calls through the VC cloud so
+    // VC owns the payload. Validated once here; per-run decisions never wait
+    // on the network (health is cached and refreshed in the background).
+    const proxyMode = buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl: baseUrl, vcKeyFor, log });
+    const proxyHealthByKey = new Map();
+    const proxyHealthFor = (key) => {
+      let health = proxyHealthByKey.get(key);
+      if (!health) {
+        health = createProxyHealth({
+          url: `${baseUrl}/${tenantPathSegment(key)}/dashboard/settings`,
+          timeoutMs: proxyMode.healthTimeoutMs,
+          ttlMs: proxyMode.healthTtlMs,
+          log,
+        });
+        proxyHealthByKey.set(key, health);
+      }
+      return health;
+    };
+    const proxyLatches = createProxyLatches({ ttlMs: proxyMode.latchTtlMs });
+    const proxyBypassLogged = new Set();
     // Each key owns its OWN completion-outbox directory (the directory name is
     // derived from the key hash), so a drain scheduled for one key can never
     // see another key's records. Startup drains must cover every configured key
@@ -7473,6 +7505,41 @@ export default {
     // dispatch session. The host exposes the same native account, channel,
     // sender and timestamp here, still before a model run exists. Exact tuple
     // agreement is mandatory and ambiguity leaves the envelope unusable.
+    // ── before_model_resolve: proxy-mode switch ──
+    // Returns a modelOverride to the agent's VC-routed twin entry; the latch
+    // taken here is what the later hooks consult for this exact run.
+    api.on("before_model_resolve", (event, ctx) => {
+      if (!proxyMode.enabled) return;
+      if (isExcludedTrigger(ctx)) return;
+      if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
+      const sessionId = hookSessionIdentity(ctx);
+      const agentEntry = proxyMode.agents.get(agentIdFromSessionKey(ctx?.sessionKey));
+      const decision = decideProxyOverride({
+        config: proxyMode,
+        ctx,
+        health: agentEntry ? proxyHealthFor(agentEntry.key) : { decide: () => "unknown" },
+        sessionIngested: isSessionIngested(sessionId),
+        deriveConvIdentity,
+        groupIndex,
+        latches: proxyLatches,
+        prompt: event?.prompt,
+      });
+      if (decision.override) {
+        log.info?.(
+          `[vc:proxy] selected agent=${agentIdFromSessionKey(ctx?.sessionKey)} twin=${decision.override} ` +
+          `conv=${decision.convId} session=${sessionId} run=${ctx?.runId ?? "?"}`,
+        );
+        return { modelOverride: decision.override };
+      }
+      if (["disabled", "agent-not-enabled", "selected-again"].includes(decision.reason)) return;
+      const onceKey = `${ctx?.sessionKey ?? sessionId}|${decision.reason}`;
+      if (!proxyBypassLogged.has(onceKey)) {
+        if (proxyBypassLogged.size > 2000) proxyBypassLogged.clear();
+        proxyBypassLogged.add(onceKey);
+        log.info?.(`[vc:proxy] bypass agent=${agentIdFromSessionKey(ctx?.sessionKey)} reason=${decision.reason} session=${sessionId}`);
+      }
+    });
+
     api.on("before_dispatch", (event, ctx) => {
       const remembered = rememberInboundDispatch(event, ctx, ocConfig);
       if (!remembered && groupConversationSession(event?.sessionKey)) {
@@ -7674,6 +7741,17 @@ export default {
       // means this plugin is off for the turn, not that the model call should
       // be refused because VC is unavailable.
       const isVcCommand = /^VC[A-Z]/i.test(promptText);
+      // Proxy mode: this run's model call goes through VC, which sees the
+      // host's full history and owns compaction, injection and ingest. The
+      // only thing the prompt needs is the signed conversation route.
+      const proxyLatch = proxyMode.enabled ? proxyLatches.get(proxyLatchKey(ctx)) : undefined;
+      if (proxyLatch) {
+        log.info?.(
+          `[vc:proxy] routed run — prepare skipped; VC owns the payload ` +
+          `session=${sessionId} run=${stateRunId || "?"} conv=${proxyLatch.convId}`,
+        );
+        return { prependContext: routeMarkerLine(proxyLatch.key, proxyLatch.convId) };
+      }
       if (providerFilter && !isVcCommand) {
         const currentModel = resolveSessionModel(sessionKey, ctx);
         const unresolved = noteUnresolvedModel(
@@ -8754,6 +8832,16 @@ export default {
         `systemPrompt=${event?.systemPrompt?.length ?? 0} chars ` +
         `prompt=${event?.prompt?.length ?? 0} chars`
       );
+      if (proxyMode.enabled) {
+        const proxyLatch = proxyLatches.get(proxyLatchKey(ctx));
+        if (proxyLatch) {
+          observeProxyModelCall(proxyLatch, event?.model);
+          const line = `[vc:proxy] attempt model=${event?.model ?? "?"} twin=${proxyLatch.twin} ` +
+            `match=${event?.model === proxyLatch.twin} session=${sessionId}`;
+          if (event?.model === proxyLatch.twin) log.info?.(line);
+          else log.warn?.(`${line} — a native model answered inside a routed run; this turn will be ingested here`);
+        }
+      }
       captureModelBoundary("llm_input", event, ctx);
     });
 
@@ -8869,6 +8957,13 @@ export default {
           log.error?.(
             `[vc:identity] ingest SKIPPED — conflicting run ids ` +
             `event=${eventRunId} context=${contextRunId}`,
+          );
+          return;
+        }
+        if (proxyMode.enabled && proxyOwnsIngest(proxyLatches.get(proxyLatchKey(ctx)))) {
+          log.info?.(
+            `[vc:proxy] ingest skipped — every model call of this run went through VC ` +
+            `session=${sessionId} run=${exactRunId || "?"}`,
           );
           return;
         }
@@ -9106,6 +9201,7 @@ export default {
           if (debug) log.error?.(`[vc:debug] ingest error detail: ${err.stack ?? err}`);
         }
       } finally {
+        if (proxyMode.enabled) proxyLatches.delete(proxyLatchKey(ctx));
         // No exit may strand the pending user turn: it would be attached
         // to a later reply.
         if (!groupOutputDeferred) {
