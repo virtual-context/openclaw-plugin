@@ -2,7 +2,7 @@
 import { describe, it, expect } from "vitest";
 import {
   tenantPathSegment,
-  buildProxyModeConfig, createProxyHealth, createProxyLatches, decideProxyOverride,
+  buildProxyModeConfig, createProxyHealth, createProxyLatches, decideProxyOverride, warmProxyHealth,
   proxyLatchKey, relatchProxyRun, routeMarkerLine, signRouteMarker, decideCodexRoute,
 } from "../proxy-mode.js";
 
@@ -80,6 +80,23 @@ describe("health cache", () => {
     const slow = createProxyHealth({ url: "http://x", timeoutMs: 10, ttlMs: 100,
       fetchImpl: (u, { signal }) => new Promise((_, rej) => signal.addEventListener("abort", () => rej(new Error("abort")))) });
     await slow.refresh(); expect(slow.state()).toBe("down");
+  });
+});
+
+describe("warmProxyHealth", () => {
+  it("probes each configured key once so the first routed decision is not unknown", async () => {
+    const config = build({ proxyMode: { enabled: true, agents: { bast: "gpt-6-astra-vc", vast: "gpt-6-astra-vc" } } });
+    const h = createProxyHealth({ url: "x", timeoutMs: 50, ttlMs: 1e6, fetchImpl: async () => ({ ok: true }) });
+    const seen = [];
+    await warmProxyHealth(config, (key) => { seen.push(key); return h; });
+    expect(new Set(seen).size).toBe(1);
+    expect(seen.length).toBe(1);
+    expect(h.decide()).toBe("ok");
+  });
+  it("swallows probe failures and still resolves", async () => {
+    const config = build({ proxyMode: { enabled: true, agents: { bast: "gpt-6-astra-vc" } } });
+    await expect(warmProxyHealth(config, () => ({ refresh: () => Promise.reject(new Error("down")) }))).resolves.toBeDefined();
+    await expect(warmProxyHealth({ agents: new Map() }, () => { throw new Error("never called"); })).resolves.toEqual([]);
   });
 });
 

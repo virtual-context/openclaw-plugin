@@ -194,6 +194,17 @@ export function createProxyHealth({ url, timeoutMs, ttlMs, fetchImpl = globalThi
   };
 }
 
+/**
+ * Probe every configured agent's cloud health once at registration, so the
+ * first routed decision after a gateway start answers from a real state
+ * instead of "unknown". Per-run decisions still never wait on the network.
+ */
+export function warmProxyHealth(config, healthFor) {
+  const keys = new Set();
+  for (const agent of config?.agents?.values?.() ?? []) if (agent?.key) keys.add(agent.key);
+  return Promise.all([...keys].map((key) => Promise.resolve(healthFor(key).refresh()).catch(() => {})));
+}
+
 /** Per-run latches with TTL; the key is proxyLatchKey(ctx). */
 export function createProxyLatches({ ttlMs, now = Date.now } = {}) {
   const map = new Map();

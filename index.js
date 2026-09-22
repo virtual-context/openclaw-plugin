@@ -39,6 +39,7 @@ import { createServerMemoryScope, memorySourceChannel } from "./server-memory-sc
 import {
   agentIdFromSessionKey,
   buildProxyModeConfig,
+  warmProxyHealth,
   createProxyHealth,
   createProxyLatches,
   decideProxyOverride,
@@ -6481,6 +6482,8 @@ export default {
       }
       return health;
     };
+    // A gateway start must not send a routed agent's first turn native: probe now.
+    if (proxyMode.enabled) void warmProxyHealth(proxyMode, proxyHealthFor);
     const proxyLatches = createProxyLatches({ ttlMs: proxyMode.latchTtlMs });
     const proxyBypassLogged = new Set();
     // Each key owns its OWN completion-outbox directory (the directory name is
