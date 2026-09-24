@@ -299,3 +299,13 @@ describe("codex-harness route", () => {
     expect(proxyOwnsIngest({ ...r.latch, observed: false })).toBe(true);
   });
 });
+
+describe("proxyMode manifest schema", () => {
+  it("accepts true or a fallback model id for a codex agent", async () => {
+    const { readFileSync } = await import("node:fs");
+    const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+    const value = manifest.configSchema.properties.proxyMode.properties.codexAgents.additionalProperties;
+    const types = (value.anyOf ?? value.oneOf ?? [value]).map((s) => s.type);
+    expect(types).toEqual(expect.arrayContaining(["boolean", "string"]));
+  });
+});

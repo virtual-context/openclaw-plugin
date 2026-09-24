@@ -172,8 +172,18 @@
           },
           "codexAgents": {
             "type": "object",
-            "description": "Agents whose codex-home chatgpt_base_url already names this tenant's VC route. The plugin signs the conversation into each prompt and leaves prepare and ingest to the proxy. Value: true.",
-            "additionalProperties": { "type": "boolean" }
+            "description": "Agents whose codex-home chatgpt_base_url already names this tenant's VC route. The plugin signs the conversation into each prompt and leaves prepare and ingest to the proxy. Value: true, or an OpenAI model id pinned to the openclaw runtime that runs are switched to while the cloud health probe reports it down.",
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1
+                }
+              ]
+            }
           },
           "healthTimeoutMs": {
             "type": "integer",
