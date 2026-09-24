@@ -155,8 +155,18 @@ export function buildProxyModeConfig(cfg, ocConfig, { pluginBaseUrl, vcKeyFor, l
           provider.supports_websockets?.literal !== "false" || provider.requires_openai_auth?.literal !== "true") {
         disable(`codex-provider:${agentId}`); continue;
       }
-      out.codexAgents.set(agentId, { key });
-      log?.info?.(`[vc:proxy] ENABLED agent=${agentId} route=codex`);
+      // A string names the model a run switches to while the cloud is down. It
+      // must run on the embedded runtime: on the Codex harness it would take the
+      // same codex-home route to the same unavailable cloud.
+      const entry = { key };
+      if (typeof flag === "string" && flag.trim()) {
+        const fallback = flag.trim();
+        const runtime = ocConfig.agents.entries[agentId].models?.[`openai/${fallback}`]?.agentRuntime?.id;
+        if (runtime === "openclaw") entry.fallback = fallback;
+        else disable(`codex-fallback-not-embedded:${fallback}`);
+      }
+      out.codexAgents.set(agentId, entry);
+      log?.info?.(`[vc:proxy] ENABLED agent=${agentId} route=codex${entry.fallback ? ` fallback=${entry.fallback}` : ""}`);
     }
   }
   if (out.agents.size === 0 && out.codexAgents.size === 0) out.enabled = false;
@@ -202,6 +212,7 @@ export function createProxyHealth({ url, timeoutMs, ttlMs, fetchImpl = globalThi
 export function warmProxyHealth(config, healthFor) {
   const keys = new Set();
   for (const agent of config?.agents?.values?.() ?? []) if (agent?.key) keys.add(agent.key);
+  for (const agent of config?.codexAgents?.values?.() ?? []) if (agent?.key) keys.add(agent.key);
   return Promise.all([...keys].map((key) => Promise.resolve(healthFor(key).refresh()).catch(() => {})));
 }
 
@@ -290,7 +301,15 @@ export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIden
 export function decideProxyOverride({ config, ctx, health, sessionIngested, deriveConvIdentity, groupIndex, latches, prompt }) {
   if (!config?.enabled) return { override: null, reason: "disabled" };
   const agentId = agentIdFromSessionKey(ctx?.sessionKey);
-  if (config.codexAgents?.has(agentId)) return { override: null, reason: "codex-routed" };
+  const codexAgent = config.codexAgents?.get(agentId);
+  if (codexAgent) {
+    // The route is fixed in the codex-home, so a run only avoids an unavailable
+    // cloud by switching to the agent's embedded-runtime fallback model.
+    if (codexAgent.fallback && health.decide() === "down") {
+      return { override: codexAgent.fallback, reason: "codex-cloud-down" };
+    }
+    return { override: null, reason: "codex-routed" };
+  }
   const agent = config.agents.get(agentId);
   if (!agent) return { override: null, reason: "agent-not-enabled" };
   const key = proxyLatchKey(ctx);

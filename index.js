@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.16.1";
+const PLUGIN_VERSION = "5.17.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -7513,7 +7513,8 @@ export default {
       if (isExcludedTrigger(ctx)) return;
       if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
       const sessionId = hookSessionIdentity(ctx);
-      const agentEntry = proxyMode.agents.get(agentIdFromSessionKey(ctx?.sessionKey));
+      const routedAgentId = agentIdFromSessionKey(ctx?.sessionKey);
+      const agentEntry = proxyMode.agents.get(routedAgentId) ?? proxyMode.codexAgents.get(routedAgentId);
       const decision = decideProxyOverride({
         config: proxyMode,
         ctx,
@@ -7526,7 +7527,7 @@ export default {
       });
       if (decision.override) {
         log.info?.(
-          `[vc:proxy] selected agent=${agentIdFromSessionKey(ctx?.sessionKey)} twin=${decision.override} ` +
+          `[vc:proxy] selected agent=${agentIdFromSessionKey(ctx?.sessionKey)} model=${decision.override} reason=${decision.reason} ` +
           `conv=${decision.convId} session=${sessionId} run=${ctx?.runId ?? "?"}`,
         );
         return { modelOverride: decision.override };

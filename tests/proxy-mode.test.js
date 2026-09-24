@@ -256,6 +256,37 @@ describe("codex-harness route", () => {
     expect(eph.latch).toMatchObject({ twin: "gpt-5.6-sol", convId: "sk:session:abc-123" });
     expect(latches.size()).toBe(1);
   });
+  it("names a fallback model a codex agent uses while the cloud is down", () => {
+    const oc = ocConfig({ models: { "openai/gpt-5.6-terra": { agentRuntime: { id: "openclaw" } } } });
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: "gpt-5.6-terra" } } }, () => toml(good), oc);
+    expect(c.codexAgents.get("bast")).toEqual({ key: KEY, fallback: "gpt-5.6-terra" });
+  });
+  it("drops a fallback that would run on the codex harness, since that goes through the route", () => {
+    const oc = ocConfig({ models: { "openai/gpt-5.6-terra": {} } });
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: "gpt-5.6-terra" } } }, () => toml(good), oc);
+    expect(c.codexAgents.get("bast")).toEqual({ key: KEY });
+    expect(c.disabled).toEqual([{ agent: "bast", reason: "codex-fallback-not-embedded:gpt-5.6-terra" }]);
+  });
+  it("sends a codex agent to its fallback only while the cloud is down", () => {
+    const oc = ocConfig({ models: { "openai/gpt-5.6-terra": { agentRuntime: { id: "openclaw" } } } });
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: "gpt-5.6-terra" } } }, () => toml(good), oc);
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    const stable = () => ({ convId: "sk:agent:bast:main", isStable: true });
+    const decide = (state) => decideProxyOverride({ config: c, ctx, health: { decide: () => state }, sessionIngested: true, deriveConvIdentity: stable, latches, prompt: "hi" });
+    expect(decide("down")).toEqual({ override: "gpt-5.6-terra", reason: "codex-cloud-down" });
+    expect(decide("ok")).toEqual({ override: null, reason: "codex-routed" });
+    expect(decide("unknown")).toEqual({ override: null, reason: "codex-routed" });
+    const plain = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good), oc);
+    expect(decideProxyOverride({ config: plain, ctx, health: { decide: () => "down" }, sessionIngested: true, deriveConvIdentity: stable, latches, prompt: "hi" }))
+      .toEqual({ override: null, reason: "codex-routed" });
+  });
+  it("warms health for codex agents too", async () => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    const probed = [];
+    await warmProxyHealth(c, (key) => ({ refresh: () => { probed.push(key); } }));
+    expect(probed).toEqual([KEY]);
+  });
   it("leaves a codex-routed run's ingest to the proxy for the whole run", async () => {
     const { observeProxyModelCall, proxyOwnsIngest } = await import("../proxy-mode.js");
     const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
