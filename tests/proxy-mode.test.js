@@ -281,6 +281,16 @@ describe("codex-harness route", () => {
     expect(decideProxyOverride({ config: plain, ctx, health: { decide: () => "down" }, sessionIngested: true, deriveConvIdentity: stable, latches, prompt: "hi" }))
       .toEqual({ override: null, reason: "codex-routed" });
   });
+  it("never routes a run on the agent's fallback model, whatever runtime the host reports", () => {
+    const oc = ocConfig({ models: { "openai/gpt-5.6-terra": { agentRuntime: { id: "openclaw" } } } });
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: "gpt-5.6-terra" } } }, () => toml(good), oc);
+    const latches = createProxyLatches({ ttlMs: 3600000 });
+    const ctx = { sessionKey: "agent:bast:main", sessionId: "s1", runId: "r1" };
+    const stable = () => ({ convId: "sk:agent:bast:main", isStable: true });
+    expect(decideCodexRoute({ config: c, ctx, model: "openai/gpt-5.6-terra", runtimeId: null, deriveConvIdentity: stable, latches }))
+      .toEqual({ latch: null, reason: "fallback-model" });
+    expect(latches.size()).toBe(0);
+  });
   it("warms health for codex agents too", async () => {
     const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
     const probed = [];

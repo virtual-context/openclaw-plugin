@@ -7767,7 +7767,7 @@ export default {
           if (cx.latch) {
             proxyLatch = cx.latch;
             if (cx.reason === "routed") log.info?.(`[vc:proxy] codex route — model=${runModel} conv=${cx.latch.convId} session=${sessionId} run=${stateRunId || "?"}`);
-          } else if (cx.reason && !["native-model", "embedded-runtime"].includes(cx.reason)) {
+          } else if (cx.reason && !["native-model", "embedded-runtime", "fallback-model"].includes(cx.reason)) {
             log.warn?.(`[vc:proxy] codex-routed agent without a route reason=${cx.reason} model=${runModel} session=${sessionId}; VC will reject the call`);
           }
         }

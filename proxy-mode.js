@@ -281,6 +281,10 @@ export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIden
   if (!agent) return { latch: null, reason: "" };
   if (typeof model !== "string" || !model.startsWith("openai/")) return { latch: null, reason: "native-model" };
   if (runtimeId === "openclaw") return { latch: null, reason: "embedded-runtime" };
+  // The configured fallback is validated to run on the embedded runtime, so a
+  // run on it never takes the codex-home route even if the host's runtime
+  // lookup for the run comes back empty.
+  if (agent.fallback && model === `openai/${agent.fallback}`) return { latch: null, reason: "fallback-model" };
   const key = proxyLatchKey(ctx);
   if (!key) return { latch: null, reason: "no-run-key" };
   const existing = latches.get(key);
