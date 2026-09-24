@@ -319,3 +319,16 @@ describe("proxyMode manifest schema", () => {
     expect(types).toEqual(expect.arrayContaining(["boolean", "string"]));
   });
 });
+
+describe("fresh health for codex fallback decisions", () => {
+  it("probes even while a cached result is still valid", async () => {
+    const { createProxyHealth } = await import("../proxy-mode.js");
+    let up = true; let calls = 0;
+    const health = createProxyHealth({ url: "u", timeoutMs: 1500, ttlMs: 60000, fetchImpl: async () => { calls += 1; return { ok: up }; } });
+    expect(await health.fresh()).toBe("ok");
+    up = false;
+    expect(health.decide()).toBe("ok"); // cached, within the TTL
+    expect(await health.fresh()).toBe("down");
+    expect(calls).toBe(2);
+  });
+});

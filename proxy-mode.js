@@ -200,6 +200,11 @@ export function createProxyHealth({ url, timeoutMs, ttlMs, fetchImpl = globalThi
       return state;
     },
     refresh,
+    /** Probe now (bounded by timeoutMs) and return the resulting state. */
+    async fresh() {
+      await refresh().catch(() => {});
+      return state;
+    },
     _set(s) { state = s; checkedAt = now(); },
   };
 }

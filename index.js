@@ -7508,17 +7508,24 @@ export default {
     // ── before_model_resolve: proxy-mode switch ──
     // Returns a modelOverride to the agent's VC-routed twin entry; the latch
     // taken here is what the later hooks consult for this exact run.
-    api.on("before_model_resolve", (event, ctx) => {
+    api.on("before_model_resolve", async (event, ctx) => {
       if (!proxyMode.enabled) return;
       if (isExcludedTrigger(ctx)) return;
       if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
       const sessionId = hookSessionIdentity(ctx);
       const routedAgentId = agentIdFromSessionKey(ctx?.sessionKey);
       const agentEntry = proxyMode.agents.get(routedAgentId) ?? proxyMode.codexAgents.get(routedAgentId);
+      let health = agentEntry ? proxyHealthFor(agentEntry.key) : { decide: () => "unknown" };
+      if (agentEntry?.fallback) {
+        // A codex run cannot leave the route once it starts, so decide from a
+        // probe taken now rather than a cached result up to a TTL old.
+        const state = await health.fresh();
+        health = { decide: () => state };
+      }
       const decision = decideProxyOverride({
         config: proxyMode,
         ctx,
-        health: agentEntry ? proxyHealthFor(agentEntry.key) : { decide: () => "unknown" },
+        health,
         sessionIngested: isSessionIngested(sessionId),
         deriveConvIdentity,
         groupIndex,
