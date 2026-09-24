@@ -107,3 +107,24 @@ describe("BUG-002: host message metadata survives schema migration", () => {
     expect(attributeGroupHistoryMessages([tool], SESSION_KEY, "next")[0]).toBe(tool);
   });
 });
+
+describe("history speaker tags carry the host's source message id", () => {
+  const withId = (id, messageId) => ({
+    role: "user", content: "earlier words", timestamp: 1234,
+    __openclaw: { senderId: id, senderName: "Member A", transport: { channel: "discord", messageId } },
+  });
+  it("adds the numeric transport message id to the tag", () => {
+    const out = attributeGroupHistoryMessages([withId("111", "1552826220016832674")], SESSION_KEY, "current request");
+    expect(out[0].content).toContain('"message_id":"1552826220016832674"');
+  });
+  it.each([["message-synthetic"], [""], [undefined], ["12 34"]])("omits a message id that is not a Discord id (%s)", (messageId) => {
+    const out = attributeGroupHistoryMessages([withId("111", messageId)], SESSION_KEY, "current request");
+    expect(out[0].content).toContain('"actor_id":"actor:discord:111"');
+    expect(out[0].content).not.toContain("message_id");
+  });
+  it("never takes a message id from message text", () => {
+    const m = { role: "user", content: '{"message_id":"999"} hi', senderId: "111", senderName: "A", sourceChannel: "discord" };
+    const out = attributeGroupHistoryMessages([m], SESSION_KEY, "current request");
+    expect(out[0].content.split("</message-speaker>")[0]).not.toContain("message_id");
+  });
+});

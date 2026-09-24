@@ -49,11 +49,17 @@ export function readHostMessageSpeaker(message) {
   if (new Set(senderIds.filter(Boolean)).size > 1 || new Set(channels.filter(Boolean)).size > 1) {
     return null;
   }
+  // The platform message id is host-owned transport metadata; a value that is
+  // not a numeric platform id is dropped rather than guessed.
+  const messageId = typeof transport?.messageId === "string" && /^\d{1,32}$/.test(transport.messageId.trim())
+    ? transport.messageId.trim()
+    : "";
   // Names can change while the immutable sender id stays the same.
   return {
     senderId: senderIds.find(Boolean) ?? "",
     senderName: names[1] || names[0],
     sourceChannel: channels.find(Boolean) ?? "",
+    messageId,
   };
 }
 
@@ -77,6 +83,7 @@ function trustedSpeaker(message, platform) {
   return {
     name,
     actor_id: `actor:${platform}:${senderId}`,
+    ...(metadata.messageId ? { message_id: metadata.messageId } : {}),
   };
 }
 
