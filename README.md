@@ -67,6 +67,11 @@ In `openclaw.json`:
 | `debug` | boolean | `false` | Enable verbose logging of REST API calls and payloads |
 | `operatorNoticeUserId` | string | none | Discord user id that receives model-fallback transition notices as a DM; the in-channel copy is cancelled. Omitted = host default (in-channel). Fails safe: without a bot token the notice stays in-channel. |
 | `modelCallCapture` | object | disabled | Store complete, untruncated `llm_input` and `llm_output` hook payloads in a bounded local gzip log. Defaults to 512 MiB, 2,000 files, and 7 days under `~/.openclaw/logs/virtual-context/model-calls`. |
+| `agentKeyFiles` | object | none | Map of agent id to an absolute path of a file holding that agent's VC key. The agent's traffic uses that key and therefore that key's tenant; every other agent uses `vcKey`. Unreadable entries fall back to `vcKey` with a log line. |
+| `agentActorIds` | object | none | The agent's own platform actor ids keyed by platform, e.g. `{"discord": "1485..."}`, so the engine can tell the agent's quoted output from a member's. Cross-checked at startup against other plugins' bot user ids and disabled on any disagreement. |
+| `outboundIdCapture` | object | `{"mode": "off"}` | Capture the bot's own outbound message ids so a member's quote-reply of the bot is recognised. Requires `convIdentity: "stable"`. |
+| `ingestRetry` | object | `{"enabled": false}` | Retry an ingest rejected with `conversation_lifecycle_busy`. Off by default; timeouts are never retried. |
+| `proxyMode` | object | disabled | Route selected agents' model calls through the VC proxy instead of the REST prepare/ingest path. See [Proxy mode](#proxy-mode). |
 
 ### Conversation identity — read this before going to production
 
@@ -92,6 +97,33 @@ Selecting the plugin as OpenClaw's context engine turns on speaker-attributed gr
 This is an OpenClaw-level slot, not a key inside the plugin's own `config` block. When selected, the plugin preserves OpenClaw's legacy context-engine lifecycle and stock compaction, and adds trusted `senderName` / `senderId` attribution to the in-memory group-chat history. Discord DMs and direct sessions are unchanged, missing metadata is never guessed, and stored conversation text is not rewritten. Omit the slot to leave OpenClaw's default context engine in place.
 
 Selecting the slot also gives the plugin an in-band compaction signal: the gateway performs compaction through the engine's `compact()`, so the plugin knows when a session was just compacted. On the first prepare after a completed compaction, the payload sent to Virtual Context carries only the current turn instead of the post-compaction survivors and summary — those are the runtime's compressed view of the conversation, not history, and the service already holds every turn it ingested. The model-facing prompt is unchanged; the suppression logs `[vc] suppressing N post-compaction survivor message(s)`. Without the slot (or on a gateway without `registerContextEngine`) the plugin has no compaction signal and forwards the window as-is; the service guards against that shape on its side.
+
+## Proxy mode
+
+By default the plugin calls the VC REST API before each turn (prepare) and after it (ingest), and the host sends the model call itself. In proxy mode the model call goes through the VC proxy instead, so VC sees and shapes the exact payload the model receives, including every round of a tool loop. The proxy records each turn it relays, so the plugin does not ingest a routed run a second time: always for Codex-routed runs, and for twin-routed runs when every model call in the run went to the twin.
+
+```json
+"proxyMode": {
+  "enabled": true,
+  "agents": { "my-agent": "gpt-5.6-sol-vc" },
+  "codexAgents": { "my-codex-agent": "gpt-5.6-terra" }
+}
+```
+
+| Key | Description |
+|-----|-------------|
+| `agents` | Agent id to a VC-routed "twin" model id: an entry in `models.providers.openai.models` whose base URL is your VC route. Each run on the agent is switched to its twin. |
+| `codexAgents` | Agents that run on the Codex harness and whose `codex-home/config.toml` already points at your VC route. Value `true`, or an OpenAI model id to switch runs to while the VC cloud is unreachable. |
+| `healthTimeoutMs` | Timeout of the cloud health probe. Default `1500`. |
+| `healthTtlMs` | How long a health result is reused. Default `60000`. A Codex agent with a fallback always probes fresh before a run. |
+| `latchTtlMs` | How long a run's routing decision is kept for host re-runs. Default 24 hours. |
+
+A Codex agent is only enabled when its `codex-home/config.toml` matches the route exactly; otherwise the plugin logs `[vc:proxy] DISABLED agent=<id> reason=<reason>` and the agent stays on the normal path:
+
+- `chatgpt_base_url` is `https://<host>/<vc-key>/backend-api`, for the key that agent uses;
+- `model_provider = "vc"`, with a `[model_providers.vc]` table whose `base_url` is the same route plus `/codex`, `requires_openai_auth = true` and `supports_websockets = false`. The custom provider is required because Codex's built-in provider opens a WebSocket to chatgpt.com regardless of `chatgpt_base_url`.
+
+The model call still authenticates with the agent's own OpenAI sign-in; VC passes it through. A fallback model for a Codex agent must run on the embedded runtime (`agentRuntime.id: "openclaw"` for that model in the agent's `models`), since a Codex-harness fallback would take the same unavailable route. Successful registrations log `[vc:proxy] ENABLED agent=<id> route=codex` (with `fallback=<model>` when set).
 
 ## How It Works
 
@@ -224,6 +256,16 @@ Sign up at [virtual-context.com](https://virtual-context.com) to get your API ke
 - [GitHub](https://github.com/virtual-context/openclaw-plugin) — plugin source code
 
 ## Changelog
+
+### 5.17.0
+
+- **Proxy mode**: new `proxyMode` config routes selected agents' model calls through the VC proxy, either by switching runs to a VC-routed twin model (`agents`) or, for Codex-harness agents, through a VC route configured in the agent's `codex-home` (`codexAgents`). The plugin validates each route at startup, disables any agent whose route does not match, and leaves ingest of routed runs to the proxy.
+- **Cloud-down fallback for Codex agents**: a `codexAgents` entry can name an embedded-runtime model; runs switch to it while a fresh health probe reports the VC cloud unreachable, and are treated as native runs.
+- **Health probe at registration**: proxy health is checked when the plugin registers, and before each run of a Codex agent that has a fallback.
+- **Platform message ids in history speaker tags**: replayed history carries each message's platform message id, so the engine can recognise turns it has already stored.
+- **History images on flat-projection hosts**: images in replayed history stay bound to their own messages, and the current request's images are named in the developer map.
+- **Attribution and admission**: attribution is preserved across native transcript formats, embedded transcript admission fences are honored, occurrence times survive exact admission, and verified reply parents are forwarded with turn provenance.
+- **Session model and history bounds**: prepare resolves the session model from the hook context and bounds the host history it sends.
 
 ### 5.5.0
 
