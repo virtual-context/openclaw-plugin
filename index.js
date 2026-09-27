@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.17.0";
+const PLUGIN_VERSION = "5.17.1";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -7411,10 +7411,10 @@ export default {
       log.info?.("[vc] gateway does not expose registerCommand — native slash commands skipped");
     } else {
     const vcSlashCommands = [
-      { name: "vcstatus", description: "Show VC conversation status (ingest, watermarks, tokens).", acceptsArgs: false, cmd: "VCSTATUS" },
-      { name: "vcmerge",  description: "Merge VC tags (e.g. /vcmerge PREVIEW or /vcmerge tag1 tag2 ...).", acceptsArgs: true,  cmd: "VCMERGE"  },
-      { name: "vclabel",  description: "Set or update conversation label (e.g. /vclabel My Project).",     acceptsArgs: true,  cmd: "VCLABEL"  },
-      { name: "vcattach", description: "Attach a tag/topic to the VC conversation (/vcattach <tag>).",     acceptsArgs: true,  cmd: "VCATTACH" },
+      { name: "vcstatus", description: "Show this conversation's VC status (ingestion, watermarks, stored segments, tokens).", acceptsArgs: false, cmd: "VCSTATUS" },
+      { name: "vcmerge",  description: "Merge this VC conversation into another (/vcmerge INTO <label or id>).", acceptsArgs: true,  cmd: "VCMERGE"  },
+      { name: "vclabel",  description: "Show or set this conversation's label (/vclabel My Project).",      acceptsArgs: true,  cmd: "VCLABEL"  },
+      { name: "vcattach", description: "Attach this session to an existing VC conversation (/vcattach <label or id>).", acceptsArgs: true,  cmd: "VCATTACH" },
     ];
     for (const def of vcSlashCommands) {
       api.registerCommand({
