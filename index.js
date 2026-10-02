@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.17.1";
+const PLUGIN_VERSION = "5.18.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -1898,8 +1898,8 @@ export function forgetInboundTurn(runId) {
 // Tested positively against the trigger the runtime supplies: the host builds
 // the hook context with a conditional spread, so the key is ABSENT rather than
 // falsy for other triggers, and inferring "heartbeat" from a missing key would
-// silently exclude real turns. Only this exact value is excluded; cron and
-// cli_budget runs are real work and keep their memory.
+// silently exclude real turns. Only this exact value is excluded here; cron
+// sessions are kept out by their session scope (ephemeralSessionScope).
 const VC_EXCLUDED_TRIGGER = "heartbeat";
 
 function isExcludedTrigger(ctx) {
@@ -3374,9 +3374,9 @@ export function deriveConvIdentity(sessionKey, sessionId, groupIndex) {
     return stable(`agent:${parts[1]}:web:direct:${scope[2]}`);
   }
   if (scope[0] === "cron" && scope[1]) {
-    // Crons are intentionally ephemeral: cron traffic runs on models outside
-    // the VC provider allowlist by design, so prepare/ingest never fire for
-    // them and a stable per-job identity would be dead config. Recognized
+    // Crons are intentionally ephemeral: ephemeralSessionScope keeps them out
+    // of prepare and ingest, so a stable per-job identity would be dead
+    // config. Recognized
     // shapes (with or without the :run:<runUuid> suffix) stay per-session
     // without a warning; anything else cron-ish is unparseable.
     if (scope.length === 2 || (scope.length === 4 && scope[2] === "run" && scope[3])) {
@@ -3692,6 +3692,37 @@ export function sessionAgentExcluded(excludedAgents, sessionKey) {
   if (!excludedAgents || excludedAgents.size === 0) return false;
   const agentId = sessionAgentScopeId(sessionKey);
   return Boolean(agentId && excludedAgents.has(agentId.toLowerCase()));
+}
+
+/**
+ * Session scopes that never use VC: cron runs, subagent spawns and OpenClaw's
+ * internal sessions (`internal-session-*`, such as the skill workshop). They
+ * are disposable work, not conversations to remember, so they run on the
+ * agent's own model and tools exactly as an excluded agent does.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function ephemeralSessionScope(sessionKey) {
+  if (typeof sessionKey !== "string") return null;
+  const parts = sessionKey.split(":");
+  if (parts[0] !== "agent" || !parts[1] || !parts[2]) return null;
+  if (parts[2] === "cron") return "cron";
+  if (parts[2] === "subagent") return "subagent";
+  if (parts[2].startsWith("internal-session")) return "internal session";
+  return null;
+}
+
+/**
+ * Why a session is kept away from VC entirely, or null when it is not.
+ *
+ * Pure function; exported for unit testing.
+ */
+export function sessionExclusionReason(excludedAgents, sessionKey) {
+  if (sessionAgentExcluded(excludedAgents, sessionKey)) {
+    return `agent '${sessionAgentScopeId(sessionKey)}' is in excludeAgents`;
+  }
+  const scope = ephemeralSessionScope(sessionKey);
+  return scope ? `${scope} sessions do not use VC` : null;
 }
 
 /**
@@ -7511,7 +7542,7 @@ export default {
     api.on("before_model_resolve", async (event, ctx) => {
       if (!proxyMode.enabled) return;
       if (isExcludedTrigger(ctx)) return;
-      if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
+      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey)) return;
       const sessionId = hookSessionIdentity(ctx);
       const routedAgentId = agentIdFromSessionKey(ctx?.sessionKey);
       const agentEntry = proxyMode.agents.get(routedAgentId) ?? proxyMode.codexAgents.get(routedAgentId);
@@ -7582,7 +7613,7 @@ export default {
       // Same position for excluded agents: their VC commands must not reach
       // the cloud or touch the tracker either -- exclusion is total, unlike
       // the provider filter, which VC commands deliberately bypass.
-      if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) return;
+      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey)) return;
       const sessionId = hookSessionIdentity(ctx);
       const turnRunId = hookInvocationRunId(ctx, sessionId);
       // This hook fires once at the start of each invoked turn, before context
@@ -7706,11 +7737,9 @@ export default {
       }
       // Before the provider filter, the VC-command bypass and the prepare
       // POST: an excluded agent's turns never reach the cloud at all.
-      if (sessionAgentExcluded(excludedAgents, sessionKey)) {
-        log.info?.(
-          `[vc] skipping prepare — agent '${sessionAgentScopeId(sessionKey)}' ` +
-          `is in excludeAgents; session=${sessionId}`,
-        );
+      const prepareExclusion = sessionExclusionReason(excludedAgents, sessionKey);
+      if (prepareExclusion) {
+        log.info?.(`[vc] skipping prepare — ${prepareExclusion}; session=${sessionId}`);
         return;
       }
       const explicitRunId = typeof ctx?.runId === "string" && ctx.runId.trim()
@@ -8977,12 +9006,9 @@ export default {
         // there is no pending user half -- but a config reload between the
         // two hooks can exclude an agent mid-turn, so release defensively
         // (the forgets are no-ops when nothing is pending).
-        if (sessionAgentExcluded(excludedAgents, ctx?.sessionKey)) {
-          log.info?.(
-            `[vc] skipping ingest — agent ` +
-            `'${sessionAgentScopeId(ctx?.sessionKey)}' is in excludeAgents; ` +
-            `session=${sessionId}`,
-          );
+        const ingestExclusion = sessionExclusionReason(excludedAgents, ctx?.sessionKey);
+        if (ingestExclusion) {
+          log.info?.(`[vc] skipping ingest — ${ingestExclusion}; session=${sessionId}`);
           releasePendingTurn();
           return;
         }

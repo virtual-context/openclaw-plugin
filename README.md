@@ -87,7 +87,7 @@ Without a `vcKey` the plugin logs a warning and does nothing.
 `convIdentity` decides which turns belong to the same VC conversation.
 
 - **`"session"` (default)** — keyed by OpenClaw's session id. That id changes when OpenClaw resets a session, and the next turn then starts a new VC conversation.
-- **`"stable"`** — keyed by the session key, so memory survives session resets. This covers the `main` session, Discord DMs, group DMs, and guild channels, Telegram direct and group chats, and per-user web chat. Cron, sub-agent, and other one-off sessions keep a per-session conversation.
+- **`"stable"`** — keyed by the session key, so memory survives session resets. This covers the `main` session, Discord DMs, group DMs, and guild channels, Telegram direct and group chats, and per-user web chat. Explicit one-off sessions keep a per-session conversation; cron, sub-agent, and internal sessions do not use VC.
 
 For an agent that should remember past conversations, set `convIdentity: "stable"`.
 
@@ -145,7 +145,7 @@ Each run is switched to a twin catalog entry that points at the VC route. For `<
 - header `X-VC-Upstream-Model: <model>`
 - `params.transport`: `"sse"`
 
-A run stays on REST mode instead of switching when: it is a heartbeat, the agent is excluded, the prompt is a typed VC command, the session's initial history upload has not happened yet, the session has no stable identity, or the last health check was not OK. These log `[vc:proxy] bypass agent=<id> reason=<reason>`. The plugin skips ingest for a twin run only when every model call of the run went to the twin.
+A run stays on REST mode instead of switching when: it is a heartbeat, the agent is excluded, the session is a cron, sub-agent, or internal session, the prompt is a typed VC command, the session's initial history upload has not happened yet, the session has no stable identity, or the last health check was not OK. These log `[vc:proxy] bypass agent=<id> reason=<reason>`. The plugin skips ingest for a twin run only when every model call of the run went to the twin.
 
 ### Codex agents (`codexAgents`)
 
@@ -236,7 +236,7 @@ Group turns log `[vc] run-bound group ingest OK` instead of the ingest line. Pro
 - `[vc] WARN provider filter now SKIPPING` — a session that was using VC fell off the allowlist, usually after a model fallback. Logged once per change.
 - `[vc] session=... has NEVER passed the provider filter` — logged on the first skip and every 25th after, naming the model to add.
 - `[vc] provider filter NOT EVALUATED` / `[vc] WARN provider filter CANNOT EVALUATE` — the session's model could not be determined. After 3 consecutive such turns the plugin stops using VC for the session and logs `[vc] skipping — model unresolved`.
-- `[vc] skipping prepare —` / `[vc] skipping ingest —` — a heartbeat turn, or an agent in `excludeAgents`.
+- `[vc] skipping prepare —` / `[vc] skipping ingest —` — a heartbeat turn, an agent in `excludeAgents`, or a cron, sub-agent, or internal session.
 - `[vc:agent-keys] KEYS MISSING` — an `agentKeyFiles` entry failed to load; that agent uses `vcKey`.
 - `[vc] ingest SKIPPED — no reply text in turn` — the turn produced no reply text to store.
 - `[vc] tool definitions refresh failed for <conversation>: <error>` — the built-in or previously fetched definitions stay in use.
@@ -247,6 +247,8 @@ Set `debug: true` for request and payload logging; disable it in production.
 ## Provider filtering and excluded agents
 
 **`providers`.** The plugin checks each turn's current model against `providers` (lowercased, exact `provider/model` match). The model comes from the hook context, or from the agent's `sessions.json` when the hook does not provide it, so `/model` switches are picked up. Because the check uses the live model, the list must cover every model in the fallback chain of each agent you want to use VC: a fallback to an unlisted model turns VC off for those turns. Conversely, listing a model that an unwanted agent also uses makes that agent use VC as well; use `excludeAgents` to keep an agent out. Typed VC commands and proxy-routed runs are not subject to the filter.
+
+**Cron, sub-agent, and internal sessions.** Sessions whose key is `agent:<id>:cron:…`, `agent:<id>:subagent:…`, or `agent:<id>:internal-session…:…` (such as the skill workshop's review runs) never use VC: no prepare, no ingest, no typed VC commands, and no proxy routing. They run on the agent's own model and tools.
 
 **`excludeAgents`.** Matches the agent id (case-insensitive) in the session key. Excluded agents get no prepare, no ingest, no typed VC commands, and no proxy routing, and the list is logged at startup when it is not empty. Current limits: the native slash commands and the seven retrieval tools do not check this list, so an excluded agent can still reach the VC service through them.
 
@@ -324,6 +326,10 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 - [Source code](https://github.com/virtual-context/openclaw-plugin)
 
 ## Changelog
+
+### 5.18.0
+
+- Cron, sub-agent, and internal sessions (such as the skill workshop's review runs) no longer use VC: no prepare, no ingest, no typed VC commands, and no proxy routing.
 
 ### 5.17.1
 
