@@ -4,6 +4,7 @@ import {
   tenantPathSegment,
   buildProxyModeConfig, createProxyHealth, createProxyLatches, decideProxyOverride, warmProxyHealth,
   proxyLatchKey, relatchProxyRun, routeMarkerLine, signRouteMarker, decideCodexRoute,
+  codexPassthroughMarker, PASSTHROUGH_ROUTE_ID,
 } from "../proxy-mode.js";
 
 const KEY = "vc-route-key";
@@ -242,6 +243,16 @@ describe("codex-harness route", () => {
     expect(r.latch).toMatchObject({ twin: "gpt-6-astra", convId: "sk:agent:bast:main", key: KEY, route: "codex" });
     expect(decideCodexRoute({ config: c, ctx, model: "openai/gpt-6-astra", runtimeId: null, deriveConvIdentity: stable, latches }).reason).toBe("latched");
     expect(routeMarkerLine(r.latch.key, r.latch.convId)).toContain("conversation=sk:agent:bast:main");
+  });
+  it("an excluded run that leaves through the codex route carries the signed no-memory marker", () => {
+    const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));
+    const cron = "agent:bast:cron:job-1:run:r1";
+    expect(codexPassthroughMarker({ config: c, sessionKey: cron, model: "openai/gpt-6-astra", runtimeId: null }))
+      .toBe(routeMarkerLine(KEY, PASSTHROUGH_ROUTE_ID));
+    // Runs that never reach the route get nothing: other agents, non-OpenAI models, the embedded runtime.
+    expect(codexPassthroughMarker({ config: c, sessionKey: "agent:other:cron:job-1", model: "openai/gpt-6-astra", runtimeId: null })).toBe("");
+    expect(codexPassthroughMarker({ config: c, sessionKey: cron, model: "minimax/MiniMax-M2.7", runtimeId: null })).toBe("");
+    expect(codexPassthroughMarker({ config: c, sessionKey: cron, model: "openai/gpt-6-astra", runtimeId: "openclaw" })).toBe("");
   });
   it("native fallbacks and embedded-runtime runs are not routed; ephemeral sessions get a signed session id", () => {
     const c = buildCodex({ proxyMode: { enabled: true, codexAgents: { bast: true } } }, () => toml(good));

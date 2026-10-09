@@ -15,6 +15,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const ROUTE_MARKER_PREFIX = "<!-- vc:route conversation=";
+/** Reserved route id: forward the request without a VC conversation. */
+export const PASSTHROUGH_ROUTE_ID = "vc:passthrough";
 
 /** HMAC-SHA256(vcKey, "vc:route:" + convId), first 32 hex chars. */
 export function signRouteMarker(vcKey, convId) {
@@ -304,6 +306,23 @@ export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIden
   const modelId = model.slice("openai/".length);
   latches.take(key, { twin: modelId, twins: new Set([modelId]), convId, key: agent.key, route: "codex" });
   return { latch: latches.get(key), reason: "routed" };
+}
+
+/**
+ * The signed no-memory marker for a run kept out of VC (cron, sub-agent,
+ * heartbeat) on a codex-routed agent. The codex-home sends every OpenAI call of
+ * that agent to VC, which rejects an unsigned one; this marker has VC forward
+ * the call without a conversation. Returns "" for a run that never reaches the
+ * route: another agent, a non-OpenAI model, the embedded runtime, or the
+ * configured fallback.
+ */
+export function codexPassthroughMarker({ config, sessionKey, model, runtimeId }) {
+  const agent = config?.codexAgents?.get(agentIdFromSessionKey(sessionKey));
+  if (!agent) return "";
+  if (typeof model !== "string" || !model.startsWith("openai/")) return "";
+  if (runtimeId === "openclaw") return "";
+  if (agent.fallback && model === `openai/${agent.fallback}`) return "";
+  return routeMarkerLine(agent.key, PASSTHROUGH_ROUTE_ID);
 }
 
 /** Decide the override for one run. Returns { override, reason }. */

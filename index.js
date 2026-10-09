@@ -45,6 +45,7 @@ import {
   decideProxyOverride,
   relatchProxyRun,
   decideCodexRoute,
+  codexPassthroughMarker,
   observeProxyModelCall,
   proxyLatchKey,
   proxyOwnsIngest,
@@ -6554,6 +6555,20 @@ export default {
     // A gateway start must not send a routed agent's first turn native: probe now.
     if (proxyMode.enabled) void warmProxyHealth(proxyMode, proxyHealthFor);
     const proxyLatches = createProxyLatches({ ttlMs: proxyMode.latchTtlMs });
+    // A run kept out of VC still reaches it when its agent's codex-home routes
+    // every OpenAI call there; it carries the signed no-memory marker so VC
+    // forwards it instead of rejecting it as unrouted.
+    const excludedRunRoute = (ctx, sessionKey, sessionId) => {
+      if (!proxyMode.enabled || !proxyMode.codexAgents?.size) return undefined;
+      const runModel = typeof ctx?.model === "string"
+        ? ctx.model
+        : (ctx?.modelProviderId && ctx?.modelId ? `${ctx.modelProviderId}/${ctx.modelId}` : undefined);
+      const runtimeId = resolveSessionRuntimeDetails(sessionKey, { model: runModel, config: ctx?.config })?.id ?? null;
+      const marker = codexPassthroughMarker({ config: proxyMode, sessionKey, model: runModel, runtimeId });
+      if (!marker) return undefined;
+      log.info?.(`[vc:proxy] no-memory route — model=${runModel} session=${sessionId}`);
+      return { prependContext: marker };
+    };
     const proxyBypassLogged = new Set();
     // Each key owns its OWN completion-outbox directory (the directory name is
     // derived from the key hash), so a drain scheduled for one key can never
@@ -7778,14 +7793,14 @@ export default {
         log.info?.(
           `[vc] skipping prepare — ${VC_EXCLUDED_TRIGGER} turn; session=${sessionId}`,
         );
-        return;
+        return excludedRunRoute(ctx, sessionKey, sessionId);
       }
       // Before the provider filter, the VC-command bypass and the prepare
       // POST: an excluded agent's turns never reach the cloud at all.
       const prepareExclusion = sessionExclusionReason(excludedAgents, sessionKey);
       if (prepareExclusion) {
         log.info?.(`[vc] skipping prepare — ${prepareExclusion}; session=${sessionId}`);
-        return;
+        return excludedRunRoute(ctx, sessionKey, sessionId);
       }
       const explicitRunId = typeof ctx?.runId === "string" && ctx.runId.trim()
         ? ctx.runId.trim()
