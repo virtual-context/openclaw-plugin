@@ -327,9 +327,9 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 
 ## Changelog
 
-### 5.18.3
+### 5.18.4
 
-- Agents on the Codex route keep one Codex thread across turns instead of having their history re-projected into a new thread on every turn.
+- Codex-routed agents return to per-turn history projection; the thread-bootstrap projection reached VC in a form it did not trim.
 
 ### 5.18.2
 

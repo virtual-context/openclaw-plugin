@@ -306,7 +306,6 @@ export function createSpeakerAttributedContextEngine({
   onCompaction,
   historyImageLabeler,
   historyWindowFor,
-  threadProjectionFor,
   log,
 }) {
   if (typeof delegateCompactionToRuntime !== "function") {
@@ -400,24 +399,10 @@ export function createSpeakerAttributedContextEngine({
           })
         : undefined;
       const systemPromptAddition = [memoryAddition, media.note].filter(Boolean).join("\n\n");
-      // A routed agent's calls go through VC, which rebuilds the outbound
-      // payload itself; re-projecting the history into a fresh backend thread
-      // every turn only rebuilds the thread and discards the provider's cached
-      // prefix. Such agents keep one thread per epoch instead.
-      let epoch = null;
-      if (typeof threadProjectionFor === "function") {
-        try {
-          const raw = threadProjectionFor(params.sessionKey);
-          epoch = typeof raw === "string" && raw ? raw : null;
-        } catch (error) {
-          log?.warn?.(`[vc:proxy] thread projection lookup failed: ${error}`);
-        }
-      }
       return {
         messages: media.messages,
         estimatedTokens: 0,
         ...(systemPromptAddition ? { systemPromptAddition } : {}),
-        ...(epoch ? { contextProjection: { mode: "thread_bootstrap", epoch } } : {}),
       };
     },
     async afterTurn() {},

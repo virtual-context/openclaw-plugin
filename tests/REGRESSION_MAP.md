@@ -2,7 +2,6 @@
 
 | Bug | Tests | Contract |
 |---|---|---|
-| BUG-008 | `codex-thread-projection.test.js` | A Codex-routed agent's assembly asks the host for thread-bootstrap projection with a stable epoch; other agents and a missing or broken callback keep per-turn projection |
 | BUG-007 | `proxy-mode.test.js` — `an excluded run that leaves through the codex route carries the signed no-memory marker` | Excluded runs on a codex-routed agent get the signed pass-through marker; other agents, non-OpenAI models, the embedded runtime and the configured fallback get none |
 | BUG-006 | `tool-defs-persistence.test.js` | Fetched tool definitions are saved and served after a restart before any fetch completes; saved definitions are refreshed on next use; conversations never fetched keep the built-in set |
 | BUG-005 | `history-image-refs.test.js`; `image-labeler.test.js`; `codex-history-image-projection.test.js` — `BUG-005: …` | Flat-projection host detection, per-image VCREF derivation and uniqueness, derived-copy projection with refs in text and file name, byte-identical originals on failure, developer ref map, trusted workspace resolution, labeler cache/quota/temp hygiene, and untouched embedded assemblies |
