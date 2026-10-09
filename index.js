@@ -4,8 +4,7 @@
  * Full Virtual Context integration via REST API.
  *
  * Bootstrap (on register):
- *   GET /api/v1/tools/definitions?vckey=KEY
- *   → Registers each VC tool via api.registerTool()
+ *   Registers the fixed VC tool catalogue via api.registerTool()
  *
  * Lifecycle hooks (every LLM turn):
  *   before_prompt_build → POST /api/v1/context/prepare
@@ -6412,101 +6411,6 @@ export function renderOutboundIdReport(stats, context = {}) {
   );
 }
 
-// Per-conversation tool-definition cache. The server binds a request-local
-// speaker enum into eligible tool schemas from the conversation's current
-// roster snapshot; hardcoded definitions remain the fail-open baseline
-// for a conversation whose definitions were never fetched.
-//
-// Fetched definitions are saved to disk and loaded on first use, so the
-// first turn after a gateway restart is served the same definitions as the
-// turns after it. The tool catalog is the head of every model request; a
-// catalog that changes between turns invalidates the provider's prompt cache.
-const toolDefsCache = new Map(); // convId + channel -> { byName: Map, fetchedAt }
-const TOOL_DEFS_TTL_MS = 60_000;
-const toolDefsInflight = new Set();
-let toolDefsLoaded = false;
-
-function toolDefsCacheKey(convId, channelId = "") {
-  return `${convId}\u0000${cleanInboundField(channelId, 256)}`;
-}
-
-function toolDefsPath() {
-  return join(homedir(), ".openclaw", "state", "virtual-context", "tool-definitions.json");
-}
-
-function loadSavedToolDefs() {
-  if (toolDefsLoaded) return;
-  toolDefsLoaded = true;
-  try {
-    const saved = JSON.parse(readFileSync(toolDefsPath(), "utf8"));
-    for (const [cacheKey, tools] of Object.entries(saved ?? {})) {
-      if (toolDefsCache.has(cacheKey) || !Array.isArray(tools)) continue;
-      const byName = new Map(tools.filter((t) => t?.name).map((t) => [t.name, t]));
-      // fetchedAt 0: served now, refreshed on the next use.
-      toolDefsCache.set(cacheKey, { byName, fetchedAt: 0 });
-    }
-  } catch {
-    // No saved definitions yet, or an unreadable file: start empty.
-  }
-}
-
-function saveToolDefs() {
-  const saved = {};
-  for (const [cacheKey, entry] of toolDefsCache) {
-    if (entry.byName.size) saved[cacheKey] = [...entry.byName.values()];
-  }
-  const finalPath = toolDefsPath();
-  const temporaryPath = `${finalPath}.${process.pid}.tmp`;
-  try {
-    mkdirSync(dirname(finalPath), { recursive: true, mode: 0o700 });
-    writeFileSync(temporaryPath, JSON.stringify(saved), { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, finalPath);
-  } catch {
-    // The in-memory cache still serves this process.
-  }
-}
-
-export function maybeRefreshToolDefs(
-  baseUrl, vcKey, convId, channelId = "", log = null,
-) {
-  if (!convId) return;
-  loadSavedToolDefs();
-  const cacheKey = toolDefsCacheKey(convId, channelId);
-  const entry = toolDefsCache.get(cacheKey);
-  if (entry && Date.now() - entry.fetchedAt < TOOL_DEFS_TTL_MS) return;
-  if (toolDefsInflight.has(cacheKey)) return;
-  toolDefsInflight.add(cacheKey);
-  vcGet(
-    baseUrl,
-    "/api/v1/tools/definitions",
-    vcKey,
-    convId,
-    8000,
-    null,
-    { channel: cleanInboundField(channelId, 256) },
-  )
-    .then((resp) => {
-      const byName = new Map();
-      for (const tdef of resp?.tools ?? []) {
-        if (tdef?.name) byName.set(tdef.name, tdef);
-      }
-      toolDefsCache.set(cacheKey, { byName, fetchedAt: Date.now() });
-      if (byName.size) saveToolDefs();
-    })
-    .catch((err) => {
-      const prior = toolDefsCache.get(cacheKey)?.byName ?? new Map();
-      toolDefsCache.set(cacheKey, { byName: prior, fetchedAt: Date.now() });
-      log?.info?.(`[vc] tool definitions refresh failed for ${convId}: ${err.message}`);
-    })
-    .finally(() => toolDefsInflight.delete(cacheKey));
-}
-
-export function cachedToolDef(convId, name, channelId = "") {
-  loadSavedToolDefs();
-  return toolDefsCache.get(toolDefsCacheKey(convId, channelId))?.byName?.get(name);
-}
-
-
 export default {
   id: "virtual-context",
   name: "Virtual Context",
@@ -7401,42 +7305,20 @@ export default {
       log.warn?.(`[vc] WARNING: session.resetByType.group.idleMinutes is ${groupIdleMinutes} — recommend 2880+ (48h). Low values reset sessions and wipe client-side history before VC can manage it.`);
     }
 
-    // ── Register VC retrieval tools (hardcoded definitions) ──
-    // TOOLS: Registered statically — no bootstrap network call needed.
-    // Update these when the VC tool catalogue changes and release a new plugin version.
+    // ── Register VC retrieval tools ──
+    // One fixed catalogue, the same for every session and turn: the tool list
+    // heads every model request, so a definition that changed between turns
+    // would discard the provider's cached prompt prefix. Regenerate it from the
+    // VC engine's tool definitions when they change and release a new version.
     const vcTools = [
-      { name: "vc_expand_topic", description: "Load the full original conversation text for a topic. Use when a topic summary covers the area you need \u2014 expanding reveals the complete conversation including details the summary may have compressed. Also use after vc_find_quote returns snippets \u2014 expand the matching tag to read surrounding context before answering. For specific facts when you don't know which topic holds them, use vc_find_quote first to locate them.", input_schema: { type: "object", properties: { tag: { type: "string", description: "Topic tag from the context-topics list to expand." }, depth: { type: "string", enum: ["segments", "full"], description: "Target depth: 'segments' for individual summaries, 'full' for original conversation text." }, collapse_tags: { type: "array", items: { type: "string" }, description: "Optional list of topic tags to collapse back to summary depth before expanding. Frees context budget in the same round-trip instead of requiring a separate tool call." } }, required: ["tag"] } },
-      { name: "vc_find_quote", description: "Search the full original conversation text and truncated tool outputs for a specific word, phrase, or detail. Use this when you see '... N bytes truncated \u2014 call vc_find_quote(query) ...' in a tool result, or when the user asks about a specific fact \u2014 a name, number, dosage, recommendation, date, or decision \u2014 especially when no topic summary mentions it or you don't know which topic it falls under. This bypasses tags entirely and searches raw text, so it finds content even when it's filed under an unexpected topic. Returns short excerpts \u2014 use vc_expand_topic on a matching tag if you need more context.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for. Use the most specific and distinctive terms." }, channel: { type: "string", description: "Optional source-channel scope for conversations that span multiple channels (e.g. a Discord server). Pass the channel name ('#vasttest') or id when the user asks what was said in a specific channel. Omit for normal searches." } }, required: ["query"] } },
-      { name: "vc_recall_all", description: "Load summaries of ALL stored conversation topics at once. Use when the user asks for a broad overview, wants to know everything discussed, needs a full summary, or asks a vague question that spans multiple topics. Returns all tag summaries within the token budget. After reviewing, use vc_expand_topic on specific tags if you need more detail.", input_schema: { type: "object", properties: {} } },
-      { name: "vc_query_facts", description: "Query extracted facts with structured filters. Essential for questions about events, experiences, trips, activities, or anything the user has done \u2014 each fact has a date, location, and status. Also use for counting, listing, or filtering questions like 'how many X have I done', 'what projects am I leading'. Returns matching facts with count.", input_schema: { type: "object", properties: { subject: { type: "string", description: "Who the fact is about. Usually 'user'." }, verb: { type: "string", description: "Action verb to search for (e.g. 'led', 'built', 'prefers'). Automatically expanded to include similar verbs." }, object_contains: { type: "string", description: "Keyword to match in the object field." }, status: { type: "string", enum: ["active", "completed", "planned", "abandoned", "recurring"], description: "Temporal status filter. Omit for counting queries to get all statuses at once." }, fact_type: { type: "string", enum: ["personal", "experience", "world"], description: "Filter by fact type. Omit to get all types." } } } },
-      { name: "vc_remember_when", description: "Best tool for time-based questions. Retrieves conversations and facts from a specific date range. Use FIRST when the question mentions a time period ('past three months', 'last week', 'in March', 'between June and July'). Returns both conversation excerpts and structured facts within the window.", input_schema: { type: "object", properties: { query: { type: "string", description: "Topic/fact query to search for within a time window." }, time_range: { type: "object", properties: { kind: { type: "string", enum: ["relative", "between_dates"] }, preset: { type: "string", enum: ["last_7_days", "last_30_days", "last_90_days", "last_week", "last_month", "this_week", "this_month"] }, start: { type: "string", description: "YYYY-MM-DD" }, end: { type: "string", description: "YYYY-MM-DD" } }, required: ["kind"] }, max_results: { type: "integer", description: "Maximum results to return (default 5)." } }, required: ["query", "time_range"] } },
-      { name: "vc_restore_tool", description: "Restore compacted conversation history in place. Compacted turns marked with [Compacted turn N | ... | vc_restore_tool(ref=...)] contain the FULL original conversation including thinking blocks, tool calls, tool outputs, and all details that the summary omits. Call this when you need the exact original content.", input_schema: { type: "object", properties: { ref: { type: "string", description: "The ref from the compacted stub (e.g. chain_5_abc123 or tool_abc123def)" } }, required: ["ref"] } },
-      { name: "vc_find_session", description: "Retrieve full conversation excerpts from a specific older session that was marked as superseded in a previous vc_find_quote result. Use this ONLY when you see '[Older session \u2014 superseded]' and need the original text to answer the question.", input_schema: { type: "object", properties: { query: { type: "string", description: "The word or phrase to search for within the session." }, session: { type: "string", description: "The session date to search (e.g. '2023/05/25'). Copy the date shown in the '[Older session (...)]' marker." } }, required: ["query", "session"] } },
+      {"name": "vc_expand_topic", "description": "Load the full original conversation text for a topic. Use when a topic summary covers the area you need — expanding reveals the complete conversation including details the summary may have compressed. Also use after vc_find_quote returns snippets — expand the matching tag to read surrounding context before answering. For specific facts when you don't know which topic holds them, use vc_find_quote first to locate them.", "input_schema": {"type": "object", "properties": {"tag": {"type": "string", "description": "Topic tag from the context-topics list to expand."}, "depth": {"type": "string", "enum": ["segments", "full"], "description": "Target depth: 'segments' for individual summaries, 'full' for original conversation text."}, "collapse_tags": {"type": "array", "items": {"type": "string"}, "description": "Optional list of topic tags to collapse back to summary depth before expanding. Frees context budget in the same round-trip instead of requiring a separate tool call."}}, "required": ["tag"]}},
+      {"name": "vc_find_quote", "description": "Find direct quote-like evidence from raw conversation turns. This tool is turn-first: use it when you need the literal place something was said, especially for names, numbers, dosages, versions, dates, and short factual details. It returns turn-backed excerpts first, then falls back to older segment-backed evidence only when the turn search is insufficient. Use mode='lookup' for normal pinpoint search. Use mode='exact_value' only when one excerpt should contain the answer verbatim as an explicit number, percentage, version, date, or count. Do not use vc_find_quote for aggregate totals or coverage across multiple components; use vc_search_summaries for that. If the question is anchored to a specific date or date range, use vc_remember_when first.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "The word or phrase to search for. Use the most specific and distinctive terms — e.g. 'magnesium glycinate' rather than 'supplement', or 'reservation 7pm' rather than 'dinner'."}, "mode": {"type": "string", "enum": ["lookup", "exact_value"], "description": "Retrieval mode. Use 'lookup' for a standard search. Use 'exact_value' only when one excerpt should contain the answer verbatim as an explicit number, percentage, version, date, or count. Do not use this tool when you must combine multiple components or search broad summaries across older compacted memory."}, "channel": {"type": "string", "description": "Optional source channel to restrict the search to: a channel name with or without a leading '#', or a stored channel id. Pass it only when the question is explicitly scoped to one channel; omit it otherwise so the whole conversation is searched."}}, "required": ["query", "mode"]}},
+      {"name": "vc_recall_all", "description": "Load summaries of ALL stored conversation topics at once. Use when the user asks for a broad overview, wants to know everything discussed, needs a full summary, or asks a vague question that spans multiple topics. Returns all tag summaries within the token budget. After reviewing, use vc_expand_topic on specific tags if you need more detail.", "input_schema": {"type": "object", "properties": {}}},
+      {"name": "vc_query_facts", "description": "Query extracted facts with structured filters. Essential for questions about events, experiences, trips, activities, or anything the user has done — each fact has a date, location, and status. Also use for counting, listing, or filtering questions like 'how many X have I done', 'what projects am I leading'. Returns matching facts with count. For counting questions, omit status to get the total across all statuses in a single call. Verb is automatically expanded to include morphological variants (e.g. 'led' also matches 'leads', 'visited' also matches 'traveled'). Object filter is auto-relaxed if too narrow.", "input_schema": {"type": "object", "properties": {"subject": {"type": "string", "description": "Who the fact is about. Usually 'user'."}, "verb": {"type": "string", "description": "Action verb to search for (e.g. 'led', 'built', 'prefers'). Automatically expanded to include similar verbs."}, "object_contains": {"type": "string", "description": "Keyword to match in the object field."}, "status": {"type": "string", "enum": ["active", "completed", "planned", "abandoned", "recurring"], "description": "Temporal status filter. Omit for counting queries to get all statuses at once."}, "fact_type": {"type": "string", "enum": ["personal", "experience", "world"], "description": "Filter by fact type. Omit to get all types."}}}},
+      {"name": "vc_remember_when", "description": "Best tool for time-based questions. Retrieves conversations and facts from a specific date range. Use FIRST when the question mentions a time period ('past three months', 'last week', 'in March', 'between June and July'). Also use FIRST when the question asks what was true on a specific date or within a date window, even if the final answer is numeric. Returns both conversation excerpts and structured facts within the window. Use relative presets when they match, or between_dates with explicit YYYY-MM-DD dates for custom ranges. Date filtering is primary; query terms only refine and rank results inside the requested window. Use mode='lookup' for narrow fact lookups within the window, mode='state_at_time' for the state on a specific date or short date window, mode='change_over_time' for chronology/evidence retrieval across the window, mode='summarize_over_time' for broad temporal synthesis questions, and mode='window_overview' for query-agnostic browse questions like what we worked on during a specific day or week. This tool CANNOT restrict results to one participant and accepts no speaker argument: its results cover everyone who spoke in the window. For 'what did <participant> say', use vc_find_quote or vc_query_facts, which enforce a speaker selection.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "Topic/fact query to rank evidence inside the time window. For mode='window_overview', this may be an empty string."}, "time_range": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["relative", "between_dates"]}, "preset": {"type": "string", "enum": ["last_7_days", "last_30_days", "last_90_days", "last_180_days", "last_week", "last_month", "this_week", "this_month"]}, "start": {"type": "string", "description": "YYYY-MM-DD"}, "end": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["kind"]}, "max_results": {"type": "integer", "description": "Maximum results to return (default 12)."}, "mode": {"type": "string", "enum": ["auto", "lookup", "change_over_time", "summarize_over_time", "state_at_time", "window_overview"], "description": "Retrieval mode. Use 'lookup' for narrow fact retrieval, 'state_at_time' when the question asks what was true on a specific date or short date window, 'change_over_time' for chronology/evidence retrieval with multiple dated items across the range, and 'summarize_over_time' for broad temporal synthesis, progression, and shifts across the date range. Use 'window_overview' when the goal is to browse what happened in the window even without a strong topic query. Default is 'auto'."}}, "required": ["query", "time_range"]}},
+      {"name": "vc_restore_tool", "description": "Put back content the proxy replaced with a stub in this request. A turn whose tool calls were collapsed appears as [Compacted turn N | ...] with a chain_ ref; restoring it puts that turn's original messages back in place, including thinking, tool calls and tool outputs. A single tool output replaced by a stub carries a tool_ ref; restoring it puts that output back in place. A recompressed image carries a media_ ref; restoring it returns the original image. Call this when you need the exact original content: raw command output, file contents, detailed reasoning, per-test results. The ref is in the stub text.", "input_schema": {"type": "object", "properties": {"ref": {"type": "string", "description": "The ref from the stub (e.g. chain_5_abc123, tool_abc123def or media_abc123)"}}, "required": ["ref"]}},
+      {"name": "vc_find_session", "description": "Retrieve full conversation excerpts from a specific older session that was marked as superseded in a previous vc_find_quote result. Use this ONLY when you see '[Older session — superseded]' and need the original text to answer the question.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "The word or phrase to search for within the session."}, "session": {"type": "string", "description": "The session date to search (e.g. '2023/05/25'). Copy the date shown in the '[Older session (...)]' marker."}}, "required": ["query", "session"]}}
     ];
-
-    // A first model turn can arrive before the asynchronous dynamic-schema
-    // refresh completes. Keep speaker selection available on that cold path;
-    // cloud validates every supplied handle against its request-local roster,
-    // and exact mode fails closed on an invalid or stale value.
-    const coldSpeakerProperty = {
-      type: "string",
-      description: (
-        "Optional speaker handle from the speaker-roster supplied in the " +
-        "current prompt. Omit unless asking about one specific participant."
-      ),
-    };
-    const coldSpeakerOnlyProperty = {
-      type: "boolean",
-      description: (
-        "Set true with a speaker handle to return only statements verifiably " +
-        "made by that participant."
-      ),
-    };
-    for (const def of vcTools) {
-      if (!["vc_find_quote", "vc_query_facts"].includes(def.name)) continue;
-      def.input_schema.properties.speaker = { ...coldSpeakerProperty };
-      def.input_schema.properties.speaker_only = { ...coldSpeakerOnlyProperty };
-    }
 
     for (const def of vcTools) {
       api.registerTool((ctx) => {
@@ -7451,16 +7333,10 @@ export default {
         // Each factory retains its own destination even if another channel's
         // invocation runs before execute. Cold factories resolve once on use.
         let factoryRoute = factoryIdentity.available ? factoryIdentity : null;
-        maybeRefreshToolDefs(
-          baseUrl, vcKeyFor(factoryContext?.sessionKey ?? ""), factoryIdentity.convId, factoryChannelId, log,
-        );
-        const fetched = cachedToolDef(
-          factoryIdentity.convId, def.name, factoryChannelId,
-        );
         return {
         name: def.name,
-        description: fetched?.description ?? def.description,
-        parameters: fetched?.input_schema ?? def.input_schema,
+        description: def.description,
+        parameters: def.input_schema,
         async execute(toolCallId, params) {
           const sessionId = factoryContext?.sessionId ?? "unknown";
           const identity = factoryRoute ?? await resolveRunMemoryRoute(
@@ -7498,7 +7374,7 @@ export default {
       };
       }, { names: [def.name] });
     }
-    log.info?.(`[vc] registered ${vcTools.length} tools (dynamic schemas, hardcoded fallback)`);
+    log.info?.(`[vc] registered ${vcTools.length} tools (fixed catalogue)`);
 
     // ── Native slash commands (/vcstatus, /vcmerge, /vclabel, /vcattach, /vcreingest) ──
     // Use api.registerCommand so each channel (Telegram, Discord, etc.) auto-registers

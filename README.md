@@ -327,6 +327,10 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 
 ## Changelog
 
+### 5.18.6
+
+- The VC tools are one fixed catalogue: every session and turn gets the same definitions, with no per-conversation fetch, cache or saved copy.
+
 ### 5.18.5
 
 - Agents on the Codex route keep one Codex thread across turns again; VC now expands the history the host projects into the thread's first message.
@@ -345,7 +349,7 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 
 ### 5.18.1
 
-- Fetched VC tool definitions are saved under `~/.openclaw/state/virtual-context/` and reused after a gateway restart, so the tool schemas a model sees no longer switch between the built-in and fetched sets from one turn to the next.
+- Fetched VC tool definitions were saved under `~/.openclaw/state/virtual-context/` and reused after a gateway restart (replaced in 5.18.6 by a fixed catalogue).
 
 ### 5.18.0
 
