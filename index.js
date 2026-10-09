@@ -6411,19 +6411,62 @@ export function renderOutboundIdReport(stats, context = {}) {
 // Per-conversation tool-definition cache. The server binds a request-local
 // speaker enum into eligible tool schemas from the conversation's current
 // roster snapshot; hardcoded definitions remain the fail-open baseline
-// whenever the fetch is stale, failing, or the feature is disabled.
+// for a conversation whose definitions were never fetched.
+//
+// Fetched definitions are saved to disk and loaded on first use, so the
+// first turn after a gateway restart is served the same definitions as the
+// turns after it. The tool catalog is the head of every model request; a
+// catalog that changes between turns invalidates the provider's prompt cache.
 const toolDefsCache = new Map(); // convId + channel -> { byName: Map, fetchedAt }
 const TOOL_DEFS_TTL_MS = 60_000;
 const toolDefsInflight = new Set();
+let toolDefsLoaded = false;
 
 function toolDefsCacheKey(convId, channelId = "") {
   return `${convId}\u0000${cleanInboundField(channelId, 256)}`;
+}
+
+function toolDefsPath() {
+  return join(homedir(), ".openclaw", "state", "virtual-context", "tool-definitions.json");
+}
+
+function loadSavedToolDefs() {
+  if (toolDefsLoaded) return;
+  toolDefsLoaded = true;
+  try {
+    const saved = JSON.parse(readFileSync(toolDefsPath(), "utf8"));
+    for (const [cacheKey, tools] of Object.entries(saved ?? {})) {
+      if (toolDefsCache.has(cacheKey) || !Array.isArray(tools)) continue;
+      const byName = new Map(tools.filter((t) => t?.name).map((t) => [t.name, t]));
+      // fetchedAt 0: served now, refreshed on the next use.
+      toolDefsCache.set(cacheKey, { byName, fetchedAt: 0 });
+    }
+  } catch {
+    // No saved definitions yet, or an unreadable file: start empty.
+  }
+}
+
+function saveToolDefs() {
+  const saved = {};
+  for (const [cacheKey, entry] of toolDefsCache) {
+    if (entry.byName.size) saved[cacheKey] = [...entry.byName.values()];
+  }
+  const finalPath = toolDefsPath();
+  const temporaryPath = `${finalPath}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(finalPath), { recursive: true, mode: 0o700 });
+    writeFileSync(temporaryPath, JSON.stringify(saved), { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, finalPath);
+  } catch {
+    // The in-memory cache still serves this process.
+  }
 }
 
 export function maybeRefreshToolDefs(
   baseUrl, vcKey, convId, channelId = "", log = null,
 ) {
   if (!convId) return;
+  loadSavedToolDefs();
   const cacheKey = toolDefsCacheKey(convId, channelId);
   const entry = toolDefsCache.get(cacheKey);
   if (entry && Date.now() - entry.fetchedAt < TOOL_DEFS_TTL_MS) return;
@@ -6444,6 +6487,7 @@ export function maybeRefreshToolDefs(
         if (tdef?.name) byName.set(tdef.name, tdef);
       }
       toolDefsCache.set(cacheKey, { byName, fetchedAt: Date.now() });
+      if (byName.size) saveToolDefs();
     })
     .catch((err) => {
       const prior = toolDefsCache.get(cacheKey)?.byName ?? new Map();
@@ -6454,6 +6498,7 @@ export function maybeRefreshToolDefs(
 }
 
 export function cachedToolDef(convId, name, channelId = "") {
+  loadSavedToolDefs();
   return toolDefsCache.get(toolDefsCacheKey(convId, channelId))?.byName?.get(name);
 }
 

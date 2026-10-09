@@ -327,6 +327,10 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 
 ## Changelog
 
+### 5.18.1
+
+- Fetched VC tool definitions are saved under `~/.openclaw/state/virtual-context/` and reused after a gateway restart, so the tool schemas a model sees no longer switch between the built-in and fetched sets from one turn to the next.
+
 ### 5.18.0
 
 - Cron, sub-agent, and internal sessions (such as the skill workshop's review runs) no longer use VC: no prepare, no ingest, no typed VC commands, and no proxy routing.
