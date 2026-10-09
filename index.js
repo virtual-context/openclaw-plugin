@@ -1902,6 +1902,9 @@ export function forgetInboundTurn(runId) {
 // silently exclude real turns. Only this exact value is excluded here; cron
 // sessions are kept out by their session scope (ephemeralSessionScope).
 const VC_EXCLUDED_TRIGGER = "heartbeat";
+// Thread epoch for Codex-routed agents; changing it starts every such
+// session on a fresh, re-projected Codex thread once.
+const CODEX_THREAD_EPOCH = "vc-proxy-1";
 
 function isExcludedTrigger(ctx) {
   return ctx?.trigger === VC_EXCLUDED_TRIGGER;
@@ -6585,6 +6588,13 @@ export default {
       // The host projects its whole history, routed or not: trimming what the
       // model sees is VC's job on the outbound payload, not the host's.
       normalizeCurrentPrompt: currentTurnForIngest,
+      // Codex-routed agents keep their Codex thread across turns: VC rebuilds
+      // every outbound payload, so per-turn re-projection buys nothing.
+      threadProjectionFor: (sessionKey) => (
+        proxyMode.enabled && proxyMode.codexAgents?.has(agentIdFromSessionKey(sessionKey))
+          ? CODEX_THREAD_EPOCH
+          : null
+      ),
       onCurrentSpeaker: (snapshot) => rememberCurrentContextSpeaker({
         ...snapshot,
         source: "context-engine",

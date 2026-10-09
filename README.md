@@ -327,6 +327,10 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 
 ## Changelog
 
+### 5.18.3
+
+- Agents on the Codex route keep one Codex thread across turns instead of having their history re-projected into a new thread on every turn.
+
 ### 5.18.2
 
 - Cron, sub-agent, heartbeat and internal runs of an agent on the Codex route now carry a signed no-memory marker, so VC forwards their model calls without storing them instead of rejecting them.
