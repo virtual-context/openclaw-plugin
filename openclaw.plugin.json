@@ -37,6 +37,13 @@
         },
         "description": "Agent ids excluded from Virtual Context entirely: no prepare, no ingest, no VC commands for their sessions. Matched case-insensitively against the agent id in the session key. Unlike the providers allowlist, exclusion holds across model switches and fallbacks. Empty or omitted = no agents excluded."
       },
+      "excludeSessions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Exact session keys excluded from Virtual Context (e.g. \"agent:bast:discord-alerts\"): no prepare, no ingest, no VC commands for those sessions, while the agent's other sessions keep VC. Matched case-insensitively. Empty or omitted = none."
+      },
       "debug": {
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."

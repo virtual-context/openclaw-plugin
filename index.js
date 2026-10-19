@@ -3717,12 +3717,19 @@ export function ephemeralSessionScope(sessionKey) {
 
 /**
  * Why a session is kept away from VC entirely, or null when it is not.
+ * `excludedSessions` holds exact session keys (excludeSessions config, parsed
+ * by buildExcludedAgentSet) for one agent's disposable sessions, such as a
+ * pinned automation session, while its conversations keep VC.
  *
  * Pure function; exported for unit testing.
  */
-export function sessionExclusionReason(excludedAgents, sessionKey) {
+export function sessionExclusionReason(excludedAgents, sessionKey, excludedSessions) {
   if (sessionAgentExcluded(excludedAgents, sessionKey)) {
     return `agent '${sessionAgentScopeId(sessionKey)}' is in excludeAgents`;
+  }
+  if (excludedSessions?.size && typeof sessionKey === "string"
+      && excludedSessions.has(sessionKey.trim().toLowerCase())) {
+    return "session is in excludeSessions";
   }
   const scope = ephemeralSessionScope(sessionKey);
   return scope ? `${scope} sessions do not use VC` : null;
@@ -6432,6 +6439,8 @@ export default {
     // commands, and unlike the model allowlist this holds across fallbacks.
     const agentExclusion = buildExcludedAgentSet(cfg.excludeAgents);
     const excludedAgents = agentExclusion.excluded;
+    const sessionExclusion = buildExcludedAgentSet(cfg.excludeSessions);
+    const excludedSessions = sessionExclusion.excluded;
     const debug = cfg.debug === true;
     // Operator DM target for rerouted model-fallback notices; absent = the
     // notices stay in-channel (host default behavior).
@@ -7259,6 +7268,18 @@ export default {
         );
       }
     }
+    if (sessionExclusion.malformed || sessionExclusion.invalid.length > 0) {
+      log.error?.(
+        `[vc:exclude-sessions] excludeSessions must be an array of session ` +
+        `keys; ${sessionExclusion.malformed ? "the whole list was rejected" : `dropped ${JSON.stringify(sessionExclusion.invalid)}`}.`,
+      );
+    }
+    if (excludedSessions.size > 0) {
+      log.info?.(
+        `[vc:exclude-sessions] excluded sessions: [${[...excludedSessions].join(", ")}] ` +
+        `— no prepare, no ingest, no VC commands`,
+      );
+    }
     drainAllCompletionOutboxes();
 
     if (outboundIdCfg.enabled) {
@@ -7488,7 +7509,7 @@ export default {
     api.on("before_model_resolve", async (event, ctx) => {
       if (!proxyMode.enabled) return;
       if (isExcludedTrigger(ctx)) return;
-      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey)) return;
+      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey, excludedSessions)) return;
       const sessionId = hookSessionIdentity(ctx);
       const routedAgentId = agentIdFromSessionKey(ctx?.sessionKey);
       const agentEntry = proxyMode.agents.get(routedAgentId) ?? proxyMode.codexAgents.get(routedAgentId);
@@ -7559,7 +7580,7 @@ export default {
       // Same position for excluded agents: their VC commands must not reach
       // the cloud or touch the tracker either -- exclusion is total, unlike
       // the provider filter, which VC commands deliberately bypass.
-      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey)) return;
+      if (sessionExclusionReason(excludedAgents, ctx?.sessionKey, excludedSessions)) return;
       const sessionId = hookSessionIdentity(ctx);
       const turnRunId = hookInvocationRunId(ctx, sessionId);
       // This hook fires once at the start of each invoked turn, before context
@@ -7683,7 +7704,7 @@ export default {
       }
       // Before the provider filter, the VC-command bypass and the prepare
       // POST: an excluded agent's turns never reach the cloud at all.
-      const prepareExclusion = sessionExclusionReason(excludedAgents, sessionKey);
+      const prepareExclusion = sessionExclusionReason(excludedAgents, sessionKey, excludedSessions);
       if (prepareExclusion) {
         log.info?.(`[vc] skipping prepare — ${prepareExclusion}; session=${sessionId}`);
         return excludedRunRoute(ctx, sessionKey, sessionId);
@@ -8952,7 +8973,7 @@ export default {
         // there is no pending user half -- but a config reload between the
         // two hooks can exclude an agent mid-turn, so release defensively
         // (the forgets are no-ops when nothing is pending).
-        const ingestExclusion = sessionExclusionReason(excludedAgents, ctx?.sessionKey);
+        const ingestExclusion = sessionExclusionReason(excludedAgents, ctx?.sessionKey, excludedSessions);
         if (ingestExclusion) {
           log.info?.(`[vc] skipping ingest — ${ingestExclusion}; session=${sessionId}`);
           releasePendingTurn();

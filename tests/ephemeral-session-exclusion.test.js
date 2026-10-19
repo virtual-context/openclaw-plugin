@@ -63,3 +63,28 @@ describe("sessionExclusionReason", () => {
     expect(sessionExclusionReason(NONE, "agent:vast:main")).toBe(null);
   });
 });
+
+describe("excludeSessions", () => {
+  const sessions = buildExcludedAgentSet(["agent:bast:discord-alerts"]).excluded;
+
+  it("excludes a listed session key, case-insensitively", () => {
+    expect(sessionExclusionReason(NONE, "agent:bast:discord-alerts", sessions))
+      .toBe("session is in excludeSessions");
+    expect(sessionExclusionReason(NONE, "Agent:Bast:Discord-Alerts", sessions))
+      .toBe("session is in excludeSessions");
+  });
+
+  it("matches the exact key, not a prefix, and leaves the agent's other sessions on VC", () => {
+    for (const key of [
+      "agent:bast:discord-alerts-kimi",
+      "agent:bast:telegram:direct:8049932331",
+      "agent:bast:main",
+    ]) {
+      expect(sessionExclusionReason(NONE, key, sessions)).toBe(null);
+    }
+  });
+
+  it("excludes nothing when unset", () => {
+    expect(sessionExclusionReason(NONE, "agent:bast:discord-alerts")).toBe(null);
+  });
+});
