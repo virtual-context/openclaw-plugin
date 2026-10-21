@@ -77,7 +77,8 @@ Without a `vcKey` the plugin logs a warning and does nothing.
 | `agentActorIds` | object | none | The agent's own platform user ids by platform, e.g. `{"discord": "1485..."}`, so its own quoted output is not attributed to a member. Checked at startup against other plugins' Discord bot ids; a mismatch disables it. |
 | `outboundIdCapture` | object | `{"mode": "off"}` | Records the bot's own outbound message ids so a member's reply to the bot can be matched. Requires `convIdentity: "stable"`. |
 | `ingestRetry` | object | `{"enabled": false}` | Retries an ingest the service rejects as busy (`conversation_lifecycle_busy`). Timeouts are never retried. |
-| `operatorNoticeUserId` | string | none | Discord user id that receives model-fallback notices as a direct message; the in-channel notice is cancelled. Without a usable bot token the notice stays in the channel. |
+| `messageSendingHook` | boolean | `false` | Registers the host's `message_sending` hook: outbound text loses `<!-- vc:... -->` comments and, with `operatorNoticeUserId`, fallback notices are rerouted. The host turns Telegram live previews and progress drafts off for every turn while any plugin holds this hook, so leave it off unless you need it. |
+| `operatorNoticeUserId` | string | none | Discord user id that receives model-fallback notices as a direct message; the in-channel notice is cancelled. Takes effect only with `messageSendingHook: true`. Without a usable bot token the notice stays in the channel. |
 | `modelCallCapture` | object | disabled | Writes every `llm_input` and `llm_output` event, untruncated, to a local gzip log. Limits default to 512 MiB, 2,000 files, and 7 days, under `~/.openclaw/logs/virtual-context/model-calls`. Contains conversation content. |
 | `proxyMode` | object | disabled | Routes selected agents' model calls through the VC proxy. See [Proxy mode](#proxy-mode). |
 | `debug` | boolean | `false` | Verbose `[vc:debug]` and `[vc:wire]` logging of requests and payloads. |
@@ -196,7 +197,7 @@ The plugin registers ten OpenClaw hooks:
 | `before_prompt_build` | Runs prepare and replaces the message history with VC's payload; applies the provider filter and exclusions. Skipped for proxy-routed runs, which only get a signed route marker. |
 | `llm_input` / `llm_output` | Model-call capture when enabled, and proxy-mode bookkeeping. |
 | `agent_end` | Runs ingest for the completed turn. Skipped for command turns, failed runs, filtered models, and proxy-owned runs. |
-| `message_sending` | Strips internal `<!-- vc:... -->` markers from outbound text and reroutes fallback notices when `operatorNoticeUserId` is set. |
+| `message_sending` | Registered only with `messageSendingHook: true`. Strips internal `<!-- vc:... -->` markers from outbound text and reroutes fallback notices when `operatorNoticeUserId` is set. |
 | `message_sent` | Records the bot's outbound message ids. Registered only when `outboundIdCapture` is enabled. |
 
 **How VC's context reaches the model.** Prepare replaces `event.messages` with VC's payload. VC's system text is applied as a system-prompt override, or, on the Codex runtime and in group chats, prepended to the prompt instead.
@@ -311,7 +312,7 @@ Discord API calls use the bot token configured for the Discord account in `openc
 - The message history is replaced with VC's payload, and VC's system text is applied as described in [How it works](#how-it-works).
 - Proxy mode switches the run's model (to its twin, or to a fallback) and adds a signed `<!-- vc:route ... -->` marker to the prompt.
 - The context engine adds speaker labels and replaces history images with labeled copies.
-- Outbound messages have `<!-- vc:... -->` markers removed; with `operatorNoticeUserId`, fallback notices are sent by direct message instead of in the channel.
+- With `messageSendingHook: true`, outbound messages have `<!-- vc:... -->` markers removed and, with `operatorNoticeUserId`, fallback notices are sent by direct message instead of in the channel. Off by default: the host disables Telegram live previews while any plugin holds that hook.
 - `debug: true` writes message previews and payloads to the gateway log.
 
 ## Getting a vcKey
@@ -326,6 +327,11 @@ Sign up at [virtual-context.com](https://virtual-context.com).
 - [Source code](https://github.com/virtual-context/openclaw-plugin)
 
 ## Changelog
+
+### 5.19.0
+
+- The `message_sending` hook is opt-in (`messageSendingHook`). The host turns Telegram live previews and progress drafts off for every turn while any plugin holds that hook; without it, fallback notices keep the host's own placement and routed runs carry no VC comment to strip.
+- The register log lists the hooks the plugin registered.
 
 ### 5.18.6
 

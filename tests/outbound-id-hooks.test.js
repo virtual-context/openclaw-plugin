@@ -222,8 +222,29 @@ describe("message_sent wiring", () => {
     for (const config of [{}, { outboundIdCapture: { mode: "off" } }]) {
       const { handlers } = await registerPlugin(home, config);
       expect(handlers.has("message_sent")).toBe(false);
-      expect(handlers.has("message_sending")).toBe(true);
+      expect(handlers.has("message_sending")).toBe(false);
     }
+  });
+
+  it("registers message_sending only when messageSendingHook is true", async () => {
+    // The host disables Telegram live previews for every turn while any
+    // plugin holds a message_sending hook, so it must never appear by default.
+    const home = makeHome();
+    installFetch();
+    for (const config of [
+      {},
+      { operatorNoticeUserId: "387316537012518913" },
+      { outboundIdCapture: { mode: "carry" } },
+      { messageSendingHook: false },
+      { messageSendingHook: "true" },
+    ]) {
+      const { handlers, log } = await registerPlugin(home, config);
+      expect(handlers.has("message_sending")).toBe(false);
+      expect(logText(log)).toContain("message_sending off");
+    }
+    const { handlers, log } = await registerPlugin(home, { messageSendingHook: true });
+    expect(handlers.has("message_sending")).toBe(true);
+    expect(logText(log)).toContain("message_sending on");
   });
 
   it("registers the hook in observe mode and makes no network call of its own", async () => {
@@ -828,6 +849,7 @@ describe("the denominator comes from the pre-delivery hook", () => {
     installFetch();
     const { handlers, log } = await registerPlugin(home, {
       outboundIdCapture: { mode: "observe" },
+      messageSendingHook: true,
     });
     // Two outbound messages seen pre-delivery...
     await handlers.get("message_sending")({ content: "one" });
@@ -846,7 +868,7 @@ describe("the denominator comes from the pre-delivery hook", () => {
   it("does not count message_sending when the feature is off", async () => {
     const home = makeHome();
     installFetch();
-    const { handlers, log } = await registerPlugin(home, {});
+    const { handlers, log } = await registerPlugin(home, { messageSendingHook: true });
     await handlers.get("message_sending")({ content: "one" });
     expect(logText(log)).not.toContain("sendingHook");
   });
@@ -857,6 +879,7 @@ describe("the denominator comes from the pre-delivery hook", () => {
     installFetch();
     const { handlers } = await registerPlugin(home, {
       outboundIdCapture: { mode: "observe" },
+      messageSendingHook: true,
     });
     const out = await handlers.get("message_sending")({
       content: "hello <!-- vc:x --> world",

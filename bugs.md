@@ -1,5 +1,13 @@
 # Bug fixes
 
+## BUG-005 — Telegram live previews and progress drafts off on every turn
+
+The plugin registered `message_sending` unconditionally to strip `<!-- vc:... -->` comments from outbound text and reroute model-fallback notices. The host disables Telegram provider previews and progress drafts for every turn while any plugin holds that hook, and its check is global, so no Telegram account could stream a draft or show status lines.
+
+The hook is now opt-in (`messageSendingHook`). Off by default: the host already keeps fallback notices out of groups and channels, and a routed run's prompt and reply carry no VC comment for a model to echo. The register log lists the hooks the plugin registered so the live state is visible.
+
+Regression: the default registration first failed a wiring check that no configuration short of the explicit flag registers the hook; the hook's own behavior is unchanged when the flag is on.
+
 ## BUG-004 — Verified reply parents disappear before memory preparation
 
 The model-facing reply boundary retained the target's parent, but memory preparation received only the direct target. A third-party follow-up therefore lacked the participant identity needed to select relevant continuity.

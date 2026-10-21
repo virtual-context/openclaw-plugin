@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.18.0";
+const PLUGIN_VERSION = "5.19.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -6428,6 +6428,13 @@ export default {
   register(api) {
     const log = api.logger ?? console;
     const cfg = api.pluginConfig ?? {};
+    // Every hook is registered through here so the names the host was given
+    // can be logged once registration is complete.
+    const registeredHooks = [];
+    const on = (name, handler) => {
+      registeredHooks.push(name);
+      return api.on(name, handler);
+    };
     const ocConfig = api.config ?? {};
     const vcKey = cfg.vcKey || "";
     const baseUrl = cfg.baseUrl || "https://api.virtual-context.com";
@@ -6445,6 +6452,12 @@ export default {
     // Operator DM target for rerouted model-fallback notices; absent = the
     // notices stay in-channel (host default behavior).
     const operatorNoticeUserId = cleanInboundField(cfg.operatorNoticeUserId, 32);
+    // Outbound text hook, opt-in. The host turns Telegram live previews and
+    // progress drafts off for every turn while any plugin holds a
+    // message_sending hook (its check is global, not per channel). Without the
+    // hook the host places fallback notices itself (direct chats only), and a
+    // routed run's prompt and reply carry no VC comment for a model to echo.
+    const messageSendingHook = cfg.messageSendingHook === true;
     const modelCallCapture = normalizeModelCallCaptureConfig(cfg.modelCallCapture);
     // Per-agent keys, read from disk so no key material lives in openclaw.json.
     // An agent without an entry keeps using the deployment-wide key above.
@@ -7474,7 +7487,7 @@ export default {
     // them. This hook is deliberately synchronous and stores only a bounded
     // routing snapshot; it performs no network call, memory write, or card
     // update. The shipped hook has no run id despite its public type.
-    api.on("message_received", (event, ctx) => {
+    on("message_received", (event, ctx) => {
       memoryScope.observeInbound(event, ctx);
       const remembered = rememberInboundTurn(event, ctx);
       if (!remembered) {
@@ -7506,7 +7519,7 @@ export default {
     // ── before_model_resolve: proxy-mode switch ──
     // Returns a modelOverride to the agent's VC-routed twin entry; the latch
     // taken here is what the later hooks consult for this exact run.
-    api.on("before_model_resolve", async (event, ctx) => {
+    on("before_model_resolve", async (event, ctx) => {
       if (!proxyMode.enabled) return;
       if (isExcludedTrigger(ctx)) return;
       if (sessionExclusionReason(excludedAgents, ctx?.sessionKey, excludedSessions)) return;
@@ -7546,7 +7559,7 @@ export default {
       }
     });
 
-    api.on("before_dispatch", (event, ctx) => {
+    on("before_dispatch", (event, ctx) => {
       const remembered = rememberInboundDispatch(event, ctx, ocConfig);
       if (!remembered && groupConversationSession(event?.sessionKey)) {
         warnIdentityOnce(
@@ -7571,7 +7584,7 @@ export default {
     // into the LLM assistant.content, which the agent harness then drops in
     // messageToolOnly mode (group/channel chats by default), and the user sees
     // nothing.
-    api.on("before_agent_reply", async (event, ctx) => {
+    on("before_agent_reply", async (event, ctx) => {
       // Guarded first, before speaker state, command detection, tracker resets
       // or any network call: a heartbeat whose text happened to match the VC
       // command prefix would otherwise reach the service and could reset the
@@ -7689,7 +7702,7 @@ export default {
       }
     });
 
-    api.on("before_prompt_build", async (event, ctx) => {
+    on("before_prompt_build", async (event, ctx) => {
       // A prior completion may have reached the cloud even when this process
       // timed out before receiving its acknowledgement. Drain is idempotent by
       // immutable source message id and never blocks this prompt path.
@@ -8822,7 +8835,7 @@ export default {
     });
 
     // ── llm_input: observability ──
-    api.on("llm_input", (event, ctx) => {
+    on("llm_input", (event, ctx) => {
       const sessionId = ctx?.sessionId ?? "unknown";
       const runId = ctx?.runId ?? sessionId;
       const found = findContinuityAdoption(
@@ -8875,7 +8888,7 @@ export default {
       captureModelBoundary("llm_input", event, ctx);
     });
 
-    api.on("llm_output", async (event, ctx) => {
+    on("llm_output", async (event, ctx) => {
       captureModelBoundary("llm_output", event, ctx);
       const sessionId = cleanInboundField(event?.sessionId)
         || hookSessionIdentity(ctx);
@@ -8901,7 +8914,7 @@ export default {
 
     // ── agent_end: ingest the completed turn ──
     // NETWORK: POST /api/v1/context/ingest — sends assistant reply text to cloud for tagging.
-    api.on("agent_end", async (event, ctx) => {
+    on("agent_end", async (event, ctx) => {
       // Obtained before the guard below because the release itself is keyed by
       // it; nothing can be cleaned up if this throws.
       const sessionId = hookSessionIdentity(ctx);
@@ -9241,13 +9254,13 @@ export default {
 
     // ── message_sent: witness the bot's OWN outbound message ids ──
     //
-    // This is the whole point of the feature. The plugin already subscribes to
-    // message_sending, which fires BEFORE delivery and therefore has no id yet.
+    // This is the whole point of the feature. message_sending (when enabled)
+    // fires BEFORE delivery and therefore has no id yet.
     // message_sent fires after, carries `messageId`, and is fire-and-forget -
     // so it can and does land after the ingest for the same turn has already
     // completed. Nothing here may assume otherwise.
     if (outboundIdCfg.enabled) {
-      api.on("message_sent", async (event, ctx) => {
+      on("message_sent", async (event, ctx) => {
         try {
           const now = Date.now();
           const observedAt = new Date(now).toISOString();
@@ -9353,8 +9366,8 @@ export default {
       });
     }
 
-    // ── Strip vc comment tags from outbound messages ──
-    api.on("message_sending", async (event) => {
+    // ── Strip vc comment tags from outbound messages (opt-in) ──
+    if (messageSendingHook) on("message_sending", async (event) => {
       // Denominator for the sent-hook (see renderOutboundIdReport).
       // message_sending fires PRE-delivery; message_sent fires after. Counting
       // both is the only way to answer "did the post-delivery hook fire for
@@ -9403,5 +9416,9 @@ export default {
         return { content: stripped };
       }
     });
+    log.info?.(
+      `[vc] hooks registered: ${registeredHooks.join(", ")} ` +
+      `(message_sending ${messageSendingHook ? "on" : "off"})`,
+    );
   },
 };

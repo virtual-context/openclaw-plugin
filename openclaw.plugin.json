@@ -2,7 +2,7 @@
   "id": "virtual-context",
   "name": "Virtual Context",
   "description": "Integrates OpenClaw with virtual-context.com for unlimited memory, compressed LLM payloads, and memory retrieval tools.",
-  "version": "5.18.6",
+  "version": "5.19.0",
   "kind": "context-engine",
   "main": "./index.js",
   "activation": {
@@ -47,6 +47,10 @@
       "debug": {
         "type": "boolean",
         "description": "Enable verbose debug logging of REST API calls, payloads, and responses. Default: false."
+      },
+      "messageSendingHook": {
+        "type": "boolean",
+        "description": "Register the host's message_sending hook, which strips <!-- vc:... --> comments from outbound text and, with operatorNoticeUserId, reroutes model-fallback notices. The host disables Telegram live previews and progress drafts on every turn while any plugin holds this hook, so it is off by default."
       },
       "operatorNoticeUserId": {
         "type": "string",
