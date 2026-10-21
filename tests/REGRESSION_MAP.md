@@ -2,6 +2,7 @@
 
 | Bug | Tests | Contract |
 |---|---|---|
+| BUG-009 | `codex-route-server-scope.test.js` — `BUG-009: codex route under a server memory scope` | Codex-routed and relatched twin runs of a server-scoped agent use the server conversation for any channel of that server, explicit groups still apply, and unproven membership yields no route instead of a per-channel conversation |
 | BUG-008 | `codex-thread-projection.test.js` | A Codex-routed agent's assembly asks the host for thread-bootstrap projection with a stable epoch; other agents and a missing or broken callback keep per-turn projection |
 | BUG-007 | `proxy-mode.test.js` — `an excluded run that leaves through the codex route carries the signed no-memory marker` | Excluded runs on a codex-routed agent get the signed pass-through marker; other agents, non-OpenAI models, the embedded runtime and the configured fallback get none |
 | BUG-006 | `fixed-tool-catalogue.test.js` | Every session and turn is offered byte-identical VC tool definitions, built without a network call |

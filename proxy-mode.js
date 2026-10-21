@@ -277,13 +277,27 @@ export function readCodexHomeConfig(agentId) {
 }
 
 /**
+ * The conversation a routed run belongs to. When the caller resolved the run's
+ * memory route (a server memory scope or explicit grouping), that route is the
+ * authority; an unavailable route never degrades to a per-channel identity.
+ * Returns { identity } or { reason } when the run must not be routed.
+ */
+function routedIdentity({ ctx, deriveConvIdentity, groupIndex, memoryRoute }) {
+  if (memoryRoute) {
+    if (!memoryRoute.available) return { reason: `scope-unavailable:${memoryRoute.reason || "unknown"}` };
+    return { identity: memoryRoute };
+  }
+  return { identity: deriveConvIdentity(ctx?.sessionKey, ctx?.sessionId, groupIndex) };
+}
+
+/**
  * Route decision for a run on a Codex-harness agent. The request already goes to
  * VC by base URL; the plugin latches the run so the prompt carries the signed
  * conversation and the completion is not ingested twice. Returns { latch, reason }.
  * Only OpenAI models leave the codex-home; a run the host placed on the embedded
  * runner (fallbacks, an explicit openclaw runtime) is native.
  */
-export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIdentity, groupIndex, latches }) {
+export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIdentity, groupIndex, latches, memoryRoute }) {
   const agent = config?.codexAgents?.get(agentIdFromSessionKey(ctx?.sessionKey));
   if (!agent) return { latch: null, reason: "" };
   if (typeof model !== "string" || !model.startsWith("openai/")) return { latch: null, reason: "native-model" };
@@ -296,7 +310,9 @@ export function decideCodexRoute({ config, ctx, model, runtimeId, deriveConvIden
   if (!key) return { latch: null, reason: "no-run-key" };
   const existing = latches.get(key);
   if (existing) return { latch: existing, reason: "latched" };
-  const identity = deriveConvIdentity(ctx?.sessionKey, ctx?.sessionId, groupIndex);
+  const routed = routedIdentity({ ctx, deriveConvIdentity, groupIndex, memoryRoute });
+  if (routed.reason) return { latch: null, reason: routed.reason };
+  const identity = routed.identity;
   let convId = identity?.isStable && typeof identity.convId === "string" && identity.convId.startsWith("sk:") ? identity.convId : "";
   if (!convId) {
     // The request leaves regardless; an ephemeral session gets its own signed id.
@@ -366,7 +382,7 @@ export function decideProxyOverride({ config, ctx, health, sessionIngested, deri
  * Returns { latch, reason } — latch null when this is not a twin run or the
  * conversation identity cannot be signed.
  */
-export function relatchProxyRun({ config, ctx, latches, deriveConvIdentity, groupIndex, model }) {
+export function relatchProxyRun({ config, ctx, latches, deriveConvIdentity, groupIndex, model, memoryRoute }) {
   if (!config?.enabled || typeof model !== "string") return { latch: null, reason: "" };
   const agent = config.agents.get(agentIdFromSessionKey(ctx?.sessionKey));
   if (!agent) return { latch: null, reason: "" };
@@ -377,7 +393,9 @@ export function relatchProxyRun({ config, ctx, latches, deriveConvIdentity, grou
   if (!twins.has(modelId)) return { latch: null, reason: "" };
   const key = proxyLatchKey(ctx);
   if (!key) return { latch: null, reason: "no-run-key" };
-  const identity = deriveConvIdentity(ctx?.sessionKey, ctx?.sessionId, groupIndex);
+  const routed = routedIdentity({ ctx, deriveConvIdentity, groupIndex, memoryRoute });
+  if (routed.reason) return { latch: null, reason: routed.reason };
+  const identity = routed.identity;
   if (!identity?.isStable || typeof identity.convId !== "string" || !identity.convId.startsWith("sk:")) {
     return { latch: null, reason: "unstable-identity" };
   }

@@ -65,7 +65,7 @@ import {
   escapeHostAttributionMarkup,
 } from "./attributed-context-engine.js";
 
-const PLUGIN_VERSION = "5.19.0";
+const PLUGIN_VERSION = "5.20.0";
 const VC_COMMENT_RE = /<!--\s*vc:[^>]*-->/g;
 
 // Exact invocation keys whose reply was a VC command (skip ingest). A unified
@@ -7768,7 +7768,14 @@ export default {
         const runModel = typeof ctx?.model === "string"
           ? ctx.model
           : (ctx?.modelProviderId && ctx?.modelId ? `${ctx.modelProviderId}/${ctx.modelId}` : undefined);
-        const re = relatchProxyRun({ config: proxyMode, ctx, latches: proxyLatches, deriveConvIdentity, groupIndex, model: runModel });
+        // The run's memory route is the conversation authority: a server memory
+        // scope groups every channel of a server, not only the channels listed in
+        // conversationGroups. Resolved once and frozen per invocation.
+        const proxyAgentId = agentIdFromSessionKey(sessionKey);
+        const memoryRoute = proxyMode.agents?.has(proxyAgentId) || proxyMode.codexAgents?.has(proxyAgentId)
+          ? await resolveRunMemoryRoute(sessionKey, sessionId, stateRunId, ctx)
+          : undefined;
+        const re = relatchProxyRun({ config: proxyMode, ctx, latches: proxyLatches, deriveConvIdentity, groupIndex, model: runModel, memoryRoute });
         if (re.latch) {
           proxyLatch = re.latch;
           log.info?.(`[vc:proxy] re-latched — host re-ran the run model=${runModel} session=${sessionId} run=${stateRunId || "?"}`);
@@ -7779,10 +7786,16 @@ export default {
           // Codex-harness agents already send every OpenAI call to VC by base URL;
           // the prompt only needs the signed conversation.
           const runtimeId = resolveSessionRuntimeDetails(sessionKey, { model: runModel, config: ctx?.config })?.id ?? null;
-          const cx = decideCodexRoute({ config: proxyMode, ctx, model: runModel, runtimeId, deriveConvIdentity, groupIndex, latches: proxyLatches });
+          const cx = decideCodexRoute({ config: proxyMode, ctx, model: runModel, runtimeId, deriveConvIdentity, groupIndex, latches: proxyLatches, memoryRoute });
           if (cx.latch) {
             proxyLatch = cx.latch;
-            if (cx.reason === "routed") log.info?.(`[vc:proxy] codex route — model=${runModel} conv=${cx.latch.convId} session=${sessionId} run=${stateRunId || "?"}`);
+            if (cx.reason === "routed") log.info?.(`[vc:proxy] codex route — model=${runModel} conv=${cx.latch.convId} source=${memoryRoute?.source ?? "identity"} session=${sessionId} run=${stateRunId || "?"}`);
+          } else if (cx.reason?.startsWith("scope-unavailable:")) {
+            // Same outcome as the prepare path: no memory for this turn, never a
+            // per-channel conversation. The call still leaves through the route.
+            const marker = codexPassthroughMarker({ config: proxyMode, sessionKey, model: runModel, runtimeId });
+            log.warn?.(`[vc:scope] codex run without memory reason=${cx.reason.slice("scope-unavailable:".length)} session=${sessionId} run=${stateRunId || "?"}`);
+            if (marker) return { prependContext: marker };
           } else if (cx.reason && !["native-model", "embedded-runtime", "fallback-model"].includes(cx.reason)) {
             log.warn?.(`[vc:proxy] codex-routed agent without a route reason=${cx.reason} model=${runModel} session=${sessionId}; VC will reject the call`);
           }
